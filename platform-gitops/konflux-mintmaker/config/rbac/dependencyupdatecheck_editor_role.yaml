@@ -1,0 +1,27 @@
+# permissions for end users to edit dependencyupdatechecks.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: mintmaker
+    app.kubernetes.io/managed-by: kustomize
+  name: dependencyupdatecheck-editor-role
+rules:
+- apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - dependencyupdatechecks
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - appstudio.redhat.com
+  resources:
+  - dependencyupdatechecks/status
+  verbs:
+  - get

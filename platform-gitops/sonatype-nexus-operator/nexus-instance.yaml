@@ -1,0 +1,24 @@
+apiVersion: apps.m88i.io/v1alpha1
+kind: Nexus
+metadata:
+  name: nexus3
+  namespace: nexus
+spec:
+  replicas: 1
+  useRedHatImage: true
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  persistence:
+    enabled: true
+    volumeCapacity: "20Gi"
+    # storageClass: "gp3" # Uncomment and specify if a default storage class is not set
+  networking:
+    expose: true
+    exposeAs: Route
+    tls:
+      mandatory: false # Set to true if configuring SSL termination

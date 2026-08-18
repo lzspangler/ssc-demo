@@ -1,0 +1,33 @@
+// This preset is used to force Renovate to only suggest updates to stable Fedora releases
+// from https://endoflife.date/fedora.
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "customManagers": [
+        {
+            "customType": "regex",
+            "description": "Fedora updates from a stable source",
+            "fileMatch": [
+                "(^|/|\\.)([Dd]ocker|[Cc]ontainer)file$",
+                "(^|/)([Dd]ocker|[Cc]ontainer)file[^/]*$"
+            ],
+            "matchStrings": [
+                "(?<depName>[\\w.-\\/]+\\/fedora[\\w-]*):(?<currentValue>[A-z0-9-_]+)(\\s|$)"
+            ],
+            "packageNameTemplate": "fedora",
+            "datasourceTemplate": "endoflife-date"
+        }
+    ],
+    "packageRules": [
+        {
+            "description": "Don't suggest bumping to unstable fedora release",
+            "matchPackageNames": [
+                "/[\\w.-\\/]+\\/fedora[\\w-]*/"
+            ],
+            "matchManagers": [
+                "dockerfile",
+                "github-actions"
+            ],
+            "enabled": false
+        }
+    ]
+}

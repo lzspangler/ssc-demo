@@ -1,0 +1,114 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: dependencyupdatechecks.appstudio.redhat.com
+spec:
+  group: appstudio.redhat.com
+  names:
+    kind: DependencyUpdateCheck
+    listKind: DependencyUpdateCheckList
+    plural: dependencyupdatechecks
+    singular: dependencyupdatecheck
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          DependencyUpdateCheck is the root CRD that triggers mintmaker to Konflux Components for dependency updates.
+          How the controller uses this CRD:
+          - Only CRs created in the MintMaker namespace (see `MintMakerNamespaceName`) are processed.
+          - When a CR is created, the controller discovers Konflux Components to scan:
+            - By default: all `appstudio.redhat.com/v1alpha1, Kind=Component` across the cluster
+            - Or: a filtered subset when `spec.namespaces` is provided
+            - For each unique repository+branch across those Components, the controller generates
+              one Tekton `PipelineRun` that scans the repository for dependency updates using Renovate.
+
+          Annotations:
+            - `mintmaker.appstudio.redhat.com/processed`: set by the controller when the
+              DependencyUpdateCheck is processed, to avoid reprocessing the same CR.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              DependencyUpdateCheckSpec filters which Konflux Components will be scanned.
+              If `namespaces` is empty, MintMaker scans all Components discoverable to the controller.
+              If provided, MintMaker only scans Components that match the namespace/application/component filters.
+            properties:
+              namespaces:
+                description: |-
+                  Specifies the list of namespaces for which to run MintMaker.
+                  If omitted, MintMaker will run for all namespaces.
+                items:
+                  description: NamespaceSpec scopes MintMaker to specific Applications
+                    within a Kubernetes namespace.
+                  properties:
+                    applications:
+                      description: |-
+                        Specifies the list of Konflux applications in a namespace for which to run MintMaker.
+                        If omitted, MintMaker will run for all namespace's applications.
+                      items:
+                        description: ApplicationSpec scopes MintMaker to specific
+                          Components within a single Konflux Application.
+                        properties:
+                          application:
+                            description: |-
+                              Specifies the name of the Konflux application for which to run Mintmaker.
+                              For more details see <a href="https://github.com/konflux-ci/architecture/blob/main/architecture/core/hybrid-application-service.md">Konflux Application Service</a>.
+                              Required.
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          components:
+                            description: |-
+                              Specifies the list of components of an application for which to run MintMaker.
+                              If omitted, MintMaker will run for all application's components.
+                            items:
+                              description: Component represents a Component name within
+                                a Konflux Application.
+                              maxLength: 63
+                              pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                              type: string
+                            type: array
+                        required:
+                        - application
+                        type: object
+                      type: array
+                    namespace:
+                      description: |-
+                        Specifies the name of the Kubernetes namespace for which to run Mintmaker.
+                        Required.
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - namespace
+                  type: object
+                type: array
+            type: object
+          status:
+            description: DependencyUpdateCheckStatus defines the observed state of
+              DependencyUpdateCheck
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
