@@ -1,0 +1,46 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: application-gitops
+rules:
+  - verbs:
+      - get
+      - list
+      - watch
+    apiGroups:
+      - '*'
+    resources:
+      - '*'
+  - verbs:
+      - create
+      - update
+      - patch
+      - delete
+    apiGroups:
+      - ''
+    resources:
+      - configmaps
+      - services
+      - persistentvolumeclaims
+      - events
+  - verbs:
+      - create
+      - update
+      - patch
+      - delete
+    apiGroups:
+      - 'apps'
+    resources:
+      - deployments
+      - statefulsets
+  - verbs:
+      - create
+      - update
+      - patch
+      - delete
+    apiGroups:
+      - 'argoproj.io'
+    resources:
+      - applications
+      - applicationsets
+      - appprojects

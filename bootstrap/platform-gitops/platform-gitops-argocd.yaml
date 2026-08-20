@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: platform-gitops
+  namespace: platform-gitops
+spec:
+  sourceNamespaces:
+    - platform-gitops
+  usersAnonymousEnabled: false
+  disableAdmin: true
+  defaultClusterScopedRoleDisabled: true
+  rbac:
+    defaultPolicy: "role:none"
+    policy: |
+      p, role:none, *, *, */*, deny
+    scopes: '[groups]'
+  sso:
+    dex:
+      openShiftOAuth: true
+    provider: dex
+  server:
+    route:
+      enabled: true

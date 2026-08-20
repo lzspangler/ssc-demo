@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-1-dev
+  namespace: platform-gitops
+spec:
+  project: demo-apps
+  source:
+    repoURL: 'https://github.com/lzspangler/ssc-demo'
+    targetRevision: main
+    path: platform-gitops/
+  destination:
+    server: 'https://kubernetes.default.svc' 
+    namespace: application-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

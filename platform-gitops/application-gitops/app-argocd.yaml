@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1beta1
+kind: ArgoCD
+metadata:
+  name: app-gitops
+  namespace: application-gitops
+spec:
+  sourceNamespaces:
+    - demo-app-*
+  usersAnonymousEnabled: false
+  disableAdmin: true 
+  defaultClusterScopedRoleDisabled: true
+  rbac:
+    defaultPolicy: "role:none"
+    policy: |
+      g, argocd-admins, role:admin
+      p, role:none, *, *, */*, deny
+    scopes: '[groups]'
+  extraConfig:
+    globalProjects: |
+      - labelSelector:
+          matchExpressions:
+            - key: platform.example.com/security-tier
+              operator: In
+              values:
+                - restricted
+        projectName: global-restricted
+  sso:
+    dex:
+      openShiftOAuth: true
+    provider: dex
+  server:
+    route:
+      enabled: true

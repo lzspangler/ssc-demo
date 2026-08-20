@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-1-dev
+  namespace: platform-gitops
+spec:
+  project: tenant-a
+  source:
+    repoURL: 'https://github.com/lzspangler/tenant-a-app-1'
+    targetRevision: main
+    path: overlays/dev
+  destination:
+    server: 'https://kubernetes.default.svc' 
+    namespace: tenant-a-app-1
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

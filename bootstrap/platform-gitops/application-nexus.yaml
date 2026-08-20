@@ -1,0 +1,63 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: nexus-repository
+  namespace: openshift-gitops
+spec:
+  project: default
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nexus
+
+  source:
+    repoURL: https://sonatype.github.io/helm3-charts/
+    chart: nexus-repository-manager
+    targetRevision: 38.1.1
+
+    helm:
+      releaseName: nexus
+
+      values: |
+        nexus:
+          imageName: registry.connect.redhat.com/sonatype/nexus-repository-manager:3.90.3-ubi-1
+
+        replicaCount: 1
+
+        service:
+          type: ClusterIP
+          protocol: TCP
+          port: 8081
+
+        persistence:
+          enabled: true
+          accessMode: ReadWriteOnce
+          storageSize: 100Gi
+
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+
+        nexus:
+          imageName: registry.connect.redhat.com/sonatype/nexus-repository-manager:3.90.3-ubi-1
+          env:
+            - name: INSTALL4J_ADD_VM_PARAMS
+              value: >-
+                -Xms2g
+                -Xmx2g
+                -XX:MaxDirectMemorySize=2g
+
+        ingress:
+          enabled: false
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=true
