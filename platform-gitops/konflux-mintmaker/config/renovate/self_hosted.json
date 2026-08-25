@@ -1,7 +1,5 @@
 {
   "prFooter": "To execute skipped test pipelines write comment `/ok-to-test`.\n\n---\n### Documentation\n\nFind out how to configure dependency updates in [MintMaker documentation](https://konflux-ci.dev/docs/mintmaker/user/) or see all available configuration options in [Renovate documentation](https://docs.renovatebot.com/configuration-options/).",
-  "redisPrefix": "renovate-global-cache",
-  "redisUrl": "redis://redis:6379",
   "allowShellExecutorForPostUpgradeCommands": true,
   "customEnvVariables": {
     "GOCACHE": "/tmp/go-build-cache",
@@ -11,7 +9,6 @@
     "UV_NO_CACHE": "true"
   },
   "repositoryCache": "enabled",
-  "repositoryCacheType": "redis://redis:6379/1",
   "cacheTtlOverride": {
     "changelog-*": 240,
     "datasource-*": 240,
