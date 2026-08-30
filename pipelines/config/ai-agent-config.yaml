@@ -45,6 +45,25 @@
 # To plug in a NON-listed implementation, build an image that honours the task
 # contract in README-ai-remediation.md and set AGENT_IMAGE / AI_PYTHON_IMAGE on
 # the PipelineRun -- this ConfigMap stays the single config surface.
+#
+# TLS trust for self-hosted endpoints
+# -----------------------------------
+# A self-hosted AI_BASE_URL served over HTTPS with a private CA (internal PKI or
+# a TLS-reencrypting egress proxy) fails the SDK handshake with
+# "CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate", because
+# the OpenAI/Anthropic Python SDKs verify only against certifi's public roots and
+# ignore SSL_CERT_FILE/SSL_VERIFY. Two ways to fix it:
+#   * Trust the CA (recommended). Create a ConfigMap holding the PEM:
+#       oc create configmap ai-endpoint-ca --from-file=ca-bundle.crt=<your-ca>.pem
+#     (or add the label config.openshift.io/inject-trusted-cabundle=true to have
+#     OpenShift populate ca-bundle.crt with the cluster + proxy trust bundle),
+#     then set AI_CA_BUNDLE below. The ai-select-cve task mounts this ConfigMap
+#     (optional) at /etc/ai-ca.
+#   * Disable verification (AI_TLS_INSECURE, demo/dev ONLY -- never production).
+# aider/litellm reach the endpoint differently: they honor SSL_VERIFY, so for the
+# aider tasks add SSL_VERIFY (a CA path, or "False" for demo-insecure) as an extra
+# key here; envFrom passes it through. Plaintext in-cluster HTTP (http://...svc)
+# sidesteps TLS entirely and needs none of this.
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: ConfigMap
@@ -58,6 +77,15 @@ data:
   AI_MODEL: "claude-opus-5"
   # Endpoint for AI_PROVIDER=gateway or AI_PROVIDER=openai (the model's /v1 URL):
   AI_BASE_URL: ""
+  # TLS trust for a self-hosted HTTPS endpoint with a private CA (see notes above).
+  # Path to a CA PEM the SDK should trust; empty = default (certifi) trust store.
+  # Point at the ai-endpoint-ca ConfigMap mounted by ai-select-cve, e.g.
+  # "/etc/ai-ca/ca-bundle.crt". For aider tasks, set SSL_VERIFY to the same path.
+  AI_CA_BUNDLE: ""
+  # Demo/dev ONLY: "true" disables TLS certificate verification. Leave "false" in
+  # production; prefer AI_CA_BUNDLE. (aider equivalent: set SSL_VERIFY="False".)
+  AI_TLS_INSECURE: "false"
+  SSL_VERIFY: "False"
   # Only used when AI_PROVIDER=bedrock:
   AWS_REGION: "us-east-1"
   # Only used when AI_PROVIDER=vertex:

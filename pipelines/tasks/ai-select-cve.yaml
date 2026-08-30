@@ -62,9 +62,22 @@ spec:
           name: ai-agent-config
       - secretRef:
           name: ai-agent-secret
+  volumes:
+    # Optional CA bundle for self-hosted / internal AI endpoints whose cert is
+    # signed by a private CA (or a TLS-reencrypting egress proxy). Create a
+    # ConfigMap named ai-endpoint-ca with the PEM, then set AI_CA_BUNDLE in
+    # ai-agent-config to the mounted file. Optional so the pod starts without it.
+    - name: endpoint-ca
+      configMap:
+        name: ai-endpoint-ca
+        optional: true
   steps:
     - name: select
       image: $(params.AI_PYTHON_IMAGE)
+      volumeMounts:
+        - name: endpoint-ca
+          mountPath: /etc/ai-ca
+          readOnly: true
       env:
         - name: HOME
           value: /tekton/home
@@ -129,6 +142,36 @@ spec:
         except Exception:
             pass
 
+        # ---- TLS trust for self-hosted / internal endpoints ----
+        # gpt-oss/Granite servers are commonly fronted by a private CA (or a
+        # TLS-reencrypting egress proxy) that the container's default trust store
+        # (certifi) doesn't know, so the SDK's HTTPS handshake fails with
+        # "CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate".
+        # Unlike litellm/aider, the OpenAI and Anthropic SDKs do NOT honor
+        # SSL_CERT_FILE / SSL_VERIFY env vars, so expose two opt-in knobs (set in
+        # ai-agent-config), secure by default:
+        #   AI_CA_BUNDLE    -> path to a CA PEM to trust (mount it via the
+        #                      ai-endpoint-ca ConfigMap; see the task's volumes)
+        #   AI_TLS_INSECURE -> "true"/"1"/"yes" disables verification (demo/dev ONLY)
+        def _tls_verify():
+            if os.environ.get("AI_TLS_INSECURE", "").strip().lower() in ("1", "true", "yes"):
+                sys.stderr.write("WARNING: AI_TLS_INSECURE set -- TLS certificate "
+                                 "verification is DISABLED. Do not use in production.\n")
+                return False
+            ca = os.environ.get("AI_CA_BUNDLE", "").strip()
+            return ca if ca else True
+
+        def _http_client(sdk_module):
+            # Return an http client (or None to keep the SDK default). Built from
+            # the SDK's OWN vendored httpx module so the instance type matches
+            # regardless of how the SDK vendors/names it.
+            verify = _tls_verify()
+            if verify is True:
+                return None
+            import importlib
+            hx = getattr(importlib.import_module(sdk_module + "._base_client"), "httpx")
+            return hx.Client(verify=verify)
+
         # ---- Build the provider-appropriate client ----
         # provider=openai routes to any OpenAI-compatible endpoint (OpenAI, vLLM,
         # Red Hat OpenShift AI, Ollama, watsonx) -- this is how gpt-oss and Granite
@@ -139,6 +182,7 @@ spec:
             oai = OpenAI(
                 base_url=(os.environ.get("AI_BASE_URL") or None),
                 api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
+                http_client=_http_client("openai"),
             )
         else:
             import anthropic
@@ -154,9 +198,10 @@ spec:
                     region=os.environ.get("VERTEX_REGION", "global"),
                 )
             elif provider == "gateway":
-                client = anthropic.Anthropic(base_url=os.environ["AI_BASE_URL"])
+                client = anthropic.Anthropic(base_url=os.environ["AI_BASE_URL"],
+                                             http_client=_http_client("anthropic"))
             else:
-                client = anthropic.Anthropic()
+                client = anthropic.Anthropic(http_client=_http_client("anthropic"))
 
         schema = {
             "type": "object",

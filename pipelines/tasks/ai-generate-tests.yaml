@@ -73,15 +73,32 @@ spec:
         #!/usr/bin/env bash
         set -euo pipefail
 
+        WORKDIR="$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+
         AGENT="${AI_AGENT:-claude-code}"
         MODEL="${AI_MODEL:-claude-opus-5}"
         echo "Generating tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL}"
 
+        # This task forks off clone-repository and runs in parallel with the
+        # build/scan chain's Maven build, which writes target/ in this same shared
+        # PVC directory. Two Maven builds sharing target/ collide -- overwriting a
+        # file another task pod created fails with "Operation not permitted"
+        # (maven-resources-plugin can't reset the mtime of a foreign-owned file).
+        # So run the agent + verification build in a private, pod-local copy of the
+        # repo (excluding the foreign-owned target/; tar re-owns to our uid on
+        # extract) and merge only the generated tests back at the end.
+        SCRATCH="/tekton/home/aitgt-work"
+        rm -rf "${SCRATCH}"; mkdir -p "${SCRATCH}"
+        tar -C "${WORKDIR}" --exclude=./target -cf - . | tar -C "${SCRATCH}" -xf -
+        cd "${SCRATCH}"
+
         PROMPT="You are working in a Quarkus/Maven project at the current directory.
         Generate JUnit 5 unit tests for classes that lack coverage. Put tests under
         src/test/java mirroring the package layout. Do NOT modify application source
-        under src/main. After writing tests, run 'mvn -B -q -Dstyle.color=never test'
-        and iterate until the tests you added pass. ${TEST_INSTRUCTIONS}"
+        under src/main. The relevant source files are already available to you --
+        do NOT ask for more files to be added; create the test files directly. After
+        writing tests, run 'mvn -B -q -Dstyle.color=never test' and iterate until the
+        tests you added pass. ${TEST_INSTRUCTIONS}"
 
         # --- Dispatch to the configured coding agent ---
         case "${AGENT}" in
@@ -94,11 +111,14 @@ spec:
             # Pass main sources as read-only reference so the agent only creates
             # files under src/test; --map-tokens bounds the repo-map context and
             # --subtree-only keeps aider scoped to this project dir.
+            # --no-show-model-warnings silences litellm's registry lookup for
+            # self-hosted models (gpt-oss/Granite aren't in its cost table).
             READ_ARGS=""
             for p in ${SOURCE_PATHS:-src/main/java}; do READ_ARGS="${READ_ARGS} --read ${p}"; done
             aider \
               --model "${AIDER_MODEL}" \
               --yes-always --no-auto-commits --no-check-update --no-gitignore \
+              --no-show-model-warnings \
               --map-tokens 1024 --subtree-only \
               ${READ_ARGS} \
               --message "${PROMPT}" \
@@ -123,10 +143,23 @@ spec:
             ;;
         esac
 
-        # Hard gate: the tests the agent added must pass on a clean invocation.
+        # Hard gate: the tests the agent added must pass. Runs in the isolated
+        # copy against its own target/, so no collision with the build chain.
         mvn -B -q -Dstyle.color=never test
 
-        # Report how many test files changed (for visibility / downstream logic).
-        ADDED="$(git -C "$(workspaces.source.path)/$(params.SUBDIRECTORY)" status --porcelain -- 'src/test/**' 2>/dev/null | wc -l | tr -d ' ')"
-        printf '%s' "${ADDED:-0}" > "$(results.TESTS_ADDED.path)"
-        echo "Staged test file changes: ${ADDED:-0}"
+        # Merge generated/changed test files back onto the shared workspace so
+        # ai-remediate-dependency and open-pr pick them up. Only touch src/test.
+        git add -A 2>/dev/null || true
+        # git status --porcelain emits "XY <path>"; strip the 3-char status prefix.
+        CHANGED="$(git status --porcelain -- 'src/test' 2>/dev/null | cut -c4-)"
+        COUNT=0
+        if [ -n "${CHANGED}" ]; then
+          while IFS= read -r f; do
+            [ -z "${f}" ] && continue
+            mkdir -p "${WORKDIR}/$(dirname "${f}")"
+            cp -f "${SCRATCH}/${f}" "${WORKDIR}/${f}"
+            COUNT=$((COUNT+1))
+          done <<< "${CHANGED}"
+        fi
+        printf '%s' "${COUNT}" > "$(results.TESTS_ADDED.path)"
+        echo "Staged test file changes: ${COUNT}"
