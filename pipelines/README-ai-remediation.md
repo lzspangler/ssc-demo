@@ -18,6 +18,79 @@ that, on top of the normal build → SBOM → RHTPA scan flow:
 The whole branch is gated behind `enable-ai-remediation` (default `"false"`), so
 the pipeline behaves exactly as before until you turn it on.
 
+## Overview
+
+The diagram shows each pipeline task (top-to-bottom in DAG order) and the
+**external systems** it talks to. Solid task-to-task arrows are the always-on
+build/scan chain; dotted arrows are the opt-in AI remediation branch. Solid edges
+to external systems are the interactions each task makes.
+
+```mermaid
+flowchart TB
+    subgraph EXT[External systems]
+        direction LR
+        SCM[("SCM / Git repo<br/>clone + branch + PR/MR")]
+        TAS["RHTAS<br/>Rekor · TUF · Fulcio"]
+        MVN[("Artifact repository<br/>Maven repo / mirror")]
+        REG[("Image registry")]
+        RHTPA["RHTPA / Trustify<br/>SBOM ingest · analyze · recommend"]
+        AI["AI model server<br/>Anthropic · gateway · Bedrock · Vertex · OpenAI-compatible"]
+        EC["Conforma / EC<br/>policy source"]
+        RH[("access.redhat.com<br/>OSV · CVE · CSAF · SBOM data")]
+    end
+
+    subgraph PIPE[maven-build-ci pipeline]
+        direction TB
+        init[init] --> clone[clone-repository]
+        clone --> verify["verify-commit<br/>optional"]
+        verify --> package["package · mvn"]
+        package --> build[build-container]
+        build --> upload[upload-sboms-to-trustification]
+        upload --> analyze[rhtpa-vulnerability-analysis]
+        analyze --> recommend[rhtpa-remediation-report]
+
+        clone -.->|AI branch| gentests[ai-generate-tests]
+        recommend -.-> conforma[conforma-policy-check]
+        conforma -.-> select[ai-select-cve]
+        select -.->|if a CVE is selected| remediate[ai-remediate-dependency]
+        gentests -.-> remediate
+        remediate -.-> rerun["re-run-tests · mvn verify"]
+        rerun -.-> openpr[open-pr]
+    end
+
+    clone -->|git clone| SCM
+    verify -->|verify signature| TAS
+    package -->|resolve deps| MVN
+    build -->|push image| REG
+    upload -->|upload SBOM| RHTPA
+    analyze -->|POST /vulnerability/analyze| RHTPA
+    recommend -->|POST /purl/recommend| RHTPA
+    gentests -->|reasoning + edits| AI
+    conforma -.->|optional policy fetch| EC
+    select -->|CVE selection| AI
+    remediate -->|reasoning + edits| AI
+    remediate -->|verify compile| MVN
+    rerun -->|resolve deps| MVN
+    openpr -->|push branch + open PR/MR| SCM
+    RHTPA -.->|importers ingest| RH
+```
+
+Notes:
+
+- **Base chain** (`init` → … → `rhtpa-remediation-report`) runs on every
+  PipelineRun. **`verify-commit`** only runs with `verify-commit="true"` (needs
+  RHTAS). The **AI branch** (dotted) only runs with `enable-ai-remediation="true"`,
+  and `ai-remediate-dependency`/`re-run-tests`/`open-pr` additionally require
+  `ai-select-cve` to actually pick a CVE.
+- `ai-generate-tests` forks off `clone-repository` and runs in parallel with the
+  build/scan chain; it rejoins at `ai-remediate-dependency`.
+- **RHTPA** must already contain vulnerability data — it populates itself from
+  `access.redhat.com` via its importers (dotted edge), independent of this
+  pipeline. See [RHTPA importers](#rhtpa-importers-populate-the-vulnerability-data).
+- The **AI model server** is whatever `ai-agent-config` points at (first-party
+  Anthropic, a gateway/proxy, Bedrock, Vertex, or any OpenAI-compatible endpoint
+  serving gpt-oss / Granite / etc.).
+
 ## Files
 
 | File | Purpose |
