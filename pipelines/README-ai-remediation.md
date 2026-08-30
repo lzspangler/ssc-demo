@@ -28,8 +28,8 @@ the pipeline behaves exactly as before until you turn it on.
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR |
-| `images/ai-agent-maven/Dockerfile` | Agent runtime (JDK17 + Maven + Claude Code + git/glab/gh) |
-| `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic Python SDK) |
+| `images/ai-agent-maven/Dockerfile` | Agent runtime (JDK17 + Maven + Claude Code + aider + git/glab/gh) |
+| `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic + OpenAI Python SDKs) |
 
 ## DAG
 
@@ -120,7 +120,10 @@ touching task YAML**. Two layers:
 
 ### 1. Provider/model/creds — ConfigMap + Secret
 
-`config/ai-agent-config.yaml` is the single switch. `AI_PROVIDER` is one of:
+`config/ai-agent-config.yaml` is the single switch, with two independent knobs.
+
+**`AI_PROVIDER`** — the wire protocol for the reasoning call (`ai-select-cve`)
+and Claude Code auth:
 
 | `AI_PROVIDER` | Extra ConfigMap keys | Secret keys | Notes |
 |---------------|----------------------|-------------|-------|
@@ -128,13 +131,58 @@ touching task YAML**. Two layers:
 | `gateway` | `AI_BASE_URL` | `ANTHROPIC_AUTH_TOKEN` (or key) | Any Anthropic-compatible gateway/proxy |
 | `bedrock` | `AWS_REGION` | AWS creds | Model auto-prefixed `anthropic.` |
 | `vertex` | `VERTEX_PROJECT_ID`, `VERTEX_REGION` | GCP creds | |
+| `openai` | `AI_BASE_URL` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint — **gpt-oss, IBM Granite** via vLLM / RHOAI / Ollama / watsonx |
+
+**`AI_AGENT`** — which coding-agent CLI drives the file-editing tasks
+(`ai-generate-tests`, `ai-remediate-dependency`):
+
+| `AI_AGENT` | Use with | Runtime |
+|------------|----------|---------|
+| `claude-code` (default) | `AI_PROVIDER` anthropic/gateway/bedrock/vertex | Claude Code headless (Anthropic protocol only) |
+| `aider` | `AI_PROVIDER=openai` | aider (litellm) — drives gpt-oss / Granite / any OpenAI-compatible model |
 
 `AI_MODEL` (default `claude-opus-5`) and `AI_EFFORT` (default `high`) are honored
-by both the Python selector and the Claude Code agent tasks. Both the bash agent
-tasks and the Python task read these via `envFrom` and translate them to the
-correct client/env (Claude Code: `CLAUDE_CODE_USE_BEDROCK`/`_USE_VERTEX`/
-`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL`; Python SDK: `AnthropicBedrockMantle` /
-`AnthropicVertex` / `base_url`).
+across tasks. Each task reads these via `envFrom` and translates them to the
+correct client/env: Claude Code → `CLAUDE_CODE_USE_BEDROCK`/`_USE_VERTEX`/
+`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL`; aider → `--model` (`openai/<AI_MODEL>` if
+unprefixed) + `OPENAI_API_BASE`/`OPENAI_API_KEY`; Python selector →
+`AnthropicBedrockMantle`/`AnthropicVertex`/`base_url` or the `openai` SDK's
+Chat Completions (strict `json_schema`, falling back to `json_object`).
+
+### Running gpt-oss or IBM Granite
+
+Point `AI_BASE_URL` at your model's OpenAI-compatible `/v1` endpoint (a vLLM or
+Red Hat OpenShift AI serving runtime, Ollama, or watsonx), then:
+
+```yaml
+# config/ai-agent-config.yaml  — gpt-oss example
+data:
+  AI_PROVIDER: "openai"
+  AI_AGENT:    "aider"
+  AI_MODEL:    "gpt-oss-120b"                       # aider uses openai/gpt-oss-120b
+  AI_BASE_URL: "http://vllm-gpt-oss.my-ns.svc:8000/v1"
+```
+
+```yaml
+# config/ai-agent-config.yaml  — IBM Granite example
+data:
+  AI_PROVIDER: "openai"
+  AI_AGENT:    "aider"
+  AI_MODEL:    "granite-3.3-8b-instruct"
+  AI_BASE_URL: "http://granite.my-ns.svc:8000/v1"
+```
+
+Then set `OPENAI_API_KEY` in `ai-agent-secret` (use any placeholder for servers
+that don't validate it, e.g. a bare vLLM/Ollama deployment). For Ollama or
+watsonx served natively (not openai-compat), set `AI_MODEL` to the full litellm
+string (`ollama_chat/granite3.3:8b`, `watsonx/ibm/granite-3-8b-instruct`) and add
+that provider's own env key (`OLLAMA_API_BASE`, `WATSONX_URL`, …) to the
+ConfigMap — `envFrom` passes any extra keys straight through.
+
+Egress: allow the model endpoint host instead of (or in addition to)
+`api.anthropic.com:443`. Both images already bundle the needed runtimes
+(`aider` + Python in the agent image, the `openai` SDK in the Python image), so
+no image changes are required to switch models.
 
 ### 2. Runtime — swappable images with a documented contract
 

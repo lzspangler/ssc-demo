@@ -15,9 +15,14 @@ RUN microdnf install -y jq ca-certificates && microdnf clean all
 
 # `bedrock` pulls boto3, `vertex` pulls google-auth; installing both keeps the
 # image provider-agnostic so AI_PROVIDER can be swapped via ConfigMap alone.
+# `openai` covers AI_PROVIDER=openai (gpt-oss, Granite, and any OpenAI-compatible
+# vLLM/RHOAI/Ollama/watsonx endpoint).
 ARG ANTHROPIC_VERSION=">=0.40,<1"
-RUN pip install --no-cache-dir "anthropic[bedrock,vertex]${ANTHROPIC_VERSION}" \
-    && python -c "import anthropic; print('anthropic', anthropic.__version__)"
+ARG OPENAI_VERSION=">=1.40"
+RUN pip install --no-cache-dir \
+      "anthropic[bedrock,vertex]${ANTHROPIC_VERSION}" \
+      "openai${OPENAI_VERSION}" \
+    && python -c "import anthropic, openai; print('anthropic', anthropic.__version__, '| openai', openai.__version__)"
 
 ENV HOME=/tekton/home
 RUN mkdir -p /tekton/home \

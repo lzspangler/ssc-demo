@@ -35,6 +35,15 @@ RUN curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && npm install -g @anthropic-ai/claude-code \
     && claude --version
 
+# aider (litellm-backed coding agent) for OpenAI-compatible models -- gpt-oss,
+# IBM Granite, and any vLLM/RHOAI/Ollama/watsonx endpoint. Selected at runtime
+# via AI_AGENT=aider. Needs a modern Python.
+RUN microdnf install -y python3.11 python3.11-pip \
+    && microdnf clean all \
+    && python3.11 -m pip install --no-cache-dir aider-chat \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && /usr/local/bin/aider --version 2>/dev/null || python3.11 -m aider --version
+
 # glab (GitLab CLI) for opening MRs.
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/') \
     && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${ARCH}.tar.gz" \

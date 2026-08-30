@@ -10,9 +10,10 @@ metadata:
 spec:
   description: >-
     Use an AI coding agent to generate JUnit unit tests for the application and
-    make them pass. Default implementation runs Claude Code headless; the backend
-    (provider/model/creds) is supplied via the ai-agent-config ConfigMap and
-    ai-agent-secret Secret. Swap the runtime by overriding AGENT_IMAGE.
+    make them pass. The coding agent is selected by AI_AGENT (claude-code |
+    aider); aider drives OpenAI-compatible models such as gpt-oss and Granite.
+    Backend (provider/model/creds) is supplied via the ai-agent-config ConfigMap
+    and ai-agent-secret Secret. Swap the runtime by overriding AGENT_IMAGE.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -60,16 +61,9 @@ spec:
         #!/usr/bin/env bash
         set -euo pipefail
 
-        # --- Configure the AI backend from ai-agent-config / ai-agent-secret ---
-        case "${AI_PROVIDER:-anthropic}" in
-          bedrock) export CLAUDE_CODE_USE_BEDROCK=1 ;;
-          vertex)  export CLAUDE_CODE_USE_VERTEX=1 ;;
-          gateway) export ANTHROPIC_BASE_URL="${AI_BASE_URL:?AI_BASE_URL required for gateway provider}" ;;
-          anthropic|*) : ;;
-        esac
-        export ANTHROPIC_MODEL="${AI_MODEL:-claude-opus-5}"
-
-        echo "Generating tests with provider=${AI_PROVIDER:-anthropic} model=${ANTHROPIC_MODEL}"
+        AGENT="${AI_AGENT:-claude-code}"
+        MODEL="${AI_MODEL:-claude-opus-5}"
+        echo "Generating tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL}"
 
         PROMPT="You are working in a Quarkus/Maven project at the current directory.
         Generate JUnit 5 unit tests for classes that lack coverage. Put tests under
@@ -77,13 +71,38 @@ spec:
         under src/main. After writing tests, run 'mvn -B -q -Dstyle.color=never test'
         and iterate until the tests you added pass. ${TEST_INSTRUCTIONS}"
 
-        # Headless, non-interactive agent run. --allowedTools limits what runs
-        # without prompting; acceptEdits lets it write files unattended.
-        claude -p "${PROMPT}" \
-          --model "${ANTHROPIC_MODEL}" \
-          --permission-mode acceptEdits \
-          --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
-          --output-format json | tee /tekton/home/claude-generate-tests.json
+        # --- Dispatch to the configured coding agent ---
+        case "${AGENT}" in
+          aider)
+            # OpenAI-compatible coding agent (gpt-oss, Granite, any vLLM/RHOAI/
+            # Ollama/watsonx endpoint). litellm reads OPENAI_API_BASE/OPENAI_API_KEY.
+            [ -n "${AI_BASE_URL:-}" ] && export OPENAI_API_BASE="${AI_BASE_URL}"
+            export OPENAI_API_KEY="${OPENAI_API_KEY:-placeholder}"
+            case "${MODEL}" in */*) AIDER_MODEL="${MODEL}";; *) AIDER_MODEL="openai/${MODEL}";; esac
+            aider \
+              --model "${AIDER_MODEL}" \
+              --yes-always --no-auto-commits --no-check-update --no-gitignore \
+              --message "${PROMPT}" \
+              pom.xml src/main 2>&1 | tee /tekton/home/aider-generate-tests.log
+            ;;
+          claude-code|*)
+            # Configure Claude Code auth from ai-agent-config / ai-agent-secret.
+            case "${AI_PROVIDER:-anthropic}" in
+              bedrock) export CLAUDE_CODE_USE_BEDROCK=1 ;;
+              vertex)  export CLAUDE_CODE_USE_VERTEX=1 ;;
+              gateway) export ANTHROPIC_BASE_URL="${AI_BASE_URL:?AI_BASE_URL required for gateway provider}" ;;
+              anthropic|*) : ;;
+            esac
+            export ANTHROPIC_MODEL="${MODEL}"
+            # Headless, non-interactive run. --allowedTools limits what runs
+            # without prompting; acceptEdits lets it write files unattended.
+            claude -p "${PROMPT}" \
+              --model "${ANTHROPIC_MODEL}" \
+              --permission-mode acceptEdits \
+              --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
+              --output-format json | tee /tekton/home/claude-generate-tests.json
+            ;;
+        esac
 
         # Hard gate: the tests the agent added must pass on a clean invocation.
         mvn -B -q -Dstyle.color=never test

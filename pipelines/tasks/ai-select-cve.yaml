@@ -115,23 +115,34 @@ spec:
         except Exception:
             pass
 
-        # ---- Build the provider-appropriate Anthropic client ----
-        import anthropic
-        if provider == "bedrock":
-            from anthropic import AnthropicBedrockMantle
-            client = AnthropicBedrockMantle(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
-            if not model.startswith("anthropic."):
-                model = "anthropic." + model
-        elif provider == "vertex":
-            from anthropic import AnthropicVertex
-            client = AnthropicVertex(
-                project_id=os.environ["VERTEX_PROJECT_ID"],
-                region=os.environ.get("VERTEX_REGION", "global"),
+        # ---- Build the provider-appropriate client ----
+        # provider=openai routes to any OpenAI-compatible endpoint (OpenAI, vLLM,
+        # Red Hat OpenShift AI, Ollama, watsonx) -- this is how gpt-oss and Granite
+        # are reached. Everything else uses the Anthropic Messages API.
+        family = "openai" if provider == "openai" else "anthropic"
+        if family == "openai":
+            from openai import OpenAI
+            oai = OpenAI(
+                base_url=(os.environ.get("AI_BASE_URL") or None),
+                api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
             )
-        elif provider == "gateway":
-            client = anthropic.Anthropic(base_url=os.environ["AI_BASE_URL"])
         else:
-            client = anthropic.Anthropic()
+            import anthropic
+            if provider == "bedrock":
+                from anthropic import AnthropicBedrockMantle
+                client = AnthropicBedrockMantle(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
+                if not model.startswith("anthropic."):
+                    model = "anthropic." + model
+            elif provider == "vertex":
+                from anthropic import AnthropicVertex
+                client = AnthropicVertex(
+                    project_id=os.environ["VERTEX_PROJECT_ID"],
+                    region=os.environ.get("VERTEX_REGION", "global"),
+                )
+            elif provider == "gateway":
+                client = anthropic.Anthropic(base_url=os.environ["AI_BASE_URL"])
+            else:
+                client = anthropic.Anthropic()
 
         schema = {
             "type": "object",
@@ -160,17 +171,43 @@ spec:
             "fixed version. If none qualify, set selected=false."
         )
 
-        resp = client.messages.create(
-            model=model,
-            max_tokens=4000,
-            thinking={"type": "adaptive"},
-            output_config={"effort": effort,
-                           "format": {"type": "json_schema", "schema": schema}},
-            system="You are a security remediation planner. Output only the schema.",
-            messages=[{"role": "user", "content": user}],
-        )
+        system = "You are a security remediation planner. Output only the schema."
 
-        text = "".join(b.text for b in resp.content if b.type == "text")
+        if family == "openai":
+            # OpenAI-compatible Chat Completions. Prefer strict json_schema
+            # (vLLM/RHOAI guided decoding, OpenAI); fall back to json_object for
+            # servers that don't support schema-constrained output (older Ollama).
+            def openai_call(response_format):
+                return oai.chat.completions.create(
+                    model=model,
+                    max_tokens=4000,
+                    response_format=response_format,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+            try:
+                resp = openai_call({
+                    "type": "json_schema",
+                    "json_schema": {"name": "cve_selection", "schema": schema, "strict": True},
+                })
+            except Exception as e:
+                print(f"json_schema not supported ({e}); retrying with json_object", file=sys.stderr)
+                resp = openai_call({"type": "json_object"})
+            text = resp.choices[0].message.content or "{}"
+        else:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=4000,
+                thinking={"type": "adaptive"},
+                output_config={"effort": effort,
+                               "format": {"type": "json_schema", "schema": schema}},
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            text = "".join(b.text for b in resp.content if b.type == "text")
+
         data = json.loads(text)
 
         selected = bool(data.get("selected")) and bool(data.get("fixed_version"))

@@ -6,15 +6,43 @@
 # by editing ONLY this file (and the companion Secret ai-agent-secret) -- no
 # pipeline or task edits required.
 #
-# AI_PROVIDER selects how the Claude client / Claude Code CLI authenticates:
+# There are two independent switches:
+#
+# AI_PROVIDER -- the wire protocol / hosting for the *reasoning* call
+#                (ai-select-cve) and for Claude Code auth:
 #   anthropic  -> first-party Anthropic API   (Secret: ANTHROPIC_API_KEY)
 #   gateway    -> any Claude-compatible gateway/proxy (e.g. LiteLLM, an
 #                 on-cluster relay). Set AI_BASE_URL; auth via
 #                 ANTHROPIC_AUTH_TOKEN in the Secret.
 #   bedrock    -> Amazon Bedrock             (Secret: AWS_* creds; set AWS_REGION)
 #   vertex     -> Google Vertex AI           (Secret: GCP creds; set VERTEX_*)
+#   openai     -> any OpenAI-compatible endpoint: OpenAI, vLLM, Red Hat OpenShift
+#                 AI, Ollama, or watsonx.ai (openai-compat). This is how you run
+#                 open-weight models such as gpt-oss and IBM Granite. Set
+#                 AI_BASE_URL to the /v1 endpoint; auth via OPENAI_API_KEY in the
+#                 Secret (use any placeholder for servers that don't check it).
 #
-# To plug in a NON-Claude implementation, build an image that honours the task
+# AI_AGENT -- which coding-agent CLI drives the file-editing tasks
+#             (ai-generate-tests, ai-remediate-dependency):
+#   claude-code -> Claude Code headless (Anthropic protocol only). Use with
+#                  AI_PROVIDER anthropic|gateway|bedrock|vertex.
+#   aider       -> aider (litellm-backed) for OpenAI-compatible models. Use with
+#                  AI_PROVIDER=openai to run gpt-oss / Granite / any vLLM/Ollama/
+#                  watsonx model.
+#
+# Model examples:
+#   Claude   : AI_PROVIDER=anthropic AI_AGENT=claude-code AI_MODEL=claude-opus-5
+#   gpt-oss  : AI_PROVIDER=openai    AI_AGENT=aider        AI_MODEL=gpt-oss-120b
+#              AI_BASE_URL=http://vllm-gpt-oss.my-ns.svc:8000/v1
+#   Granite  : AI_PROVIDER=openai    AI_AGENT=aider        AI_MODEL=granite-3.3-8b-instruct
+#              AI_BASE_URL=http://granite.my-ns.svc:8000/v1
+# For aider, AI_MODEL may be a bare id (defaults to the "openai/" litellm
+# provider) or a full litellm string, e.g. "ollama_chat/granite3.3:8b" or
+# "watsonx/ibm/granite-3-8b-instruct" -- in which case add that provider's own
+# env (OLLAMA_API_BASE, WATSONX_URL, ...) as extra keys here; envFrom passes them
+# through automatically.
+#
+# To plug in a NON-listed implementation, build an image that honours the task
 # contract in README-ai-remediation.md and set AGENT_IMAGE / AI_PYTHON_IMAGE on
 # the PipelineRun -- this ConfigMap stays the single config surface.
 # -----------------------------------------------------------------------------
@@ -26,13 +54,15 @@ metadata:
     app.kubernetes.io/part-of: maven-build-ci
 data:
   AI_PROVIDER: "anthropic"
+  AI_AGENT: "claude-code"
   AI_MODEL: "claude-opus-5"
-  # Only used when AI_PROVIDER=gateway (Claude-compatible endpoint):
+  # Endpoint for AI_PROVIDER=gateway or AI_PROVIDER=openai (the model's /v1 URL):
   AI_BASE_URL: ""
   # Only used when AI_PROVIDER=bedrock:
   AWS_REGION: "us-east-1"
   # Only used when AI_PROVIDER=vertex:
   VERTEX_PROJECT_ID: ""
   VERTEX_REGION: "global"
-  # Effort / verbosity knob passed to the model where supported (low|medium|high|xhigh|max):
+  # Effort / verbosity knob passed to the model where supported (low|medium|high|xhigh|max).
+  # For gpt-oss this maps to reasoning effort; ignored by models that don't support it.
   AI_EFFORT: "high"
