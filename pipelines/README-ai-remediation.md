@@ -24,6 +24,7 @@ the pipeline behaves exactly as before until you turn it on.
 |------|---------|
 | `pipelines/maven-build-ci-pipeline-ai.yaml` | Pipeline with the gated AI branch wired into the existing DAG |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
+| `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
 | `secrets/scm-auth-secret.example.yaml` | Example Secret — Git token for opening the PR/MR |
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
@@ -57,6 +58,126 @@ additionally gated on `ai-select-cve` actually picking a CVE, so a clean scan
 generated tests to the workspace. Because Tekton's "skipped-parent still runs the
 successor" semantics don't apply when the successor's own `when` fails, the tail
 of the branch is short-circuited cleanly when there's nothing to fix.
+
+## Prerequisites
+
+Everything below is assumed to be in place **before** the `## One-time setup`
+commands. Items marked _(base pipeline)_ are required even with the AI branch off;
+the rest are only needed when `enable-ai-remediation="true"`. The examples use the
+namespace `tssc-app-ci` — substitute your own.
+
+### Platform
+
+| Requirement | Notes |
+|-------------|-------|
+| OpenShift 4.x _(base pipeline)_ | Target cluster. |
+| **OpenShift Pipelines** (Tekton) operator _(base pipeline)_ | Provides `Task`/`Pipeline`/`PipelineRun` CRDs and the referenced cluster tasks (`init`, `git-clone`, `maven`, `build-container`/buildah, `verify-commit`). |
+| **RHTPA 2.2.6** (Red Hat Trusted Profile Analyzer / Trustify) _(base pipeline)_ | Reachable from the cluster, with its OIDC issuer. Its vulnerability data must be **populated** — see [RHTPA importers](#rhtpa-importers-populate-the-vulnerability-data). |
+| **Trusted Artifact Signer** (TAS) — _optional_ | Only if you run with `verify-commit="true"`. Supplies Rekor/TUF/Fulcio; drives the `oidc-issuer`, `rekor-url`, `tuf-mirror`, `certificate-identity` params. Left `"false"` by default. |
+| Egress | RHTPA importers reach `access.redhat.com` (Red Hat SBOM/CSAF/OSV data); the AI provider endpoint (`api.anthropic.com:443` by default, or your gateway/Bedrock/Vertex/OpenAI-compatible host); the SCM host (`gitlab.com`/`github.com` or your on-prem SCM); and the image registry. Image **builds** additionally pull from `archive.apache.org`, `rpm.nodesource.com`, `gitlab.com`, `github.com`. |
+
+### Secrets & ConfigMaps (in the pipeline namespace)
+
+| Object | Kind | Required when | Keys / contents |
+|--------|------|---------------|-----------------|
+| `tpa-secret` | Secret | _(base pipeline)_ | `bombastic_api_url`, `oidc_issuer_url`, `oidc_client_id`, `oidc_client_secret`. Consumed by the RHTPA tasks **and** the importer Job. (Name overridable via `trustification-secret-name`.) |
+| `ai-agent-config` | ConfigMap | AI branch | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
+| `ai-agent-secret` | Secret | AI branch | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
+| `scm-auth-secret` | Secret | AI branch (PR step) | `username` + `token` with push + PR/MR-create scope. From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
+
+### Workspaces / PVCs
+
+The `PipelineRun` must bind these workspaces (declared on the pipeline):
+
+| Workspace | Backing | Purpose |
+|-----------|---------|---------|
+| `workspace` | PVC (RWO/RWX) | Source, SBOMs, and the RHTPA reports the AI branch reads. |
+| `maven-settings` | ConfigMap/Secret with `settings.xml` | Maven repo/mirror config for `package` + `re-run-tests`. |
+| `git-auth` | basic-auth Secret | Clone credentials for `git-clone`. |
+| `gitops-auth` | Secret | As required by your base pipeline. |
+
+### Container images (AI branch)
+
+Build and push the two runtime images and set `agent-image` / `ai-python-image`
+(they default to `quay.io/REPLACE_ME/...:v1.0.0`). Commands are in
+[One-time setup](#one-time-setup) below.
+
+### RHTPA importers (populate the vulnerability data)
+
+RHTPA ships with an importer set seeded at install, but the two heavyweight Red
+Hat importers are **disabled by default** because their first ingest is large and
+slow. Until they run, `/purl/recommend` returns nothing (the recommend catalog is
+empty), which is why the pipeline treats the **analyze** report as authoritative
+and the **recommend** report as supplemental.
+
+| Importer | Default | Provides | Needed for |
+|----------|---------|----------|------------|
+| `osv-github` | **enabled** | Upstream OSV/GHSA advisories | `analyze` findings (CVE + severity) |
+| `cve` | **enabled** | NVD CVE records | `analyze` findings |
+| `redhat-csaf` | **disabled** | Red Hat CSAF/VEX (fix status for Red Hat products) | Richer advisory/fix context |
+| `redhat-sboms` | **disabled** | Red Hat SBOM rebuild catalog | Populating `/purl/recommend` (the supplemental signal) |
+| `quay-redhat-user-workloads` | disabled | — | Not used by this pipeline |
+
+**Enabling is a runtime setting in Trustify's database managed via the
+`/api/v2/importer` REST API — RHTPA 2.2.6 does not expose it as an operator CR
+field.** So the closest thing to "declarative" is an **idempotent Job** that
+applies the API calls; commit it and apply it with the rest of your manifests (or
+run it as an Argo CD sync hook / one-off `oc apply`):
+
+```
+oc -n tssc-app-ci apply -f config/rhtpa-enable-importers-job.yaml
+oc -n tssc-app-ci logs -f job/rhtpa-enable-importers
+```
+
+The Job (`config/rhtpa-enable-importers-job.yaml`) reads `tpa-secret`, flips each
+importer's nested `disabled` flag to `false`, and forces an immediate run. It is
+safe to re-run (re-apply after `oc delete job rhtpa-enable-importers`); set the
+`IMPORTERS` env in the manifest to change which importers it targets.
+
+<details>
+<summary>Equivalent manual API calls (for debugging)</summary>
+
+```bash
+# token helper (client-credentials; tokens are short-lived, re-mint per call)
+auth() {
+  ep=$(curl -sf "${OIDC_ISSUER_URL%/}/.well-known/openid-configuration" | jq -r .token_endpoint)
+  echo "Authorization: Bearer $(curl -sf --user "$OIDC_CLIENT_ID:$OIDC_CLIENT_SECRET" \
+        -d grant_type=client_credentials "$ep" | jq -r .access_token)"
+}
+
+# 1. list importers + their REAL state (disabled lives under the type key)
+curl -sf -H "$(auth)" "$RHTPA_URL/api/v2/importer" \
+  | jq -r '.[] | "\(.name)\tdisabled=\(.configuration|to_entries[0].value.disabled)\tlastRun=\(.lastRun)\tlastError=\(.lastError)"'
+
+# 2. enable (flip the NESTED disabled, then PUT the whole configuration back)
+name=redhat-sboms
+curl -sf -H "$(auth)" "$RHTPA_URL/api/v2/importer/$name" | jq '.configuration' \
+ | jq '(to_entries[0].key) as $k | .[$k].disabled=false' \
+ | curl -sf -X PUT -H "$(auth)" -H 'Content-Type: application/json' \
+        --data @- "$RHTPA_URL/api/v2/importer/$name"
+
+# 3. force an immediate run
+curl -sf -X POST -H "$(auth)" "$RHTPA_URL/api/v2/importer/$name/force"
+
+# 4. poll: state while running; the /report .items array fills in on completion
+curl -sf -H "$(auth)" "$RHTPA_URL/api/v2/importer/$name" | jq '{state,lastRun,lastSuccess,lastError}'
+curl -sf -H "$(auth)" "$RHTPA_URL/api/v2/importer/$name/report" | jq '{total, first: .items[0]}'
+```
+
+Gotchas that bite: the importer name is `redhat-sboms` (plural); `disabled` is
+nested under the type key (`.configuration.sbom.disabled`), so setting a
+top-level `.disabled` silently does nothing and, because `PUT` replaces the whole
+config, can even re-disable it; and `force` on a still-disabled importer is a
+no-op. Verify `disabled=false` **before** forcing.
+</details>
+
+**Timing:** `redhat-sboms` is the long pole — tens of GB, commonly **hours** for
+the first run (`numberOfItems` climbs across report entries via `continuation`).
+Treat it as done only when the importer shows a non-null `lastSuccess` (a non-null
+`lastError` such as `Import aborted` means it failed — usually a transient
+network/pod-restart during the large fetch; re-run the Job). Once `redhat-sboms`
+succeeds, re-test `/purl/recommend` for a Red Hat-shipped component to confirm the
+catalog is populated.
 
 ## One-time setup
 
