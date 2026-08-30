@@ -80,13 +80,24 @@ spec:
         MODEL="${AI_MODEL:-claude-opus-5}"
         echo "Remediating ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION} (agent=${AGENT} model=${MODEL})"
 
+        WORKDIR="$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+
+        # The workspace repo was cloned by a different uid; this pod runs as an
+        # arbitrary OpenShift uid, so git aborts with "detected dubious ownership".
+        # Mark the repo safe for every git call here -- the agent's internal
+        # `git add` and our own `git status` at the end.
+        git config --global --add safe.directory "${WORKDIR}"
+        git config --global --add safe.directory "$(workspaces.source.path)"
+        git config --global user.email "pipeline@tekton.local" 2>/dev/null || true
+        git config --global user.name "tekton-pipeline" 2>/dev/null || true
+
         PROMPT="Update the Maven dependency '${PACKAGE}' to version '${FIXED_VERSION}'
         to remediate ${CVE_ID}. Edit pom.xml -- prefer dependencyManagement or a BOM
         property if the project uses one. Current version is '${CURRENT_VERSION}'.
-        Do NOT change unrelated dependencies or application logic. Then run
-        'mvn -B -q -Dstyle.color=never -DskipTests install' to confirm the project
-        still resolves and compiles. Finally write a short REMEDIATION.md at the
-        project root describing the change and this rationale: ${JUSTIFICATION}"
+        Do NOT change unrelated dependencies or application logic. Do NOT run any
+        build or shell commands -- the build is verified separately. Finally write a
+        short REMEDIATION.md at the project root describing the change and this
+        rationale: ${JUSTIFICATION}"
 
         # --- Dispatch to the configured coding agent ---
         case "${AGENT}" in
@@ -118,9 +129,24 @@ spec:
             ;;
         esac
 
-        # Verify compile independently of the agent's own run.
-        mvn -B -q -Dstyle.color=never -DskipTests install
+        # Verify compile independently of the agent's own run, in a pod-local copy.
+        # target/ on the shared PVC was created by an earlier task pod under a
+        # different uid, and Maven's resources plugin can't overwrite those
+        # foreign-owned files ("Operation not permitted"). Exclude target/ (tar
+        # re-owns to our uid on extract); the agent's pom.xml edit stays on the
+        # shared workspace for open-pr to commit. --warning=no-file-changed +
+        # tolerating tar's exit 1 handles a dir-mtime bump during the read.
+        SCRATCH="/tekton/home/airemediate-work"
+        rm -rf "${SCRATCH}"; mkdir -p "${SCRATCH}"
+        set +e
+        tar -C "${WORKDIR}" --exclude=./target --warning=no-file-changed -cf - . \
+          | tar -C "${SCRATCH}" -xf -
+        rcs=("${PIPESTATUS[@]}")
+        set -e
+        if [ "${rcs[0]}" -gt 1 ]; then echo "source tar failed (rc=${rcs[0]})"; exit 1; fi
+        if [ "${rcs[1]}" -ne 0 ]; then echo "extract tar failed (rc=${rcs[1]})"; exit 1; fi
+        ( cd "${SCRATCH}" && mvn -B -q -Dstyle.color=never -DskipTests install )
 
-        CHANGED="$(git -C "$(workspaces.source.path)/$(params.SUBDIRECTORY)" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | wc -l | tr -d ' ')"
+        CHANGED="$(git -C "${WORKDIR}" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | wc -l | tr -d ' ')"
         printf '%s' "$([ "${CHANGED:-0}" -gt 0 ] && echo 1 || echo 0)" > "$(results.CHANGED.path)"
         echo "Build file changes: ${CHANGED:-0}"
