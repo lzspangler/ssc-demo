@@ -106,12 +106,19 @@ spec:
           value: $(results.JUSTIFICATION.path)
       script: |
         #!/usr/bin/env python3
-        import json, os, sys
+        import json, os, re, sys
 
         provider = os.environ.get("AI_PROVIDER", "anthropic")
         model = os.environ.get("AI_MODEL", "claude-opus-5")
         effort = os.environ.get("AI_EFFORT", "high")
         ws = os.environ["WORKSPACE_PATH"]
+        # Char budget for the two big report blobs, so the prompt stays under the
+        # model's context window. Self-hosted gpt-oss/Granite are commonly 128K
+        # tokens; the full analyze report (every CVE's description prose) alone can
+        # blow past that. ~4 chars/token, and we leave generous headroom for the
+        # schema, instructions, and the completion.
+        VULN_CHAR_BUDGET = int(os.environ.get("AI_VULN_CHAR_BUDGET", "260000"))
+        REPORT_CHAR_BUDGET = int(os.environ.get("AI_REPORT_CHAR_BUDGET", "40000"))
 
         def read_json(path, default):
             try:
@@ -142,6 +149,68 @@ spec:
         except Exception:
             pass
 
+        # ---- Trim the reports to the must-fix CVEs to fit the context window ----
+        # The AI only ever selects from the must-fix set, so the analyze report's
+        # per-CVE detail prose (where the fixed version lives) and findings are
+        # only needed for those CVEs. Dropping every other CVE's detail is what
+        # brings a 160K-token dump back under a 128K-token model. A hard char
+        # budget backstops pathological cases (huge must-fix set, unparseable JSON).
+        def _mustfix_ids(raw):
+            ids = set()
+            try:
+                arr = json.loads(raw)
+            except Exception:
+                arr = []
+            for item in (arr if isinstance(arr, list) else []):
+                if isinstance(item, str):
+                    ids.add(item)
+                elif isinstance(item, dict):
+                    for k in ("cve_id", "id", "cve", "identifier", "term"):
+                        v = item.get(k)
+                        if isinstance(v, str):
+                            ids.add(v)
+            return ids
+
+        def _cve_toks(ids):
+            toks = set()
+            for i in ids:
+                toks.add(i)
+                for m in re.findall(r"CVE-\d{4}-\d+", i, re.I):
+                    toks.add(m.upper())
+            return toks
+
+        def _trim_vuln(raw, ids):
+            try:
+                v = json.loads(raw)
+            except Exception:
+                return raw
+            if not isinstance(v, dict):
+                return raw
+            idset = set(ids)
+            toks = _cve_toks(ids)
+            def match(cid):
+                return isinstance(cid, str) and (cid in idset or cid.upper() in toks)
+            findings = [f for f in (v.get("findings") or [])
+                        if isinstance(f, dict) and match(f.get("cve_id"))]
+            details = [d for d in (v.get("details") or [])
+                       if isinstance(d, dict) and match(d.get("identifier") or d.get("id"))]
+            # If nothing matched (e.g. conforma terms that aren't bare CVE ids),
+            # keep the compact findings for context but still drop the huge details.
+            if not findings:
+                findings = [f for f in (v.get("findings") or []) if isinstance(f, dict)]
+            return json.dumps({"findings": findings, "details": details})
+
+        def _cap(s, limit):
+            if len(s) <= limit:
+                return s
+            return s[:limit] + "\n...[truncated %d chars to fit the model context]..." % (len(s) - limit)
+
+        ids = _mustfix_ids(mustfix)
+        vuln = _cap(_trim_vuln(vuln, ids), VULN_CHAR_BUDGET)
+        report = _cap(report, REPORT_CHAR_BUDGET)
+        print("prompt sizes (chars): mustfix=%d vuln=%d report=%d"
+              % (len(mustfix), len(vuln), len(report)), file=sys.stderr)
+
         # ---- TLS trust for self-hosted / internal endpoints ----
         # gpt-oss/Granite servers are commonly fronted by a private CA (or a
         # TLS-reencrypting egress proxy) that the container's default trust store
@@ -163,13 +232,22 @@ spec:
 
         def _http_client(sdk_module):
             # Return an http client (or None to keep the SDK default). Built from
-            # the SDK's OWN vendored httpx module so the instance type matches
-            # regardless of how the SDK vendors/names it.
+            # the SDK's OWN vendored httpx module so the instance type matches:
+            # recent SDKs vendor httpx under the name "httpx2" (and import it as
+            # such, so _base_client.httpx may not exist), older ones use "httpx".
             verify = _tls_verify()
             if verify is True:
                 return None
             import importlib
-            hx = getattr(importlib.import_module(sdk_module + "._base_client"), "httpx")
+            bc = importlib.import_module(sdk_module + "._base_client")
+            hx = getattr(bc, "httpx", None) or getattr(bc, "httpx2", None)
+            if hx is None:
+                for mod in ("httpx2", "httpx"):
+                    try:
+                        hx = importlib.import_module(mod)
+                        break
+                    except ImportError:
+                        continue
             return hx.Client(verify=verify)
 
         # ---- Build the provider-appropriate client ----
@@ -242,10 +320,20 @@ spec:
             "policy. Determine PACKAGE and CURRENT_VERSION from its affected_purl "
             "and the FIXED_VERSION from the analyze findings/details as described "
             "above. You must supply a concrete fixed version; if you cannot "
-            "confidently determine one for any must-fix CVE, set selected=false."
+            "confidently determine one for any must-fix CVE, set selected=false.\n\n"
+            "Every field must hold a REAL value taken from the data above -- e.g. "
+            "package \"com.fasterxml.jackson.core:jackson-databind\", "
+            "current_version \"2.13.2\", fixed_version \"2.13.4.2\", "
+            "cve_id \"CVE-2020-36518\". Never emit a JSON Schema, field types, "
+            "comments, code fences, or placeholder words like \"string\"."
         )
 
-        system = "You are a security remediation planner. Output only the schema."
+        system = (
+            "You are a security remediation planner. Respond with ONLY a single "
+            "JSON object that conforms to the given schema, populated with real "
+            "values derived from the input. Do NOT output the schema itself, field "
+            "types, comments, code fences, or placeholder values."
+        )
 
         if family == "openai":
             # OpenAI-compatible Chat Completions. Prefer strict json_schema
@@ -282,13 +370,67 @@ spec:
             )
             text = "".join(b.text for b in resp.content if b.type == "text")
 
-        data = json.loads(text)
+        # Extract the JSON object even when the model wraps it in markdown fences
+        # or leaks gpt-oss "harmony" channel markers (assistant/analysis/final)
+        # or /* ... */ comments -- guided decoding is not always enforced by
+        # OpenAI-compatible gateways, so never trust the response to be clean.
+        def _extract_json(t):
+            if not t:
+                return {}
+            t = t.strip()
+            t = re.sub(r"^\s*(assistant|analysis|final|commentary)\b[:>]*", "", t, flags=re.I)
+            t = t.replace("```json5", "").replace("```json", "").replace("```", "")
+            s, e = t.find("{"), t.rfind("}")
+            if s != -1 and e != -1 and e > s:
+                cand = re.sub(r"/\*.*?\*/", "", t[s:e + 1], flags=re.S)
+                try:
+                    return json.loads(cand)
+                except Exception:
+                    pass
+            try:
+                return json.loads(t)
+            except Exception:
+                return {}
 
-        selected = bool(data.get("selected")) and bool(data.get("fixed_version"))
-        write_result("R_SELECTED", "1" if selected else "0")
-        write_result("R_CVE_ID", data.get("cve_id", "") if selected else "")
-        write_result("R_PACKAGE", data.get("package", "") if selected else "")
-        write_result("R_CURRENT_VERSION", data.get("current_version", "") if selected else "")
-        write_result("R_FIXED_VERSION", data.get("fixed_version", "") if selected else "")
-        write_result("R_JUSTIFICATION", data.get("justification", "") if selected else "")
+        data = _extract_json(text)
+        if not isinstance(data, dict):
+            data = {}
+
+        # Guard against the model echoing the schema / placeholders. A selection is
+        # only honored if every field the downstream remediation needs holds a real
+        # value: package looks like groupId:artifactId, the versions contain digits,
+        # and the CVE is actually in the must-fix set. Otherwise -> SELECTED=0, so a
+        # junk response can never trigger a bogus dependency bump.
+        def _placeholder(v):
+            if not isinstance(v, str):
+                return True
+            s = v.strip().lower()
+            return (not s or s in ("string", "null", "none", "n/a")
+                    or "schema" in s or "/*" in s or "assistant" in s or "```" in s)
+
+        pkg = str(data.get("package", "")).strip()
+        cur = str(data.get("current_version", "")).strip()
+        fix = str(data.get("fixed_version", "")).strip()
+        cve = str(data.get("cve_id", "")).strip()
+        toks = _cve_toks(ids)
+
+        valid = (
+            bool(data.get("selected"))
+            and ":" in pkg and not _placeholder(pkg)
+            and not _placeholder(fix) and re.search(r"\d", fix) is not None
+            and not _placeholder(cur) and re.search(r"\d", cur) is not None
+            and (not ids or cve in ids or cve.upper() in toks)
+        )
+        if bool(data.get("selected")) and not valid:
+            print("Model returned selected=true but the payload failed validation "
+                  "(placeholder/echoed schema or CVE not in must-fix); treating as "
+                  "no selection.", file=sys.stderr)
+            print("Raw model text:\n" + text, file=sys.stderr)
+
+        write_result("R_SELECTED", "1" if valid else "0")
+        write_result("R_CVE_ID", cve if valid else "")
+        write_result("R_PACKAGE", pkg if valid else "")
+        write_result("R_CURRENT_VERSION", cur if valid else "")
+        write_result("R_FIXED_VERSION", fix if valid else "")
+        write_result("R_JUSTIFICATION", str(data.get("justification", "")).strip() if valid else "")
         print(json.dumps(data, indent=2))
