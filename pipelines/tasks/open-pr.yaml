@@ -1,0 +1,153 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: open-pr
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "git, pull-request, gitlab, github"
+spec:
+  description: >-
+    Commit the accumulated working-tree changes (generated tests + dependency
+    remediation) to a new branch and open a PR/MR back to the application repo.
+    Supports GitLab (glab) and GitHub (gh). Auth comes from the SCM_SECRET_NAME
+    secret (keys: token, username).
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      default: source
+    - name: GIT_URL
+      type: string
+      description: HTTPS URL of the application repository.
+    - name: GIT_HOST
+      type: string
+      description: SCM host, e.g. gitlab-gitlab.apps.cluster.example.com
+    - name: SCM_PROVIDER
+      type: string
+      description: gitlab | github
+      default: gitlab
+    - name: BASE_BRANCH
+      type: string
+      default: master
+    - name: CVE_ID
+      type: string
+    - name: PACKAGE
+      type: string
+    - name: FIXED_VERSION
+      type: string
+    - name: JUSTIFICATION
+      type: string
+      default: ""
+    - name: SCM_SECRET_NAME
+      type: string
+      default: scm-auth-secret
+    - name: GIT_IMAGE
+      type: string
+      default: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8:latest
+  workspaces:
+    - name: source
+  results:
+    - name: PR_URL
+      description: URL of the created PR/MR (empty if none created).
+  volumes:
+    - name: scm-secret
+      secret:
+        secretName: $(params.SCM_SECRET_NAME)
+        optional: false
+  steps:
+    - name: open-pr
+      image: $(params.GIT_IMAGE)
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      volumeMounts:
+        - name: scm-secret
+          mountPath: /run/secrets/scm
+          readOnly: true
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: JUSTIFICATION
+          value: $(params.JUSTIFICATION)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        TOKEN="$(cat /run/secrets/scm/token)"
+        USERNAME="$(cat /run/secrets/scm/username 2>/dev/null || echo oauth2)"
+
+        if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git status --porcelain)" ]; then
+          echo "Changes detected; preparing PR."
+        else
+          echo "No changes to submit; skipping PR."
+          printf '' > "$(results.PR_URL.path)"
+          exit 0
+        fi
+
+        BRANCH="rhtpa/remediate-${CVE_ID:-update}-$(date +%s)"
+        git config user.email "tekton-bot@${GIT_HOST}"
+        git config user.name  "TSSC Remediation Bot"
+        git checkout -b "${BRANCH}"
+        git add -A
+        git commit -m "fix(${CVE_ID}): bump ${PACKAGE} to ${FIXED_VERSION} + add unit tests
+
+        ${JUSTIFICATION}
+
+        Automated by the maven-build-ci AI remediation pipeline."
+
+        # Build an authenticated push URL from GIT_URL (strip any scheme/creds).
+        REPO_PATH="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
+        PUSH_URL="https://${USERNAME}:${TOKEN}@${GIT_HOST}/${REPO_PATH}.git"
+        git push "${PUSH_URL}" "${BRANCH}"
+
+        TITLE="Remediate ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION} (+ generated tests)"
+        BODY="Automated remediation from the maven-build-ci pipeline.
+
+        - CVE: ${CVE_ID}
+        - Dependency: ${PACKAGE} -> ${FIXED_VERSION}
+        - Rationale: ${JUSTIFICATION}
+
+        Includes AI-generated unit tests. Please review before merging."
+
+        PR_URL=""
+        case "${SCM_PROVIDER}" in
+          gitlab)
+            export GITLAB_HOST="${GIT_HOST}"
+            export GITLAB_TOKEN="${TOKEN}"
+            PR_URL="$(glab mr create \
+              --source-branch "${BRANCH}" \
+              --target-branch "${BASE_BRANCH}" \
+              --title "${TITLE}" \
+              --description "${BODY}" \
+              --yes 2>&1 | grep -Eo 'https?://[^ ]+/-/merge_requests/[0-9]+' | head -1 || true)"
+            ;;
+          github)
+            export GH_HOST="${GIT_HOST}"
+            export GH_TOKEN="${TOKEN}"
+            PR_URL="$(gh pr create \
+              --base "${BASE_BRANCH}" \
+              --head "${BRANCH}" \
+              --title "${TITLE}" \
+              --body "${BODY}" 2>&1 | grep -Eo 'https?://[^ ]+/pull/[0-9]+' | head -1 || true)"
+            ;;
+          *)
+            echo "Unsupported SCM_PROVIDER: ${SCM_PROVIDER}" >&2
+            exit 1
+            ;;
+        esac
+
+        echo "PR/MR: ${PR_URL:-<none captured>}"
+        printf '%s' "${PR_URL}" > "$(results.PR_URL.path)"

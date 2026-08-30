@@ -1,0 +1,94 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ai-generate-tests
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "ai, testing, maven"
+spec:
+  description: >-
+    Use an AI coding agent to generate JUnit unit tests for the application and
+    make them pass. Default implementation runs Claude Code headless; the backend
+    (provider/model/creds) is supplied via the ai-agent-config ConfigMap and
+    ai-agent-secret Secret. Swap the runtime by overriding AGENT_IMAGE.
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      description: Project subdirectory within the source workspace (where pom.xml lives).
+      default: source
+    - name: AGENT_IMAGE
+      type: string
+      description: Container image providing the AI agent runtime (JDK17 + Maven + Claude Code).
+      default: quay.io/REPLACE_ME/ai-agent-maven:latest
+    - name: TEST_INSTRUCTIONS
+      type: string
+      description: Extra natural-language guidance for the test-generation agent.
+      default: >-
+        Prioritize public service and business-logic classes that currently lack
+        coverage. Keep tests deterministic and offline (no network, no live DB).
+  workspaces:
+    - name: source
+      description: Workspace containing the application source (shared PVC).
+  results:
+    - name: TESTS_ADDED
+      description: Number of new/changed test files staged by the agent.
+  stepTemplate:
+    envFrom:
+      - configMapRef:
+          name: ai-agent-config
+      - secretRef:
+          name: ai-agent-secret
+    env:
+      - name: HOME
+        value: /tekton/home
+  steps:
+    - name: generate-and-run
+      image: $(params.AGENT_IMAGE)
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      computeResources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      env:
+        - name: TEST_INSTRUCTIONS
+          value: $(params.TEST_INSTRUCTIONS)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        # --- Configure the AI backend from ai-agent-config / ai-agent-secret ---
+        case "${AI_PROVIDER:-anthropic}" in
+          bedrock) export CLAUDE_CODE_USE_BEDROCK=1 ;;
+          vertex)  export CLAUDE_CODE_USE_VERTEX=1 ;;
+          gateway) export ANTHROPIC_BASE_URL="${AI_BASE_URL:?AI_BASE_URL required for gateway provider}" ;;
+          anthropic|*) : ;;
+        esac
+        export ANTHROPIC_MODEL="${AI_MODEL:-claude-opus-5}"
+
+        echo "Generating tests with provider=${AI_PROVIDER:-anthropic} model=${ANTHROPIC_MODEL}"
+
+        PROMPT="You are working in a Quarkus/Maven project at the current directory.
+        Generate JUnit 5 unit tests for classes that lack coverage. Put tests under
+        src/test/java mirroring the package layout. Do NOT modify application source
+        under src/main. After writing tests, run 'mvn -B -q -Dstyle.color=never test'
+        and iterate until the tests you added pass. ${TEST_INSTRUCTIONS}"
+
+        # Headless, non-interactive agent run. --allowedTools limits what runs
+        # without prompting; acceptEdits lets it write files unattended.
+        claude -p "${PROMPT}" \
+          --model "${ANTHROPIC_MODEL}" \
+          --permission-mode acceptEdits \
+          --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
+          --output-format json | tee /tekton/home/claude-generate-tests.json
+
+        # Hard gate: the tests the agent added must pass on a clean invocation.
+        mvn -B -q -Dstyle.color=never test
+
+        # Report how many test files changed (for visibility / downstream logic).
+        ADDED="$(git -C "$(workspaces.source.path)/$(params.SUBDIRECTORY)" status --porcelain -- 'src/test/**' 2>/dev/null | wc -l | tr -d ' ')"
+        printf '%s' "${ADDED:-0}" > "$(results.TESTS_ADDED.path)"
+        echo "Staged test file changes: ${ADDED:-0}"

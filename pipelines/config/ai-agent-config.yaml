@@ -1,0 +1,38 @@
+# -----------------------------------------------------------------------------
+# Pluggable AI backend configuration (non-secret).
+#
+# Every AI task in this pipeline reads its backend settings from this ConfigMap
+# via `envFrom`, so you can point the whole pipeline at a different LLM backend
+# by editing ONLY this file (and the companion Secret ai-agent-secret) -- no
+# pipeline or task edits required.
+#
+# AI_PROVIDER selects how the Claude client / Claude Code CLI authenticates:
+#   anthropic  -> first-party Anthropic API   (Secret: ANTHROPIC_API_KEY)
+#   gateway    -> any Claude-compatible gateway/proxy (e.g. LiteLLM, an
+#                 on-cluster relay). Set AI_BASE_URL; auth via
+#                 ANTHROPIC_AUTH_TOKEN in the Secret.
+#   bedrock    -> Amazon Bedrock             (Secret: AWS_* creds; set AWS_REGION)
+#   vertex     -> Google Vertex AI           (Secret: GCP creds; set VERTEX_*)
+#
+# To plug in a NON-Claude implementation, build an image that honours the task
+# contract in README-ai-remediation.md and set AGENT_IMAGE / AI_PYTHON_IMAGE on
+# the PipelineRun -- this ConfigMap stays the single config surface.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-agent-config
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+data:
+  AI_PROVIDER: "anthropic"
+  AI_MODEL: "claude-opus-5"
+  # Only used when AI_PROVIDER=gateway (Claude-compatible endpoint):
+  AI_BASE_URL: ""
+  # Only used when AI_PROVIDER=bedrock:
+  AWS_REGION: "us-east-1"
+  # Only used when AI_PROVIDER=vertex:
+  VERTEX_PROJECT_ID: ""
+  VERTEX_REGION: "global"
+  # Effort / verbosity knob passed to the model where supported (low|medium|high|xhigh|max):
+  AI_EFFORT: "high"

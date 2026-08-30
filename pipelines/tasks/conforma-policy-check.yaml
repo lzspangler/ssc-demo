@@ -1,0 +1,121 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: conforma-policy-check
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "conforma, policy, security"
+spec:
+  description: >-
+    Produce the machine-checkable "must-fix" set of vulnerabilities that the AI
+    remediation step must choose from. If a Conforma (Enterprise Contract) policy
+    is configured it is evaluated with the `ec` CLI; otherwise a severity-based
+    fallback derives the must-fix list from the RHTPA remediation report (CVEs
+    that have an available fixed version). Writes must-fix-cves.json to the
+    workspace for the AI selector to consume.
+  params:
+    - name: REMEDIATION_REPORT_PATH
+      type: string
+      description: Absolute path (on the workspace) to the RHTPA remediation JSON.
+      default: ""
+    - name: SBOMS_DIR
+      type: string
+      default: sboms
+    - name: POLICY_CONFIGURATION
+      type: string
+      description: >-
+        Conforma/EC policy source (git url, bundle, or policy name). Leave empty
+        to use the severity-based fallback instead of running `ec`.
+      default: ""
+    - name: SEVERITY_THRESHOLD
+      type: string
+      description: Fallback only. Minimum severity considered must-fix (low|medium|high|critical).
+      default: high
+    - name: EC_IMAGE
+      type: string
+      default: quay.io/enterprise-contract/ec-cli:latest
+  workspaces:
+    - name: workspace
+  results:
+    - name: MUST_FIX_PATH
+      description: Path to the JSON array of policy must-fix CVEs.
+    - name: MUST_FIX_COUNT
+      description: Number of must-fix CVEs.
+  steps:
+    - name: evaluate
+      image: $(params.EC_IMAGE)
+      workingDir: $(workspaces.workspace.path)
+      env:
+        - name: REMEDIATION_REPORT_PATH
+          value: $(params.REMEDIATION_REPORT_PATH)
+        - name: SBOMS_DIR
+          value: $(params.SBOMS_DIR)
+        - name: POLICY_CONFIGURATION
+          value: $(params.POLICY_CONFIGURATION)
+        - name: SEVERITY_THRESHOLD
+          value: $(params.SEVERITY_THRESHOLD)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        WS="$(workspaces.workspace.path)"
+        OUT_DIR="${WS}/rhtpa"
+        mkdir -p "${OUT_DIR}"
+        MUST_FIX="${OUT_DIR}/must-fix-cves.json"
+
+        REPORT="${REMEDIATION_REPORT_PATH:-${OUT_DIR}/remediation.json}"
+        if [[ ! -f "${REPORT}" ]]; then
+          echo "WARN: remediation report not found at ${REPORT}; emitting empty must-fix set."
+          echo '[]' > "${MUST_FIX}"
+          printf '%s' "${MUST_FIX}" > "$(results.MUST_FIX_PATH.path)"
+          printf '0' > "$(results.MUST_FIX_COUNT.path)"
+          exit 0
+        fi
+
+        if [[ -n "${POLICY_CONFIGURATION}" ]]; then
+          # ---- Conforma / Enterprise Contract path (author your rego here) ----
+          echo "Evaluating Conforma policy: ${POLICY_CONFIGURATION}"
+          ec validate input \
+            --file "${REPORT}" \
+            --policy "${POLICY_CONFIGURATION}" \
+            --output json > "${OUT_DIR}/conforma-result.json" || true
+          # Extract violating CVE ids from the EC result into the must-fix list.
+          # Adjust the .metadata.code selector to match your policy's rules.
+          jq '[.. | objects
+                | select((.metadata.code? // "") | test("cve"))
+                | (.metadata.term? // .msg? // "")
+              ] | map(select(. != "")) | unique' \
+            "${OUT_DIR}/conforma-result.json" > "${MUST_FIX}" || echo '[]' > "${MUST_FIX}"
+        else
+          # ---- Severity-based fallback derived from the RHTPA remediation report ----
+          echo "No Conforma policy configured; using severity fallback >= ${SEVERITY_THRESHOLD}"
+          # Rank severities; keep CVEs whose recommendation is 'Fixed' (fix available).
+          jq --arg thr "${SEVERITY_THRESHOLD}" '
+            def rank(s):
+              {critical:4, high:3, medium:2, low:1, none:0}[(s // "none")|ascii_downcase] // 0;
+            [ .recommendations // {}
+              | to_entries[]
+              | .key as $inpurl
+              | .value[]
+              | .package as $fixpkg
+              | .vulnerabilities[]?
+              | select((.status // "") == "Fixed")
+              | { cve_id: .id,
+                  input_purl: $inpurl,
+                  recommended_package: $fixpkg,
+                  severity: (.severity // "unknown"),
+                  status: .status,
+                  justification: (.justification // null) }
+              | select(rank(.severity) >= rank($thr) or .severity == "unknown")
+            ] | unique_by(.cve_id)
+          ' "${REPORT}" > "${MUST_FIX}"
+        fi
+
+        COUNT="$(jq 'length' "${MUST_FIX}")"
+        echo "Must-fix CVE count: ${COUNT}"
+        cat "${MUST_FIX}"
+
+        printf '%s' "${MUST_FIX}" > "$(results.MUST_FIX_PATH.path)"
+        printf '%s' "${COUNT}" > "$(results.MUST_FIX_COUNT.path)"

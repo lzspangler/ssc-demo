@@ -1,0 +1,174 @@
+# AI vulnerability remediation branch for `maven-build-ci`
+
+This extends the existing `maven-build-ci` pipeline with an **opt-in** AI branch
+that, on top of the normal build → SBOM → RHTPA scan flow:
+
+1. Generates and runs unit tests for the app (AI coding agent).
+2. Turns the RHTPA remediation report into a policy **must-fix** set
+   (Conforma/Enterprise Contract gate, with a severity-based fallback).
+3. Asks the AI to select **exactly one** CVE to remediate, constrained to the
+   must-fix set and steered by a user-defined policy.
+4. Has the AI update the vulnerable Maven dependency to its fixed version.
+5. Re-runs all tests (existing + generated) with `mvn verify`.
+6. Opens a **PR/MR** back to the app repo with the tests + remediation.
+
+The whole branch is gated behind `enable-ai-remediation` (default `"false"`), so
+the pipeline behaves exactly as before until you turn it on.
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `pipelines/maven-build-ci-pipeline-ai.yaml` | Pipeline with the gated AI branch wired into the existing DAG |
+| `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
+| `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
+| `secrets/scm-auth-secret.example.yaml` | Example Secret — Git token for opening the PR/MR |
+| `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
+| `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
+| `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
+| `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
+| `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR |
+| `images/ai-agent-maven/Dockerfile` | Agent runtime (JDK17 + Maven + Claude Code + git/glab/gh) |
+| `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic Python SDK) |
+
+## DAG
+
+```
+init → clone-repository ─┬─ verify-commit → package → build-container → upload-sboms → rhtpa-vuln-analysis → rhtpa-remediation-report
+                         │                                                                                          │
+                         │                                                                          conforma-policy-check
+                         │                                                                                          │
+                         └─ ai-generate-tests ───────────────┐                                              ai-select-cve
+                                                             │                                                     │
+                                          ai-remediate-dependency  ←──────────────────────────────────────────────┘
+                                                             │      (only if ai-select-cve.SELECTED == "1")
+                                                       re-run-tests (mvn verify)
+                                                             │
+                                                          open-pr
+```
+
+`ai-generate-tests` runs in parallel with the build/scan chain (both fork off
+`clone-repository`). `ai-remediate-dependency`, `re-run-tests`, and `open-pr` are
+additionally gated on `ai-select-cve` actually picking a CVE, so a clean scan
+(nothing must-fix) skips remediation and the PR but still contributes the
+generated tests to the workspace. Because Tekton's "skipped-parent still runs the
+successor" semantics don't apply when the successor's own `when` fails, the tail
+of the branch is short-circuited cleanly when there's nothing to fix.
+
+## One-time setup
+
+1. **Build & push the two images**, then set the pipeline params (or edit the
+   defaults) `agent-image` and `ai-python-image`:
+   ```
+   podman build -t quay.io/<org>/ai-agent-maven:latest images/ai-agent-maven && podman push quay.io/<org>/ai-agent-maven:latest
+   podman build -t quay.io/<org>/ai-python:latest      images/ai-python      && podman push quay.io/<org>/ai-python:latest
+   ```
+
+2. **Create the AI backend Secret** in `tssc-app-ci` from the example (fill in a
+   real key; do not commit it):
+   ```
+   oc -n tssc-app-ci create -f secrets/ai-agent-secret.example.yaml   # after editing REPLACE_ME
+   ```
+
+3. **Apply the ConfigMap** (this is where you pick the provider/model):
+   ```
+   oc -n tssc-app-ci apply -f config/ai-agent-config.yaml
+   ```
+
+4. **Create the SCM Secret** with a token that can push a branch and open a
+   PR/MR (GitLab: `api` + `write_repository`; GitHub: Contents + Pull requests
+   write):
+   ```
+   oc -n tssc-app-ci create -f secrets/scm-auth-secret.example.yaml   # after editing REPLACE_ME
+   ```
+
+5. **Apply the tasks + pipeline:**
+   ```
+   oc -n tssc-app-ci apply -f tasks/
+   oc -n tssc-app-ci apply -f pipelines/maven-build-ci-pipeline-ai.yaml
+   ```
+
+6. **Egress:** the cluster must allow the selected provider's endpoint
+   (`api.anthropic.com:443` for the default `anthropic` provider; your gateway /
+   Bedrock / Vertex endpoint otherwise) plus `gitlab.com`/`github.com` release
+   downloads at image-build time.
+
+## Turning it on
+
+Set the gate and the SCM params on the PipelineRun (or in the PaC template):
+
+```yaml
+params:
+  - name: enable-ai-remediation
+    value: "true"
+  - name: git-host
+    value: gitlab-gitlab.apps.cluster.example.com
+  - name: scm-provider
+    value: gitlab            # or github
+  - name: base-branch
+    value: master
+```
+
+Optional: override `ai-remediation-policy` (free-form CVE-prioritization policy
+for the AI) and/or `conforma-policy-configuration` (an EC policy source; empty
+uses the severity fallback keeping fixed-available CVEs at/above `high`).
+
+## Swapping the AI backend (pluggable)
+
+The backend is abstracted so different AI implementations plug in **without
+touching task YAML**. Two layers:
+
+### 1. Provider/model/creds — ConfigMap + Secret
+
+`config/ai-agent-config.yaml` is the single switch. `AI_PROVIDER` is one of:
+
+| `AI_PROVIDER` | Extra ConfigMap keys | Secret keys | Notes |
+|---------------|----------------------|-------------|-------|
+| `anthropic` (default) | — | `ANTHROPIC_API_KEY` | Direct api.anthropic.com |
+| `gateway` | `AI_BASE_URL` | `ANTHROPIC_AUTH_TOKEN` (or key) | Any Anthropic-compatible gateway/proxy |
+| `bedrock` | `AWS_REGION` | AWS creds | Model auto-prefixed `anthropic.` |
+| `vertex` | `VERTEX_PROJECT_ID`, `VERTEX_REGION` | GCP creds | |
+
+`AI_MODEL` (default `claude-opus-5`) and `AI_EFFORT` (default `high`) are honored
+by both the Python selector and the Claude Code agent tasks. Both the bash agent
+tasks and the Python task read these via `envFrom` and translate them to the
+correct client/env (Claude Code: `CLAUDE_CODE_USE_BEDROCK`/`_USE_VERTEX`/
+`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL`; Python SDK: `AnthropicBedrockMantle` /
+`AnthropicVertex` / `base_url`).
+
+### 2. Runtime — swappable images with a documented contract
+
+To plug in a *different agent implementation entirely* (not just a different
+Claude backend), replace the images via `agent-image` / `ai-python-image`. Any
+replacement must honor these task contracts:
+
+**`ai-generate-tests`** — workspace `source`, working dir
+`<source>/<SUBDIRECTORY>`. Must generate JUnit tests under `src/test/**`, run
+them, and leave changes in the working tree. Result `TESTS_ADDED` = count of
+added/changed test files. Env available via `envFrom` (provider/model/creds).
+
+**`ai-select-cve`** — inputs via env: `REMEDIATION_REPORT_PATH`, `MUST_FIX_PATH`
+(JSON array; empty ⇒ must emit `SELECTED=0`), `POLICY_CONTEXT`. Must write these
+results: `SELECTED` (`0`/`1`), `CVE_ID`, `PACKAGE` (`groupId:artifactId`),
+`CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`. Must pick from the must-fix
+set only, and require a concrete fixed version.
+
+**`ai-remediate-dependency`** — inputs via params/env: `CVE_ID`, `PACKAGE`,
+`CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`. Must edit `pom.xml` to the
+fixed version (only that dependency), confirm the project still compiles, and
+leave changes in the working tree. Result `CHANGED` = `0`/`1`.
+
+As long as a replacement image provides the same binaries/entrypoints the task
+scripts call (or you also swap the task's `taskRef`), the rest of the pipeline is
+unaffected.
+
+## Safety notes
+
+- **PRs are never auto-merged** — every change lands on a branch for human review.
+- Secrets are mounted (`envFrom`/volume), never baked into images; the examples
+  ship with `REPLACE_ME` placeholders and must not be committed with real values.
+- User-controlled values flow into the Python task via env (`R_*`,
+  `POLICY_CONTEXT`) rather than string-interpolated into source, to avoid script
+  injection.
+- **Cost/latency:** each AI task makes real model calls. Consider a `timeout` on
+  the AI tasks and start with `AI_EFFORT: medium` if cost is a concern.

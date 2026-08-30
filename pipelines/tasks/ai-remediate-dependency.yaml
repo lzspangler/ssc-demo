@@ -1,0 +1,104 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ai-remediate-dependency
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "ai, security, remediation, maven"
+spec:
+  description: >-
+    Use an AI coding agent to update the selected vulnerable Maven dependency to
+    its fixed version and confirm the project still resolves/compiles. Operates
+    on the shared source workspace so the change accumulates alongside generated
+    tests for a single PR. Backend pluggable via ai-agent-config / ai-agent-secret.
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      default: source
+    - name: CVE_ID
+      type: string
+    - name: PACKAGE
+      type: string
+      description: Maven coordinates (groupId:artifactId) to update.
+    - name: CURRENT_VERSION
+      type: string
+      default: ""
+    - name: FIXED_VERSION
+      type: string
+    - name: JUSTIFICATION
+      type: string
+      default: ""
+    - name: AGENT_IMAGE
+      type: string
+      default: quay.io/REPLACE_ME/ai-agent-maven:latest
+  workspaces:
+    - name: source
+  results:
+    - name: CHANGED
+      description: "1 if the agent modified the build files, else 0."
+  stepTemplate:
+    envFrom:
+      - configMapRef:
+          name: ai-agent-config
+      - secretRef:
+          name: ai-agent-secret
+    env:
+      - name: HOME
+        value: /tekton/home
+  steps:
+    - name: remediate
+      image: $(params.AGENT_IMAGE)
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      computeResources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      env:
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: CURRENT_VERSION
+          value: $(params.CURRENT_VERSION)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: JUSTIFICATION
+          value: $(params.JUSTIFICATION)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        case "${AI_PROVIDER:-anthropic}" in
+          bedrock) export CLAUDE_CODE_USE_BEDROCK=1 ;;
+          vertex)  export CLAUDE_CODE_USE_VERTEX=1 ;;
+          gateway) export ANTHROPIC_BASE_URL="${AI_BASE_URL:?AI_BASE_URL required for gateway provider}" ;;
+          anthropic|*) : ;;
+        esac
+        export ANTHROPIC_MODEL="${AI_MODEL:-claude-opus-5}"
+
+        echo "Remediating ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION}"
+
+        PROMPT="Update the Maven dependency '${PACKAGE}' to version '${FIXED_VERSION}'
+        to remediate ${CVE_ID}. Edit pom.xml -- prefer dependencyManagement or a BOM
+        property if the project uses one. Current version is '${CURRENT_VERSION}'.
+        Do NOT change unrelated dependencies or application logic. Then run
+        'mvn -B -q -Dstyle.color=never -DskipTests install' to confirm the project
+        still resolves and compiles. Finally write a short REMEDIATION.md at the
+        project root describing the change and this rationale: ${JUSTIFICATION}"
+
+        claude -p "${PROMPT}" \
+          --model "${ANTHROPIC_MODEL}" \
+          --permission-mode acceptEdits \
+          --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
+          --output-format json | tee /tekton/home/claude-remediate.json
+
+        # Verify compile independently of the agent's own run.
+        mvn -B -q -Dstyle.color=never -DskipTests install
+
+        CHANGED="$(git -C "$(workspaces.source.path)/$(params.SUBDIRECTORY)" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | wc -l | tr -d ' ')"
+        printf '%s' "$([ "${CHANGED:-0}" -gt 0 ] && echo 1 || echo 0)" > "$(results.CHANGED.path)"
+        echo "Build file changes: ${CHANGED:-0}"

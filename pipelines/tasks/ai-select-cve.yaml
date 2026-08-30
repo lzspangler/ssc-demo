@@ -1,0 +1,183 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ai-select-cve
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "ai, security, remediation"
+spec:
+  description: >-
+    Ask the AI to choose exactly ONE dependency vulnerability to remediate, given
+    the RHTPA remediation report, the Conforma must-fix set (policy gate), and a
+    user-defined policy (free-form context). Emits the decision as small Tekton
+    results. Backend is pluggable via ai-agent-config / ai-agent-secret; runtime
+    via AI_PYTHON_IMAGE.
+  params:
+    - name: REMEDIATION_REPORT_PATH
+      type: string
+      description: Absolute path (on the workspace) to the RHTPA remediation JSON.
+      default: ""
+    - name: MUST_FIX_PATH
+      type: string
+      description: Absolute path (on the workspace) to the Conforma must-fix JSON array.
+      default: ""
+    - name: POLICY_CONTEXT
+      type: string
+      description: User-defined prioritization policy (natural language).
+      default: >-
+        Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
+        version. Avoid major-version bumps unless required to obtain the fix.
+        Never select a CVE without a concrete fixed version. Prefer changes that
+        touch a single dependency.
+    - name: AI_PYTHON_IMAGE
+      type: string
+      description: Image with the Anthropic Python SDK installed.
+      default: quay.io/REPLACE_ME/ai-python:latest
+  workspaces:
+    - name: workspace
+  results:
+    - name: SELECTED
+      description: "1 if a CVE was selected, 0 if none qualified."
+    - name: CVE_ID
+    - name: PACKAGE
+      description: Maven coordinates (groupId:artifactId) of the dependency to bump.
+    - name: CURRENT_VERSION
+    - name: FIXED_VERSION
+    - name: JUSTIFICATION
+  stepTemplate:
+    envFrom:
+      - configMapRef:
+          name: ai-agent-config
+      - secretRef:
+          name: ai-agent-secret
+  steps:
+    - name: select
+      image: $(params.AI_PYTHON_IMAGE)
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: WORKSPACE_PATH
+          value: $(workspaces.workspace.path)
+        - name: REMEDIATION_REPORT_PATH
+          value: $(params.REMEDIATION_REPORT_PATH)
+        - name: MUST_FIX_PATH
+          value: $(params.MUST_FIX_PATH)
+        - name: POLICY_CONTEXT
+          value: $(params.POLICY_CONTEXT)
+        # Result file paths, passed to Python via env to avoid source interpolation.
+        - name: R_SELECTED
+          value: $(results.SELECTED.path)
+        - name: R_CVE_ID
+          value: $(results.CVE_ID.path)
+        - name: R_PACKAGE
+          value: $(results.PACKAGE.path)
+        - name: R_CURRENT_VERSION
+          value: $(results.CURRENT_VERSION.path)
+        - name: R_FIXED_VERSION
+          value: $(results.FIXED_VERSION.path)
+        - name: R_JUSTIFICATION
+          value: $(results.JUSTIFICATION.path)
+      script: |
+        #!/usr/bin/env python3
+        import json, os, sys
+
+        provider = os.environ.get("AI_PROVIDER", "anthropic")
+        model = os.environ.get("AI_MODEL", "claude-opus-5")
+        effort = os.environ.get("AI_EFFORT", "high")
+        ws = os.environ["WORKSPACE_PATH"]
+
+        def read_json(path, default):
+            try:
+                with open(path) as f:
+                    return f.read()
+            except Exception:
+                return default
+
+        report_path = os.environ.get("REMEDIATION_REPORT_PATH") or f"{ws}/rhtpa/remediation.json"
+        mustfix_path = os.environ.get("MUST_FIX_PATH") or f"{ws}/rhtpa/must-fix-cves.json"
+        report = read_json(report_path, "{}")
+        mustfix = read_json(mustfix_path, "[]")
+
+        def write_result(name_env, value):
+            with open(os.environ[name_env], "w") as f:
+                f.write(str(value))
+
+        # If the policy gate produced nothing to fix, exit cleanly with SELECTED=0.
+        try:
+            if len(json.loads(mustfix)) == 0:
+                print("No must-fix CVEs; nothing to remediate.")
+                for e in ("R_SELECTED",): write_result(e, "0")
+                for e in ("R_CVE_ID","R_PACKAGE","R_CURRENT_VERSION","R_FIXED_VERSION","R_JUSTIFICATION"):
+                    write_result(e, "")
+                sys.exit(0)
+        except Exception:
+            pass
+
+        # ---- Build the provider-appropriate Anthropic client ----
+        import anthropic
+        if provider == "bedrock":
+            from anthropic import AnthropicBedrockMantle
+            client = AnthropicBedrockMantle(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
+            if not model.startswith("anthropic."):
+                model = "anthropic." + model
+        elif provider == "vertex":
+            from anthropic import AnthropicVertex
+            client = AnthropicVertex(
+                project_id=os.environ["VERTEX_PROJECT_ID"],
+                region=os.environ.get("VERTEX_REGION", "global"),
+            )
+        elif provider == "gateway":
+            client = anthropic.Anthropic(base_url=os.environ["AI_BASE_URL"])
+        else:
+            client = anthropic.Anthropic()
+
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["selected", "cve_id", "package", "current_version",
+                         "fixed_version", "justification"],
+            "properties": {
+                "selected": {"type": "boolean"},
+                "cve_id": {"type": "string"},
+                "package": {"type": "string",
+                            "description": "Maven groupId:artifactId to update"},
+                "current_version": {"type": "string"},
+                "fixed_version": {"type": "string"},
+                "justification": {"type": "string"},
+            },
+        }
+
+        user = (
+            "User-defined policy:\n" + os.environ["POLICY_CONTEXT"] + "\n\n"
+            "Conforma must-fix CVEs (policy gate -- choose only from these):\n"
+            + mustfix + "\n\n"
+            "RHTPA remediation report (recommended fixed packages are PURLs, "
+            "e.g. pkg:maven/group/artifact@1.2.3 -- derive Maven coordinates and "
+            "fixed version from them):\n" + report + "\n\n"
+            "Select exactly ONE CVE that satisfies the policy and has a concrete "
+            "fixed version. If none qualify, set selected=false."
+        )
+
+        resp = client.messages.create(
+            model=model,
+            max_tokens=4000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": effort,
+                           "format": {"type": "json_schema", "schema": schema}},
+            system="You are a security remediation planner. Output only the schema.",
+            messages=[{"role": "user", "content": user}],
+        )
+
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        data = json.loads(text)
+
+        selected = bool(data.get("selected")) and bool(data.get("fixed_version"))
+        write_result("R_SELECTED", "1" if selected else "0")
+        write_result("R_CVE_ID", data.get("cve_id", "") if selected else "")
+        write_result("R_PACKAGE", data.get("package", "") if selected else "")
+        write_result("R_CURRENT_VERSION", data.get("current_version", "") if selected else "")
+        write_result("R_FIXED_VERSION", data.get("fixed_version", "") if selected else "")
+        write_result("R_JUSTIFICATION", data.get("justification", "") if selected else "")
+        print(json.dumps(data, indent=2))
