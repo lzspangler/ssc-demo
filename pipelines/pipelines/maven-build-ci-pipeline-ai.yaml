@@ -138,8 +138,11 @@ spec:
       default: ""
     - name: agent-image
       type: string
-      description: AI coding-agent runtime image (JDK17 + Maven + Claude Code).
-      default: quay.io/REPLACE_ME/ai-agent-maven:v1.0.0
+      description: >-
+        AI coding-agent runtime image (JDK17 + Maven + the agent CLI). Use the
+        flavor matching AI_AGENT: ai-agent-maven-claude for claude-code (default),
+        ai-agent-maven-aider for aider.
+      default: quay.io/REPLACE_ME/ai-agent-maven-claude:v1.0.0
     - name: ai-python-image
       type: string
       description: Image with the Anthropic Python SDK for the CVE selector.

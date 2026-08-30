@@ -21,8 +21,11 @@ spec:
       default: source
     - name: AGENT_IMAGE
       type: string
-      description: Container image providing the AI agent runtime (JDK17 + Maven + Claude Code).
-      default: quay.io/REPLACE_ME/ai-agent-maven:v1.0.0
+      description: >-
+        Container image providing the AI agent runtime (JDK17 + Maven + the agent
+        CLI). Use the flavor matching AI_AGENT: ai-agent-maven-claude for
+        claude-code (default), ai-agent-maven-aider for aider.
+      default: quay.io/REPLACE_ME/ai-agent-maven-claude:v1.0.0
     - name: TEST_INSTRUCTIONS
       type: string
       description: Extra natural-language guidance for the test-generation agent.

@@ -32,7 +32,11 @@ spec:
       default: ""
     - name: AGENT_IMAGE
       type: string
-      default: quay.io/REPLACE_ME/ai-agent-maven:v1.0.0
+      description: >-
+        AI agent runtime image (JDK17 + Maven + the agent CLI). Use the flavor
+        matching AI_AGENT: ai-agent-maven-claude for claude-code (default),
+        ai-agent-maven-aider for aider.
+      default: quay.io/REPLACE_ME/ai-agent-maven-claude:v1.0.0
   workspaces:
     - name: source
   results:

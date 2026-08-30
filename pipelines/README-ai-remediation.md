@@ -105,7 +105,8 @@ Notes:
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR |
-| `images/ai-agent-maven/Dockerfile` | Agent runtime (JDK17 + Maven + Claude Code + aider + git/glab/gh) |
+| `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
+| `images/ai-agent-maven-aider/Dockerfile` | Agent runtime, **aider** flavor (ubi-minimal + JDK17 + Maven + Python/aider + git/glab/gh) |
 | `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic + OpenAI Python SDKs) |
 
 ## DAG
@@ -171,8 +172,19 @@ The `PipelineRun` must bind these workspaces (declared on the pipeline):
 
 ### Container images (AI branch)
 
-Build and push the two runtime images and set `agent-image` / `ai-python-image`
-(they default to `quay.io/REPLACE_ME/...:v1.0.0`). Commands are in
+The agent runtime ships in **two flavors**, one per `AI_AGENT` backend — build the
+one matching your configured backend (or both, if you switch between them):
+
+| Image | `AI_AGENT` | Contains |
+| --- | --- | --- |
+| `ai-agent-maven-claude` | `claude-code` (default) | Node.js + Claude Code |
+| `ai-agent-maven-aider` | `aider` | Python 3.11 + aider |
+
+Both are built on `ubi9/ubi-minimal` + `java-17-openjdk-devel` (leaner than the
+`ubi9/openjdk-17` builder image — the S2I scripts and bundled Maven are dropped)
+and both carry JDK17 + Maven + git/glab/gh. Point `agent-image` at whichever
+matches `AI_AGENT`; build+push the CVE-selector `ai-python-image` as well. Images
+default to `quay.io/REPLACE_ME/...:v1.0.0`. Commands are in
 [One-time setup](#one-time-setup) below.
 
 ### RHTPA importers (populate the vulnerability data)
@@ -254,12 +266,18 @@ catalog is populated.
 
 ## One-time setup
 
-1. **Build & push the two images**, then set the pipeline params (or edit the
-   defaults) `agent-image` and `ai-python-image`:
+1. **Build & push the images**, then set the pipeline params (or edit the
+   defaults) `agent-image` and `ai-python-image`. Build the agent flavor matching
+   your `AI_AGENT` (or both):
    ```
-   podman build -t quay.io/<org>/ai-agent-maven:v1.0.0 images/ai-agent-maven && podman push quay.io/<org>/ai-agent-maven:v1.0.0
-   podman build -t quay.io/<org>/ai-python:v1.0.0      images/ai-python      && podman push quay.io/<org>/ai-python:v1.0.0
+   # Claude Code flavor (AI_AGENT=claude-code, the default):
+   podman build -t quay.io/<org>/ai-agent-maven-claude:v1.0.0 images/ai-agent-maven-claude && podman push quay.io/<org>/ai-agent-maven-claude:v1.0.0
+   # aider flavor (AI_AGENT=aider):
+   podman build -t quay.io/<org>/ai-agent-maven-aider:v1.0.0  images/ai-agent-maven-aider  && podman push quay.io/<org>/ai-agent-maven-aider:v1.0.0
+   # CVE-selector runtime:
+   podman build -t quay.io/<org>/ai-python:v1.0.0            images/ai-python             && podman push quay.io/<org>/ai-python:v1.0.0
    ```
+   Set `agent-image` to the `-claude` or `-aider` reference to match `AI_AGENT`.
 
 2. **Create the AI backend Secret** in `tssc-app-ci` from the example (fill in a
    real key; do not commit it):
@@ -380,9 +398,11 @@ that provider's own env key (`OLLAMA_API_BASE`, `WATSONX_URL`, …) to the
 ConfigMap — `envFrom` passes any extra keys straight through.
 
 Egress: allow the model endpoint host instead of (or in addition to)
-`api.anthropic.com:443`. Both images already bundle the needed runtimes
-(`aider` + Python in the agent image, the `openai` SDK in the Python image), so
-no image changes are required to switch models.
+`api.anthropic.com:443`. Switching to `AI_AGENT=aider` means using the
+`ai-agent-maven-aider` image (Python + aider) instead of `ai-agent-maven-claude`
+(Node + Claude Code) — set `agent-image` accordingly. The CVE-selector Python
+image bundles both the Anthropic and `openai` SDKs, so it needs no change to
+switch models.
 
 ### 2. Runtime — swappable images with a documented contract
 
