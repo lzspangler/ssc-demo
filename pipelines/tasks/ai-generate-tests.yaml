@@ -22,13 +22,20 @@ spec:
     - name: AGENT_IMAGE
       type: string
       description: Container image providing the AI agent runtime (JDK17 + Maven + Claude Code).
-      default: quay.io/REPLACE_ME/ai-agent-maven:latest
+      default: quay.io/REPLACE_ME/ai-agent-maven:v1.0.0
     - name: TEST_INSTRUCTIONS
       type: string
       description: Extra natural-language guidance for the test-generation agent.
       default: >-
         Prioritize public service and business-logic classes that currently lack
         coverage. Keep tests deterministic and offline (no network, no live DB).
+    - name: SOURCE_PATHS
+      type: string
+      description: >-
+        Space-separated main-source paths given to the agent as read-only
+        context. Narrow this (e.g. to a package) on large repos to control token
+        cost. Only affects the aider (OpenAI-compatible) path.
+      default: src/main/java
   workspaces:
     - name: source
       description: Workspace containing the application source (shared PVC).
@@ -57,6 +64,8 @@ spec:
       env:
         - name: TEST_INSTRUCTIONS
           value: $(params.TEST_INSTRUCTIONS)
+        - name: SOURCE_PATHS
+          value: $(params.SOURCE_PATHS)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -79,11 +88,18 @@ spec:
             [ -n "${AI_BASE_URL:-}" ] && export OPENAI_API_BASE="${AI_BASE_URL}"
             export OPENAI_API_KEY="${OPENAI_API_KEY:-placeholder}"
             case "${MODEL}" in */*) AIDER_MODEL="${MODEL}";; *) AIDER_MODEL="openai/${MODEL}";; esac
+            # Pass main sources as read-only reference so the agent only creates
+            # files under src/test; --map-tokens bounds the repo-map context and
+            # --subtree-only keeps aider scoped to this project dir.
+            READ_ARGS=""
+            for p in ${SOURCE_PATHS:-src/main/java}; do READ_ARGS="${READ_ARGS} --read ${p}"; done
             aider \
               --model "${AIDER_MODEL}" \
               --yes-always --no-auto-commits --no-check-update --no-gitignore \
+              --map-tokens 1024 --subtree-only \
+              ${READ_ARGS} \
               --message "${PROMPT}" \
-              pom.xml src/main 2>&1 | tee /tekton/home/aider-generate-tests.log
+              2>&1 | tee /tekton/home/aider-generate-tests.log
             ;;
           claude-code|*)
             # Configure Claude Code auth from ai-agent-config / ai-agent-secret.

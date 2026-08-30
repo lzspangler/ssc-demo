@@ -131,6 +131,8 @@ spec:
         PURL_COUNT="$(jq 'length' /tmp/purls.json)"
 
         echo "Found ${PURL_COUNT} unique PURLs."
+        echo "Sample PURLs (check for qualifiers like ?type=jar that may prevent matching):"
+        jq -r '.[0:5][]' /tmp/purls.json || true
 
         if [[ "${PURL_COUNT}" == "0" ]]; then
           jq -n \
@@ -262,6 +264,32 @@ spec:
 
           echo >> /tmp/recommendations.jsonl
         done
+
+        #
+        # Diagnostics: show exactly what RHTPA returned before we parse it, so an
+        # empty result can be told apart from an unexpected response shape.
+        #
+        echo
+        echo "----- RAW RHTPA recommend response (first 4000 bytes) -----"
+        head -c 4000 /tmp/recommendations.jsonl || true
+        echo
+        echo "----- Top-level keys seen across all batch responses -----"
+        # `?` tolerates non-object responses (e.g. a bare array or error object).
+        SEEN_KEYS="$(jq -s -c '[ .[] | (objects | keys[]) ] | unique' /tmp/recommendations.jsonl 2>/dev/null || echo '"<not valid JSON objects>"')"
+        echo "${SEEN_KEYS}"
+
+        # How many responses actually carried a non-null "recommendations" object?
+        RESPONSES_WITH_KEY="$(jq -s '[ .[] | select((.recommendations // null) != null) ] | length' /tmp/recommendations.jsonl 2>/dev/null || echo 0)"
+        echo "Batch responses containing a 'recommendations' field: ${RESPONSES_WITH_KEY}/${BATCH_COUNT}"
+
+        if [[ "${RESPONSES_WITH_KEY}" == "0" ]]; then
+          echo
+          echo "WARNING: no batch response contained a 'recommendations' field."
+          echo "         Either RHTPA returned a different response shape than this"
+          echo "         task expects (see the keys above), or the endpoint returned"
+          echo "         no recommendations. The report below will show 0; inspect the"
+          echo "         raw output above to disambiguate before trusting that value."
+        fi
 
         #
         # Combine the recommendations returned by each batch.

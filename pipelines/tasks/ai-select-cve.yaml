@@ -34,7 +34,7 @@ spec:
     - name: AI_PYTHON_IMAGE
       type: string
       description: Image with the Anthropic Python SDK installed.
-      default: quay.io/REPLACE_ME/ai-python:latest
+      default: quay.io/REPLACE_ME/ai-python:v1.0.0
   workspaces:
     - name: workspace
   results:

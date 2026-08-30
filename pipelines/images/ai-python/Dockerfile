@@ -4,8 +4,8 @@
 # same image serves every AI_PROVIDER) + jq.
 #
 # Build & push:
-#   podman build -t quay.io/<org>/ai-python:latest images/ai-python
-#   podman push  quay.io/<org>/ai-python:latest
+#   podman build -t quay.io/<org>/ai-python:v1.0.0 images/ai-python
+#   podman push  quay.io/<org>/ai-python:v1.0.0
 # Then set the pipeline param ai-python-image (or the default) to that reference.
 
 FROM registry.access.redhat.com/ubi9/python-311:latest

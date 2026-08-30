@@ -4,8 +4,8 @@
 # git + glab + gh (SCM), jq (JSON wrangling).
 #
 # Build & push:
-#   podman build -t quay.io/<org>/ai-agent-maven:latest images/ai-agent-maven
-#   podman push  quay.io/<org>/ai-agent-maven:latest
+#   podman build -t quay.io/<org>/ai-agent-maven:v1.0.0 images/ai-agent-maven
+#   podman push  quay.io/<org>/ai-agent-maven:v1.0.0
 # Then set the pipeline param agent-image (or the default) to that reference.
 
 FROM registry.access.redhat.com/ubi9/openjdk-17:latest
@@ -37,10 +37,11 @@ RUN curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
 
 # aider (litellm-backed coding agent) for OpenAI-compatible models -- gpt-oss,
 # IBM Granite, and any vLLM/RHOAI/Ollama/watsonx endpoint. Selected at runtime
-# via AI_AGENT=aider. Needs a modern Python.
+# via AI_AGENT=aider. Needs a modern Python. Pinned for reproducible CLI flags.
+ARG AIDER_VERSION=0.86.2
 RUN microdnf install -y python3.11 python3.11-pip \
     && microdnf clean all \
-    && python3.11 -m pip install --no-cache-dir aider-chat \
+    && python3.11 -m pip install --no-cache-dir "aider-chat==${AIDER_VERSION}" \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && /usr/local/bin/aider --version 2>/dev/null || python3.11 -m aider --version
 

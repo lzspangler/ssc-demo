@@ -60,8 +60,8 @@ of the branch is short-circuited cleanly when there's nothing to fix.
 1. **Build & push the two images**, then set the pipeline params (or edit the
    defaults) `agent-image` and `ai-python-image`:
    ```
-   podman build -t quay.io/<org>/ai-agent-maven:latest images/ai-agent-maven && podman push quay.io/<org>/ai-agent-maven:latest
-   podman build -t quay.io/<org>/ai-python:latest      images/ai-python      && podman push quay.io/<org>/ai-python:latest
+   podman build -t quay.io/<org>/ai-agent-maven:v1.0.0 images/ai-agent-maven && podman push quay.io/<org>/ai-agent-maven:v1.0.0
+   podman build -t quay.io/<org>/ai-python:v1.0.0      images/ai-python      && podman push quay.io/<org>/ai-python:v1.0.0
    ```
 
 2. **Create the AI backend Secret** in `tssc-app-ci` from the example (fill in a

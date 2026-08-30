@@ -32,7 +32,7 @@ spec:
       default: ""
     - name: AGENT_IMAGE
       type: string
-      default: quay.io/REPLACE_ME/ai-agent-maven:latest
+      default: quay.io/REPLACE_ME/ai-agent-maven:v1.0.0
   workspaces:
     - name: source
   results:
