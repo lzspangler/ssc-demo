@@ -1,0 +1,103 @@
+# -----------------------------------------------------------------------------
+# Declarative enablement of the RHTPA (Trustify) data importers.
+#
+# WHY THIS IS A JOB, NOT A CR:
+# In RHTPA 2.2.6 the importer set is seeded into Trustify's database at install
+# time (with the large Red Hat SBOM/CSAF importers DISABLED by default), and
+# importer enablement is a runtime setting managed through the /api/v2/importer
+# REST API -- it is not exposed as a first-class field on the RHTPA operator CR.
+# This Job makes enabling them reproducible / GitOps-able by applying the exact
+# same API calls idempotently: enable each importer (flip the nested `disabled`
+# flag) and force an immediate run. Re-running the Job is safe -- it just
+# re-asserts `disabled=false` and re-triggers a run.
+#
+# If a newer RHTPA operator/Helm chart exposes importer seeding via the CR or
+# Helm values, prefer that and delete this Job.
+#
+# PREREQUISITE: the Secret named in `trustification-secret` (default tpa-secret)
+# must exist in this namespace with keys:
+#   bombastic_api_url, oidc_issuer_url, oidc_client_id, oidc_client_secret
+# (the same Secret the pipeline's RHTPA tasks consume).
+#
+# Apply:      oc -n tssc-app-ci apply -f config/rhtpa-enable-importers-job.yaml
+# Re-run:     oc -n tssc-app-ci delete job rhtpa-enable-importers --ignore-not-found \
+#               && oc -n tssc-app-ci apply -f config/rhtpa-enable-importers-job.yaml
+# Logs:       oc -n tssc-app-ci logs -f job/rhtpa-enable-importers
+# -----------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rhtpa-enable-importers
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: maven-build-ci
+    spec:
+      restartPolicy: OnFailure
+      volumes:
+        - name: trustification-secret
+          secret:
+            secretName: tpa-secret
+      containers:
+        - name: enable-importers
+          image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+          # Space-separated list of importers to enable + force. These two are the
+          # ones disabled by default; osv-github and cve are enabled already.
+          env:
+            - name: IMPORTERS
+              value: "redhat-sboms redhat-csaf"
+          volumeMounts:
+            - name: trustification-secret
+              mountPath: /run/secrets/trustification
+              readOnly: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              microdnf install -y jq >/dev/null 2>&1 || true
+
+              S=/run/secrets/trustification
+              RHTPA_URL="$(cat "$S/bombastic_api_url")"
+              ISS="$(cat "$S/oidc_issuer_url")"
+              CID="$(cat "$S/oidc_client_id")"
+              CSEC="$(cat "$S/oidc_client_secret")"
+
+              # Mint a fresh token per call (client-credentials tokens are short-lived).
+              token() {
+                ep="$(curl -sf "${ISS%/}/.well-known/openid-configuration" | jq -r .token_endpoint)"
+                curl -sf --user "$CID:$CSEC" -d grant_type=client_credentials "$ep" | jq -r .access_token
+              }
+
+              for name in $IMPORTERS; do
+                echo "== $name =="
+
+                # The `disabled` flag lives nested under the single type key
+                # (sbom/csaf/osv/...), so discover that key and flip it in place.
+                cfg="$(curl -sf -H "Authorization: Bearer $(token)" \
+                        "$RHTPA_URL/api/v2/importer/$name" | jq '.configuration')"
+                key="$(printf '%s' "$cfg" | jq -r 'keys[0]')"
+
+                printf '%s' "$cfg" | jq --arg k "$key" '.[$k].disabled=false' \
+                  | curl -sf -X PUT \
+                      -H "Authorization: Bearer $(token)" \
+                      -H 'Content-Type: application/json' \
+                      --data @- "$RHTPA_URL/api/v2/importer/$name"
+
+                d="$(curl -sf -H "Authorization: Bearer $(token)" \
+                      "$RHTPA_URL/api/v2/importer/$name" \
+                      | jq -r --arg k "$key" '.configuration[$k].disabled')"
+                echo "  $name disabled=$d"
+                [ "$d" = "false" ] || { echo "ERROR: failed to enable $name"; exit 1; }
+
+                curl -sf -X POST -H "Authorization: Bearer $(token)" \
+                  "$RHTPA_URL/api/v2/importer/$name/force"
+                echo "  $name forced -- run will start within ~1 minute"
+              done
+
+              echo "Done. Poll with:"
+              echo "  oc -n <ns> exec deploy/... # or use the API /importer/<name>"
