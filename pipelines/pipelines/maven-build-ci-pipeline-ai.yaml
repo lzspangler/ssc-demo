@@ -306,10 +306,13 @@ spec:
           workspace: workspace
 
     # ==================== AI remediation branch (gated) ====================
-    # Runs in parallel with the build/scan chain off clone-repository.
+    # Linear chain after the scan/policy stages so it never runs concurrently with
+    # the Maven build/scan tasks that write target/ on the shared workspace:
+    #   conforma-policy-check -> ai-generate-tests -> ai-select-cve
+    #     -> ai-remediate-dependency -> re-run-tests -> open-pr
     - name: ai-generate-tests
       runAfter:
-        - clone-repository
+        - conforma-policy-check
       taskRef:
         name: ai-generate-tests
       when:
@@ -352,7 +355,7 @@ spec:
 
     - name: ai-select-cve
       runAfter:
-        - conforma-policy-check
+        - ai-generate-tests
       taskRef:
         name: ai-select-cve
       when:
@@ -377,7 +380,6 @@ spec:
     - name: ai-remediate-dependency
       runAfter:
         - ai-select-cve
-        - ai-generate-tests
       taskRef:
         name: ai-remediate-dependency
       when:
