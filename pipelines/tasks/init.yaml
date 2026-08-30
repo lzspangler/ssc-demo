@@ -1,0 +1,55 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: "konflux"
+  name: init
+spec:
+  description: >-
+    Initialize Pipeline Task, include flags for rebuild and auth. Generates image repository secret used by the PipelineRun.
+  params:
+    - name: image-url
+      description: Image URL for build by PipelineRun
+    - name: rebuild
+      description: Rebuild the image if exists
+      default: "false"
+    - name: skip-checks
+      description: Skip checks against built image
+      default: "false"
+  results:
+    - name: build
+      description: Defines if the image in param image-url should be built
+
+  steps:
+    - name: init
+      image: registry.access.redhat.com/ubi9/skopeo:9.5-1745865345@sha256:d91eb0dac7308ddfb12193368a42009509925edba80da9ffd3b82d03427dc3ed
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      env:
+        - name: IMAGE_URL
+          value: $(params.image-url)
+        - name: REBUILD
+          value: $(params.rebuild)
+        - name: SKIP_CHECKS
+          value: $(params.skip-checks)
+      script: |
+        #!/bin/bash
+        echo "Build Initialize: $IMAGE_URL"
+        echo
+
+        echo "Determine if Image Already Exists"
+        # Build the image when rebuild is set to true or image does not exist
+        # The image check comes last to avoid unnecessary, slow API calls
+        if [ "$REBUILD" == "true" ] || [ "$SKIP_CHECKS" == "false" ] || ! skopeo inspect --no-tags --raw "docker://$IMAGE_URL" &>/dev/null; then
+          echo -n "true" > $(results.build.path)
+        else
+          echo -n "false" > $(results.build.path)
+        fi
+

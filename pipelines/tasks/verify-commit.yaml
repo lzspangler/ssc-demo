@@ -1,0 +1,49 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: verify-commit
+spec:
+  params:
+  - description: TUF mirror
+    name: tuf-mirror
+    type: string
+    default: http://tuf.tssc-tas.svc
+  - description: Email address of committer
+    name: certificate-identity
+    type: string
+    default: userX@domain.com
+  - description: OIDC issuer
+    name: oidc-issuer
+    type: string
+    default: https://sso.<domain>/realms/trusted-artifact-signer
+  - description: Rekor URL
+    name: rekor-url
+    type: string
+    default: http://rekor-server.tssc-tas.svc
+  description: This task verifies the latest commit signature
+  stepTemplate:
+    env:
+      - name: GITSIGN_REKOR_URL
+        value: $(params.rekor-url)
+  steps:
+  - image: registry.access.redhat.com/ubi9/toolbox@sha256:47d4891b3e744f5622a31bd21a42dd51358c43bbfd44860cc05c7b29cc520e66
+    name: git-verify
+    script: |
+      wget -q http://cli-server.trusted-artifact-signer.svc:8080/clients/linux/cosign-amd64.gz
+      wget -q http://cli-server.trusted-artifact-signer.svc:8080/clients/linux/gitsign-amd64.gz
+      gunzip cosign-amd64.gz
+      chmod a+x cosign-amd64
+      mv cosign-amd64 /usr/local/bin/cosign
+      gunzip gitsign-amd64.gz
+      chmod a+x gitsign-amd64
+      mv gitsign-amd64 /usr/local/bin/gitsign
+
+      git config --global --add safe.directory /workspace/repository/source
+      cosign initialize --mirror=$(params.tuf-mirror) --root=$(params.tuf-mirror)/root.json
+      git show -s
+      gitsign verify --certificate-identity=$(params.certificate-identity) --certificate-oidc-issuer=$(params.oidc-issuer) HEAD \
+      || (echo "Unable to verify commit signature!" && exit 1)
+    workingDir: /workspace/repository/source
+  workspaces:
+  - name: repository
+

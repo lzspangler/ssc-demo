@@ -17,8 +17,6 @@ rules:
       - patch
       - delete
     apiGroups:
-      - 'argoproj.io'
+      - '*'
     resources:
-      - applications
-      - applicationsets
-      - appprojects
+      - '*'

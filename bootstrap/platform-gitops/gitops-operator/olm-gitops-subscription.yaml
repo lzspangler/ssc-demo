@@ -4,7 +4,7 @@ metadata:
   name: openshift-gitops-operator
   namespace: openshift-operators
 spec:
-  channel: latest
+  channel: gitops-1.21
   config:
     env:
     - name: DISABLE_DEFAULT_ARGOCD_INSTANCE

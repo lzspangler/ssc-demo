@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lightwell-keycloak
+  namespace: platform-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/rhpds/lightwell-tssc-workshop.git
+    targetRevision: main
+    path: automation/gitops/components/keycloak
+    helm:
+      releaseName: keycloak
+      valuesObject:
+        deployer:
+          domain: apps.cluster-6rlfs.dyn.redhatworkshops.io
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sso
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

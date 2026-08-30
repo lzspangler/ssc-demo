@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lightwell-repo
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/rhpds/lightwell-tssc-workshop.git
+    targetRevision: main
+    path: automation/gitops/components/lightwell-repo
+    helm:
+      releaseName: lightwell-repo
+      valuesObject:
+        deployer:
+          domain: apps.cluster-6rlfs.dyn.redhatworkshops.io
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: lightwell-repo
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
