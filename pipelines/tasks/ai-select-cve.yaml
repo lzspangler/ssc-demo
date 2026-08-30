@@ -10,14 +10,24 @@ metadata:
 spec:
   description: >-
     Ask the AI to choose exactly ONE dependency vulnerability to remediate, given
-    the RHTPA remediation report, the Conforma must-fix set (policy gate), and a
-    user-defined policy (free-form context). Emits the decision as small Tekton
-    results. Backend is pluggable via ai-agent-config / ai-agent-secret; runtime
-    via AI_PYTHON_IMAGE.
+    the RHTPA vulnerability-analysis report (authoritative CVE/severity/affected
+    PURL source), the RHTPA remediation (recommend) report (supplemental), the
+    Conforma must-fix set (policy gate), and a user-defined policy (free-form
+    context). Emits the decision as small Tekton results. Backend is pluggable via
+    ai-agent-config / ai-agent-secret; runtime via AI_PYTHON_IMAGE.
   params:
+    - name: VULNERABILITY_REPORT_PATH
+      type: string
+      description: >-
+        Absolute path (on the workspace) to the RHTPA vulnerability-analysis JSON
+        (authoritative: .findings + per-CVE details carry severity, affected
+        PURLs, and the fix version in the title/description prose).
+      default: ""
     - name: REMEDIATION_REPORT_PATH
       type: string
-      description: Absolute path (on the workspace) to the RHTPA remediation JSON.
+      description: >-
+        Absolute path (on the workspace) to the RHTPA remediation (recommend)
+        JSON. Supplemental only; often empty for upstream-only Maven deps.
       default: ""
     - name: MUST_FIX_PATH
       type: string
@@ -60,6 +70,8 @@ spec:
           value: /tekton/home
         - name: WORKSPACE_PATH
           value: $(workspaces.workspace.path)
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(params.VULNERABILITY_REPORT_PATH)
         - name: REMEDIATION_REPORT_PATH
           value: $(params.REMEDIATION_REPORT_PATH)
         - name: MUST_FIX_PATH
@@ -95,8 +107,10 @@ spec:
             except Exception:
                 return default
 
+        vuln_path = os.environ.get("VULNERABILITY_REPORT_PATH") or f"{ws}/rhtpa/vulnerabilities.json"
         report_path = os.environ.get("REMEDIATION_REPORT_PATH") or f"{ws}/rhtpa/remediation.json"
         mustfix_path = os.environ.get("MUST_FIX_PATH") or f"{ws}/rhtpa/must-fix-cves.json"
+        vuln = read_json(vuln_path, "{}")
         report = read_json(report_path, "{}")
         mustfix = read_json(mustfix_path, "[]")
 
@@ -164,11 +178,26 @@ spec:
             "User-defined policy:\n" + os.environ["POLICY_CONTEXT"] + "\n\n"
             "Conforma must-fix CVEs (policy gate -- choose only from these):\n"
             + mustfix + "\n\n"
-            "RHTPA remediation report (recommended fixed packages are PURLs, "
-            "e.g. pkg:maven/group/artifact@1.2.3 -- derive Maven coordinates and "
-            "fixed version from them):\n" + report + "\n\n"
-            "Select exactly ONE CVE that satisfies the policy and has a concrete "
-            "fixed version. If none qualify, set selected=false."
+            "AUTHORITATIVE SOURCE -- RHTPA vulnerability-analysis report. Its "
+            "'.findings[]' give each CVE's severity, affected_purls (the exact "
+            "vulnerable dependency, e.g. pkg:maven/group/artifact@1.2.3 -- derive "
+            "the Maven groupId:artifactId and CURRENT_VERSION from these), and "
+            "'fixed_version_hints' (best-effort version tokens scraped from the "
+            "advisory text). '.details[]' hold the full CVE title/description. The "
+            "concrete fixed version is usually stated only in that prose (e.g. "
+            "'before versions 2.13.4.1 and 2.12.17.1', 'fixed in 2.14.0'); use the "
+            "hints as candidates and read the title/description to pick the correct "
+            "fixed version on the SAME release line as the current version:\n"
+            + vuln + "\n\n"
+            "SUPPLEMENTAL -- RHTPA remediation (recommend) report. Recommended "
+            "fixed packages are PURLs; this is a Red Hat-rebuild catalog lookup and "
+            "is frequently empty for upstream-only Maven deps -- treat it as a "
+            "cross-check, not the source of truth:\n" + report + "\n\n"
+            "Select exactly ONE CVE from the must-fix set that best satisfies the "
+            "policy. Determine PACKAGE and CURRENT_VERSION from its affected_purl "
+            "and the FIXED_VERSION from the analyze findings/details as described "
+            "above. You must supply a concrete fixed version; if you cannot "
+            "confidently determine one for any must-fix CVE, set selected=false."
         )
 
         system = "You are a security remediation planner. Output only the schema."

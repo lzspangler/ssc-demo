@@ -12,13 +12,22 @@ spec:
     Produce the machine-checkable "must-fix" set of vulnerabilities that the AI
     remediation step must choose from. If a Conforma (Enterprise Contract) policy
     is configured it is evaluated with the `ec` CLI; otherwise a severity-based
-    fallback derives the must-fix list from the RHTPA remediation report (CVEs
-    that have an available fixed version). Writes must-fix-cves.json to the
-    workspace for the AI selector to consume.
+    fallback derives the must-fix list from the RHTPA vulnerability-analysis
+    report (the authoritative CVE + severity + affected-PURL source). The RHTPA
+    remediation (recommend) report is supplemental only. Writes must-fix-cves.json
+    to the workspace for the AI selector to consume.
   params:
+    - name: VULNERABILITY_REPORT_PATH
+      type: string
+      description: >-
+        Absolute path (on the workspace) to the RHTPA vulnerability-analysis JSON
+        (the authoritative source: .findings carry cve_id/severity/affected_purls).
+      default: ""
     - name: REMEDIATION_REPORT_PATH
       type: string
-      description: Absolute path (on the workspace) to the RHTPA remediation JSON.
+      description: >-
+        Absolute path (on the workspace) to the RHTPA remediation (recommend)
+        JSON. Supplemental only; often empty for upstream-only Maven deps.
       default: ""
     - name: SBOMS_DIR
       type: string
@@ -48,6 +57,8 @@ spec:
       image: $(params.EC_IMAGE)
       workingDir: $(workspaces.workspace.path)
       env:
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(params.VULNERABILITY_REPORT_PATH)
         - name: REMEDIATION_REPORT_PATH
           value: $(params.REMEDIATION_REPORT_PATH)
         - name: SBOMS_DIR
@@ -65,9 +76,13 @@ spec:
         mkdir -p "${OUT_DIR}"
         MUST_FIX="${OUT_DIR}/must-fix-cves.json"
 
+        # Authoritative source: the vulnerability-analysis report (.findings).
+        VULN_REPORT="${VULNERABILITY_REPORT_PATH:-${OUT_DIR}/vulnerabilities.json}"
+        # Supplemental (recommend) report; may be absent or empty.
         REPORT="${REMEDIATION_REPORT_PATH:-${OUT_DIR}/remediation.json}"
-        if [[ ! -f "${REPORT}" ]]; then
-          echo "WARN: remediation report not found at ${REPORT}; emitting empty must-fix set."
+
+        if [[ ! -f "${VULN_REPORT}" ]]; then
+          echo "WARN: vulnerability report not found at ${VULN_REPORT}; emitting empty must-fix set."
           echo '[]' > "${MUST_FIX}"
           printf '%s' "${MUST_FIX}" > "$(results.MUST_FIX_PATH.path)"
           printf '0' > "$(results.MUST_FIX_COUNT.path)"
@@ -78,7 +93,7 @@ spec:
           # ---- Conforma / Enterprise Contract path (author your rego here) ----
           echo "Evaluating Conforma policy: ${POLICY_CONFIGURATION}"
           ec validate input \
-            --file "${REPORT}" \
+            --file "${VULN_REPORT}" \
             --policy "${POLICY_CONFIGURATION}" \
             --output json > "${OUT_DIR}/conforma-result.json" || true
           # Extract violating CVE ids from the EC result into the must-fix list.
@@ -89,28 +104,31 @@ spec:
               ] | map(select(. != "")) | unique' \
             "${OUT_DIR}/conforma-result.json" > "${MUST_FIX}" || echo '[]' > "${MUST_FIX}"
         else
-          # ---- Severity-based fallback derived from the RHTPA remediation report ----
+          # ---- Severity-based fallback derived from the analyze .findings ----
+          #
+          # The analyze report is the source of truth: every finding is a real,
+          # published CVE affecting a dependency in the SBOM. We keep those at or
+          # above the threshold. We deliberately do NOT require a structured fixed
+          # version here -- analyze exposes the fix only as free text in the CVE
+          # title/description (surfaced as fixed_version_hints), and ai-select-cve
+          # is responsible for resolving the concrete fixed version. Gating on a
+          # structured fix would drop every finding and the AI branch would never
+          # fire, which is exactly the bug this replaces.
+          #
           echo "No Conforma policy configured; using severity fallback >= ${SEVERITY_THRESHOLD}"
-          # Rank severities; keep CVEs whose recommendation is 'Fixed' (fix available).
+          echo "Source: ${VULN_REPORT}"
           jq --arg thr "${SEVERITY_THRESHOLD}" '
             def rank(s):
-              {critical:4, high:3, medium:2, low:1, none:0}[(s // "none")|ascii_downcase] // 0;
-            [ .recommendations // {}
-              | to_entries[]
-              | .key as $inpurl
-              | .value[]
-              | .package as $fixpkg
-              | .vulnerabilities[]?
-              | select((.status // "") == "Fixed")
-              | { cve_id: .id,
-                  input_purl: $inpurl,
-                  recommended_package: $fixpkg,
+              {critical:4, high:3, medium:2, low:1, none:0, unknown:0}[(s // "unknown")|ascii_downcase] // 0;
+            [ .findings // []
+              | .[]
+              | select(rank(.severity) >= rank($thr) or (.severity // "unknown") == "unknown")
+              | { cve_id: .cve_id,
                   severity: (.severity // "unknown"),
-                  status: .status,
-                  justification: (.justification // null) }
-              | select(rank(.severity) >= rank($thr) or .severity == "unknown")
+                  affected_purls: (.affected_purls // []),
+                  fixed_version_hints: (.fixed_version_hints // []) }
             ] | unique_by(.cve_id)
-          ' "${REPORT}" > "${MUST_FIX}"
+          ' "${VULN_REPORT}" > "${MUST_FIX}"
         fi
 
         COUNT="$(jq 'length' "${MUST_FIX}")"

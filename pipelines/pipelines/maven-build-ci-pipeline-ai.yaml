@@ -335,6 +335,8 @@ spec:
           operator: in
           values: ["true"]
       params:
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(tasks.rhtpa-vulnerability-analysis.results.VULNERABILITY_REPORT)
         - name: REMEDIATION_REPORT_PATH
           value: $(tasks.rhtpa-remediation-report.results.REMEDIATION_REPORT)
         - name: SBOMS_DIR
@@ -355,6 +357,8 @@ spec:
           operator: in
           values: ["true"]
       params:
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(tasks.rhtpa-vulnerability-analysis.results.VULNERABILITY_REPORT)
         - name: REMEDIATION_REPORT_PATH
           value: $(tasks.rhtpa-remediation-report.results.REMEDIATION_REPORT)
         - name: MUST_FIX_PATH

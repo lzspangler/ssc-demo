@@ -4,8 +4,11 @@ This extends the existing `maven-build-ci` pipeline with an **opt-in** AI branch
 that, on top of the normal build → SBOM → RHTPA scan flow:
 
 1. Generates and runs unit tests for the app (AI coding agent).
-2. Turns the RHTPA remediation report into a policy **must-fix** set
-   (Conforma/Enterprise Contract gate, with a severity-based fallback).
+2. Turns the RHTPA **vulnerability-analysis** report into a policy **must-fix**
+   set (Conforma/Enterprise Contract gate, with a severity-based fallback). The
+   analyze report is the source of truth (CVE + severity + affected PURL); the
+   recommend report is supplemental (it is a Red Hat-rebuild catalog lookup and is
+   usually empty for upstream-only Maven deps).
 3. Asks the AI to select **exactly one** CVE to remediate, constrained to the
    must-fix set and steered by a user-defined policy.
 4. Has the AI update the vulnerable Maven dependency to its fixed version.
@@ -111,7 +114,10 @@ params:
 
 Optional: override `ai-remediation-policy` (free-form CVE-prioritization policy
 for the AI) and/or `conforma-policy-configuration` (an EC policy source; empty
-uses the severity fallback keeping fixed-available CVEs at/above `high`).
+uses the severity fallback keeping analyze findings at/above `high`). The fallback
+does **not** require a structured fixed version — analyze exposes the fix only as
+free text in the CVE title/description, so `ai-select-cve` resolves the concrete
+fixed version from that prose (with `fixed_version_hints` as candidates).
 
 ## Swapping the AI backend (pluggable)
 
@@ -195,11 +201,14 @@ replacement must honor these task contracts:
 them, and leave changes in the working tree. Result `TESTS_ADDED` = count of
 added/changed test files. Env available via `envFrom` (provider/model/creds).
 
-**`ai-select-cve`** — inputs via env: `REMEDIATION_REPORT_PATH`, `MUST_FIX_PATH`
-(JSON array; empty ⇒ must emit `SELECTED=0`), `POLICY_CONTEXT`. Must write these
+**`ai-select-cve`** — inputs via env: `VULNERABILITY_REPORT_PATH` (authoritative;
+`.findings` + `.details` carry severity, affected PURLs, and the fix version in
+the CVE prose), `REMEDIATION_REPORT_PATH` (supplemental), `MUST_FIX_PATH` (JSON
+array; empty ⇒ must emit `SELECTED=0`), `POLICY_CONTEXT`. Must write these
 results: `SELECTED` (`0`/`1`), `CVE_ID`, `PACKAGE` (`groupId:artifactId`),
 `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`. Must pick from the must-fix
-set only, and require a concrete fixed version.
+set only, deriving `PACKAGE`/`CURRENT_VERSION` from the affected PURL and the
+concrete `FIXED_VERSION` from the analyze findings/prose.
 
 **`ai-remediate-dependency`** — inputs via params/env: `CVE_ID`, `PACKAGE`,
 `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`. Must edit `pom.xml` to the
