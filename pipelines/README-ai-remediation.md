@@ -104,7 +104,7 @@ Notes:
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
-| `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR |
+| `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR (runs on the **agent image** — see note below) |
 | `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
 | `images/ai-agent-maven-aider/Dockerfile` | Agent runtime, **aider** flavor (ubi-minimal + JDK17 + Maven + Python/aider + git/glab/gh) |
 | `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic + OpenAI Python SDKs) |
@@ -157,7 +157,36 @@ namespace `tssc-app-ci` — substitute your own.
 | `tpa-secret` | Secret | _(base pipeline)_ | `bombastic_api_url`, `oidc_issuer_url`, `oidc_client_id`, `oidc_client_secret`. Consumed by the RHTPA tasks **and** the importer Job. (Name overridable via `trustification-secret-name`.) |
 | `ai-agent-config` | ConfigMap | AI branch | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
 | `ai-agent-secret` | Secret | AI branch | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
-| `scm-auth-secret` | Secret | AI branch (PR step) | `username` + `token` with push + PR/MR-create scope. From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
+| `scm-auth-secret` | Secret | AI branch (PR step) | `username` + `token` with push + PR/MR-create scope (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
+
+#### SCM token scopes (`scm-auth-secret`)
+
+The `open-pr` task uses this token for exactly two privileged operations: a
+`git push` of the remediation branch over HTTPS, and a `glab mr create` /
+`gh pr create` API call. (The initial repo **clone** uses a *different* secret —
+the `git-auth` workspace — so this token does not need clone/read access to the
+whole instance.)
+
+**GitLab** — grant the minimum:
+
+| Scope | Why |
+|-------|-----|
+| `api` | Required for `glab mr create` — MR creation is a write-API call and GitLab has no narrower per-feature scope. |
+| `write_repository` | Required to `git push` the branch over HTTPS. (`api` often permits push too, but include this to avoid version-specific edge cases.) |
+
+- **Role:** the token identity needs at least **Developer** on the target
+  project (enough to push a non-protected `rhtpa/*` branch and open an MR). Use
+  **Maintainer** only if that branch namespace is protected.
+- **Token type:** a **Project Access Token** scoped to the one repo (bot identity,
+  Developer role, `api` + `write_repository`) is the least-privilege choice and
+  auto-expires. A Personal Access Token works but reaches every project the user
+  can. Create it on the same GitLab instance as `GIT_HOST`.
+- **`username` key:** leave it as `oauth2` — GitLab accepts `oauth2:<token>` for
+  HTTPS push, and `glab` authenticates via the token regardless of username.
+
+**GitHub** — a fine-grained token with **Contents: read & write** (push the
+branch) and **Pull requests: read & write** (open the PR), scoped to the target
+repo. A classic token needs the `repo` scope.
 
 ### Workspaces / PVCs
 
@@ -186,6 +215,14 @@ and both carry JDK17 + Maven + git/glab/gh. Point `agent-image` at whichever
 matches `AI_AGENT`; build+push the CVE-selector `ai-python-image` as well. Images
 default to `quay.io/REPLACE_ME/...:v1.0.0`. Commands are in
 [One-time setup](#one-time-setup) below.
+
+> **Why the agent image bundles `git`/`glab`/`gh`:** besides the code-editing
+> tasks, `open-pr` also runs on the agent image (the pipeline sets its `GIT_IMAGE`
+> to `agent-image`). The default git-init image ships `git` **only** — no
+> `glab`/`gh` — so `open-pr` would fail its `glab mr create` / `gh pr create` step
+> on it. Running it on the agent image gives it all three tools without a separate
+> image. (This is why `agent-image` must resolve for a full remediation run even
+> though `open-pr` doesn't edit code.)
 
 ### RHTPA importers (populate the vulnerability data)
 
@@ -271,11 +308,11 @@ catalog is populated.
    your `AI_AGENT` (or both):
    ```
    # Claude Code flavor (AI_AGENT=claude-code, the default):
-   podman build -t quay.io/<org>/ai-agent-maven-claude:v1.0.0 images/ai-agent-maven-claude && podman push quay.io/<org>/ai-agent-maven-claude:v1.0.0
+   podman build --platform linux/amd64 -t quay.io/<org>/ai-agent-maven-claude:v1.0.0 images/ai-agent-maven-claude && podman push quay.io/<org>/ai-agent-maven-claude:v1.0.0
    # aider flavor (AI_AGENT=aider):
-   podman build -t quay.io/<org>/ai-agent-maven-aider:v1.0.0  images/ai-agent-maven-aider  && podman push quay.io/<org>/ai-agent-maven-aider:v1.0.0
+   podman build --platform linux/amd64 -t quay.io/<org>/ai-agent-maven-aider:v1.0.0  images/ai-agent-maven-aider  && podman push quay.io/<org>/ai-agent-maven-aider:v1.0.0
    # CVE-selector runtime:
-   podman build -t quay.io/<org>/ai-python:v1.0.0            images/ai-python             && podman push quay.io/<org>/ai-python:v1.0.0
+   podman build --platform linux/amd64 -t quay.io/<org>/ai-python:v1.0.0            images/ai-python             && podman push quay.io/<org>/ai-python:v1.0.0
    ```
    Set `agent-image` to the `-claude` or `-aider` reference to match `AI_AGENT`.
 

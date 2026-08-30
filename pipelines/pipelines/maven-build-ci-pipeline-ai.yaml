@@ -462,6 +462,10 @@ spec:
           value: $(tasks.ai-select-cve.results.JUSTIFICATION)
         - name: SCM_SECRET_NAME
           value: $(params.scm-secret-name)
+        # open-pr needs git + glab + gh; the default git-init image ships git only,
+        # so run it on the agent image, which bundles all three (both flavors do).
+        - name: GIT_IMAGE
+          value: $(params.agent-image)
       workspaces:
         - name: source
           workspace: workspace

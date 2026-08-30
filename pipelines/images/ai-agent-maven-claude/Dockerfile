@@ -57,22 +57,26 @@ RUN microdnf install -y nodejs npm \
     && node --version \
     && claude --version
 
-# glab (GitLab CLI) for opening MRs.
+# glab (GitLab CLI) for opening MRs. NOTE: do NOT run glab/gh at build time --
+# they are Go binaries and Go's lock-free stack aborts ("lfstack.push invalid
+# packing") under qemu when cross-building amd64 on an arm64 host. The extracted
+# binary is a valid amd64 and runs fine on the x86_64 cluster; verify presence only.
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/') \
     && curl -fsSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${ARCH}.tar.gz" \
       -o /tmp/glab.tar.gz \
     && tar -xzf /tmp/glab.tar.gz -C /usr/local bin/glab \
     && rm -f /tmp/glab.tar.gz \
-    && glab --version
+    && test -x /usr/local/bin/glab
 
-# gh (GitHub CLI) for opening PRs.
+# gh (GitHub CLI) for opening PRs. Same qemu/Go caveat as glab above -- verify
+# presence, don't execute.
 RUN ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/') \
     && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" \
       -o /tmp/gh.tar.gz \
     && tar -xzf /tmp/gh.tar.gz -C /tmp \
     && cp "/tmp/gh_${GH_VERSION}_linux_${ARCH}/bin/gh" /usr/local/bin/gh \
     && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH}" \
-    && gh --version
+    && test -x /usr/local/bin/gh
 
 # Tekton runs steps as an arbitrary non-root UID in the root group; make HOME
 # and the Maven repo writable by the group.

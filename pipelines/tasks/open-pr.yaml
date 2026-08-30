@@ -44,6 +44,12 @@ spec:
       default: scm-auth-secret
     - name: GIT_IMAGE
       type: string
+      description: >-
+        Image this task runs in. It MUST contain git AND the SCM CLI it calls
+        (glab for GitLab, gh for GitHub). The pipeline overrides this with the
+        agent image, which bundles all three. WARNING: the default below
+        (pipelines-git-init) ships git ONLY -- no glab/gh -- so override it (or
+        supply your own git+glab+gh image) when running this task standalone.
       default: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8:latest
   workspaces:
     - name: source
