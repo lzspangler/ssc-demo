@@ -15,7 +15,9 @@ that, on top of the normal build → SBOM → RHTPA scan flow:
 5. Re-runs all tests (existing + generated) with `mvn verify`.
 6. Opens a **PR/MR** back to the app repo with the tests + remediation.
 
-The ai capabilities are gated behind `enable-ai-remediation` (default `"false"`).
+The ai capabilities are gated behind `enable-ai-remediation`, which defaults to
+`"true"` on this pipeline (`pipelines/agentic-cve-remediation.yaml`). Set it to
+`"false"` to run only the base build → SBOM → RHTPA scan chain.
 
 ## Overview
 
@@ -38,21 +40,20 @@ flowchart TB
         RH[("access.redhat.com<br/>OSV · CVE · CSAF · SBOM data")]
     end
 
-    subgraph PIPE[maven-build-ci pipeline]
+    subgraph PIPE[agentic-cve-remediation pipeline]
         direction TB
         init[init] --> clone[clone-repository]
         clone --> verify["verify-commit<br/>optional"]
         verify --> package["package · mvn"]
         package --> build[build-container]
-        build --> upload[upload-sboms-to-trustification]
+        build --> upload[upload-sbom-to-rhtpa]
         upload --> analyze[rhtpa-vulnerability-analysis]
         analyze --> recommend[rhtpa-remediation-report]
 
-        clone -.->|AI branch| gentests[ai-generate-tests]
-        recommend -.-> conforma[conforma-policy-check]
-        conforma -.-> select[ai-select-cve]
+        recommend -.->|AI branch| conforma[conforma-policy-check]
+        conforma -.-> gentests[ai-generate-tests]
+        gentests -.-> select[ai-select-cve]
         select -.->|if a CVE is selected| remediate[ai-remediate-dependency]
-        gentests -.-> remediate
         remediate -.-> rerun["re-run-tests · mvn verify"]
         rerun -.-> openpr[open-pr]
     end
@@ -78,11 +79,15 @@ Notes:
 
 - **Base chain** (`init` → … → `rhtpa-remediation-report`) runs on every
   PipelineRun. **`verify-commit`** only runs with `verify-commit="true"` (needs
-  RHTAS). The **AI branch** (dotted) only runs with `enable-ai-remediation="true"`,
-  and `ai-remediate-dependency`/`re-run-tests`/`open-pr` additionally require
+  RHTAS). The **AI branch** (dotted) only runs with `enable-ai-remediation="true"`
+  (the default on this pipeline), and
+  `ai-remediate-dependency`/`re-run-tests`/`open-pr` additionally require
   `ai-select-cve` to actually pick a CVE.
-- `ai-generate-tests` forks off `clone-repository` and runs in parallel with the
-  build/scan chain; it rejoins at `ai-remediate-dependency`.
+- The **AI branch is a linear chain** appended after the scan/policy stages
+  (`rhtpa-remediation-report` → `conforma-policy-check` → `ai-generate-tests` →
+  `ai-select-cve` → …), not a parallel fork. It runs strictly after the
+  build/scan tasks so nothing writes `target/` on the shared workspace while the
+  agent tasks run — avoiding a concurrent-writer race on the PVC.
 - **RHTPA** must already contain vulnerability data — it populates itself from
   `access.redhat.com` via its importers (dotted edge), independent of this
   pipeline. See [RHTPA importers](#rhtpa-importers-populate-the-vulnerability-data).
@@ -94,7 +99,7 @@ Notes:
 
 | File | Purpose |
 |------|---------|
-| `pipelines/maven-build-ci-pipeline-ai.yaml` | Pipeline with the gated AI branch wired into the existing DAG |
+| `pipelines/agentic-cve-remediation.yaml` | Pipeline with the gated AI branch wired into the existing DAG |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
@@ -111,26 +116,35 @@ Notes:
 ## DAG
 
 ```
-init → clone-repository ─┬─ verify-commit → package → build-container → upload-sboms → rhtpa-vuln-analysis → rhtpa-remediation-report
-                         │                                                                                          │
-                         │                                                                          conforma-policy-check
-                         │                                                                                          │
-                         └─ ai-generate-tests ───────────────┐                                              ai-select-cve
-                                                             │                                                     │
-                                          ai-remediate-dependency  ←──────────────────────────────────────────────┘
-                                                             │      (only if ai-select-cve.SELECTED == "1")
-                                                       re-run-tests (mvn verify)
-                                                             │
-                                                          open-pr
+init → clone-repository → verify-commit → package → build-container → upload-sbom-to-rhtpa → rhtpa-vulnerability-analysis → rhtpa-remediation-report
+                                                                                                                                       │
+                                                                                                                        conforma-policy-check
+                                                                                                                                       │
+                                                                                                                          ai-generate-tests
+                                                                                                                                       │
+                                                                                                                             ai-select-cve
+                                                                                                                                       │  (only if ai-select-cve.SELECTED == "1")
+                                                                                                                     ai-remediate-dependency
+                                                                                                                                       │
+                                                                                                                       re-run-tests (mvn verify)
+                                                                                                                                       │
+                                                                                                                                    open-pr
 ```
 
-`ai-generate-tests` runs in parallel with the build/scan chain (both fork off
-`clone-repository`). `ai-remediate-dependency`, `re-run-tests`, and `open-pr` are
-additionally gated on `ai-select-cve` actually picking a CVE, so a clean scan
+The whole thing is a single linear chain. The AI branch is appended after
+`rhtpa-remediation-report` (not forked off `clone-repository`) so the
+agent/`mvn verify` tasks never run concurrently with the build/scan tasks that
+write `target/` on the shared workspace — a concurrent writer there bumps the
+workdir mtime mid-read and breaks the agents' `tar` of the source, so
+serializing avoids that race and is simpler to reason about.
+
+`ai-remediate-dependency`, `re-run-tests`, and `open-pr` are additionally gated on
+`ai-select-cve` actually picking a CVE (`SELECTED == "1"`), so a clean scan
 (nothing must-fix) skips remediation and the PR but still contributes the
-generated tests to the workspace. Because Tekton's "skipped-parent still runs the
-successor" semantics don't apply when the successor's own `when` fails, the tail
-of the branch is short-circuited cleanly when there's nothing to fix.
+generated tests from `ai-generate-tests` to the workspace. Because Tekton's
+"skipped-parent still runs the successor" semantics don't apply when the
+successor's own `when` fails, the tail of the branch is short-circuited cleanly
+when there's nothing to fix.
 
 ## Prerequisites
 
@@ -336,7 +350,7 @@ catalog is populated.
 5. **Apply the tasks + pipeline:**
    ```
    oc -n tssc-app-ci apply -f tasks/
-   oc -n tssc-app-ci apply -f pipelines/maven-build-ci-pipeline-ai.yaml
+   oc -n tssc-app-ci apply -f pipelines/agentic-cve-remediation.yaml
    ```
 
 6. **Egress:** the cluster must allow the selected provider's endpoint
@@ -357,7 +371,7 @@ params:
   - name: scm-provider
     value: gitlab            # or github
   - name: base-branch
-    value: master
+    value: main
 ```
 
 Optional: override `ai-remediation-policy` (free-form CVE-prioritization policy
