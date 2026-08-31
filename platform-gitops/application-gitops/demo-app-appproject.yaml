@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: demo-app
+  namespace: application-gitops
+  labels:
+    platform.example.com/security-tier: restricted
+spec:
+  sourceNamespaces:
+    - 'demo-app-*'
+  sourceRepos:
+    - 'https://github.com/lzspangler/spring-boot-example'
+  destinations:
+    - server: 'https://kubernetes.default.svc'
+      namespace: 'demo-app-*'
+  roles:
+    - name: developer
+      groups:
+        - demo-app-developers
+      policies:
+        - p, proj:demo-app:developer, applications, get, demo-app/*, allow
+        - p, proj:demo-app:developer, applications, sync, demo-app/*, allow

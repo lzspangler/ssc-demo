@@ -1,0 +1,376 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: rhtpa-remediation-report
+spec:
+  description: >-
+    Query Red Hat Trusted Profile Analyzer for remediation recommendations
+    for the PURLs contained in a CycloneDX SBOM.
+
+  params:
+    - name: COMPONENT_NAME
+      type: string
+      description: Name of the application/component.
+
+    - name: SBOMS_DIR
+      type: string
+      default: sboms
+
+    - name: TRUSTIFICATION_SECRET_NAME
+      type: string
+      default: tpa-secret
+
+    - name: FAIL_IF_TRUSTIFICATION_NOT_CONFIGURED
+      type: string
+      default: "true"
+
+    - name: HTTP_RETRIES
+      type: string
+      default: "3"
+
+    - name: BATCH_SIZE
+      type: string
+      default: "128"
+
+  workspaces:
+    - name: workspace
+      description: Workspace containing the application and SBOM.
+
+  results:
+    - name: REMEDIATION_REPORT
+      description: Path to the JSON remediation report.
+
+    - name: RECOMMENDATION_COUNT
+      description: Number of remediation recommendations returned by RHTPA.
+
+  volumes:
+    - name: trustification-secret
+      secret:
+        secretName: $(params.TRUSTIFICATION_SECRET_NAME)
+        optional: true
+
+  steps:
+    - name: recommend
+      image: quay.io/konflux-ci/appstudio-utils:8f9f933d7b0b57e37b96fd34698c92c785cfeadc@sha256:924eb1680b6cda674e902579135a06b2c6683c3cc1082bbdc159a4ce5ea9f4df
+
+      env:
+        - name: COMPONENT_NAME
+          value: $(params.COMPONENT_NAME)
+
+        - name: SBOM_PATH
+          value: $(workspaces.workspace.path)/$(params.SBOMS_DIR)/sbom-cyclonedx.json
+
+        - name: TRUSTIFICATION_SECRET_NAME
+          value: $(params.TRUSTIFICATION_SECRET_NAME)
+
+        - name: FAIL_IF_TRUSTIFICATION_NOT_CONFIGURED
+          value: $(params.FAIL_IF_TRUSTIFICATION_NOT_CONFIGURED)
+
+        - name: HTTP_RETRIES
+          value: $(params.HTTP_RETRIES)
+
+        - name: BATCH_SIZE
+          value: $(params.BATCH_SIZE)
+
+      volumeMounts:
+        - name: trustification-secret
+          mountPath: /run/secrets/trustification
+          readOnly: true
+
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        SECRET_PATH=/run/secrets/trustification
+
+        read_secret() {
+          local key="$1"
+
+          if [[ -f "${SECRET_PATH}/${key}" ]]; then
+            cat "${SECRET_PATH}/${key}"
+            return 0
+          fi
+
+          echo "ERROR: Secret '${TRUSTIFICATION_SECRET_NAME}' does not contain '${key}'." >&2
+
+          if [[ "${FAIL_IF_TRUSTIFICATION_NOT_CONFIGURED}" == "false" ]]; then
+            echo "RHTPA is not configured; skipping remediation analysis."
+            exit 0
+          fi
+
+          exit 1
+        }
+
+        RHTPA_URL="$(read_secret bombastic_api_url)"
+        OIDC_ISSUER_URL="$(read_secret oidc_issuer_url)"
+        OIDC_CLIENT_ID="$(read_secret oidc_client_id)"
+        OIDC_CLIENT_SECRET="$(read_secret oidc_client_secret)"
+
+        if [[ ! -f "${SBOM_PATH}" ]]; then
+          echo "ERROR: SBOM does not exist: ${SBOM_PATH}"
+          exit 1
+        fi
+
+        mkdir -p "$(workspaces.workspace.path)/rhtpa"
+
+        OUTPUT="$(workspaces.workspace.path)/rhtpa/remediation.json"
+        MARKDOWN="$(workspaces.workspace.path)/rhtpa/remediation.md"
+
+        #
+        # Extract unique PURLs from CycloneDX.
+        #
+        jq -e '
+          [
+            .components[]?
+            | select(.purl != null)
+            | .purl
+          ]
+          | unique
+        ' "${SBOM_PATH}" > /tmp/purls.json
+
+        PURL_COUNT="$(jq 'length' /tmp/purls.json)"
+
+        echo "Found ${PURL_COUNT} unique PURLs."
+        echo "Sample PURLs (check for qualifiers like ?type=jar that may prevent matching):"
+        jq -r '.[0:5][]' /tmp/purls.json || true
+
+        if [[ "${PURL_COUNT}" == "0" ]]; then
+          jq -n \
+            --arg component "${COMPONENT_NAME}" \
+            '{
+              component: $component,
+              recommendations: {}
+            }' > "${OUTPUT}"
+
+          cat > "${MARKDOWN}" <<EOF
+        # RHTPA Remediation Report
+
+        **Component:** ${COMPONENT_NAME}
+
+        No PURLs were found in the SBOM.
+        EOF
+
+          printf '%s' "${OUTPUT}" > "$(results.REMEDIATION_REPORT.path)"
+          printf '%s' "0" > "$(results.RECOMMENDATION_COUNT.path)"
+
+          exit 0
+        fi
+
+        #
+        # Configure CA trust if supplied by the pipeline environment.
+        #
+        if [[ -f /tekton-custom-certs/ca-bundle.crt ]]; then
+          cp /tekton-custom-certs/ca-bundle.crt \
+            /etc/pki/ca-trust/source/anchors/tekton-ca-bundle.crt
+
+          update-ca-trust
+        fi
+
+        CURL_OPTS=(
+          --silent
+          --show-error
+          --fail-with-body
+          --retry "${HTTP_RETRIES}"
+        )
+
+        #
+        # OIDC discovery.
+        #
+        OIDC_DISCOVERY_URL="${OIDC_ISSUER_URL%/}/.well-known/openid-configuration"
+
+        TOKEN_ENDPOINT="$(
+          curl "${CURL_OPTS[@]}" \
+            "${OIDC_DISCOVERY_URL}" |
+            jq -r '.token_endpoint // empty'
+        )"
+
+        if [[ -z "${TOKEN_ENDPOINT}" ]]; then
+          echo "ERROR: OIDC discovery did not return token_endpoint."
+          exit 1
+        fi
+
+        #
+        # Obtain OAuth2 client-credentials token.
+        #
+        TOKEN_RESPONSE="$(
+          curl "${CURL_OPTS[@]}" \
+            --user "${OIDC_CLIENT_ID}:${OIDC_CLIENT_SECRET}" \
+            --data "grant_type=client_credentials" \
+            "${TOKEN_ENDPOINT}"
+        )"
+
+        ACCESS_TOKEN="$(
+          jq -r '.access_token // empty' <<< "${TOKEN_RESPONSE}"
+        )"
+
+        TOKEN_TYPE="$(
+          jq -r '.token_type // "Bearer"' <<< "${TOKEN_RESPONSE}"
+        )"
+
+        if [[ -z "${ACCESS_TOKEN}" ]]; then
+          echo "ERROR: OIDC token response did not contain access_token."
+          exit 1
+        fi
+
+        #
+        # Batch PURLs.
+        #
+        jq -c \
+          --argjson size "${BATCH_SIZE}" \
+          '
+          [
+            range(0; length; $size) as $i
+            | .[$i:($i + $size)]
+          ]
+          ' /tmp/purls.json > /tmp/batches.json
+
+        BATCH_COUNT="$(jq 'length' /tmp/batches.json)"
+
+        echo "Requesting recommendations for ${BATCH_COUNT} batch(es)."
+
+        #
+        # The API returns:
+        #
+        # {
+        #   "recommendations": {
+        #     "<input-purl>": [
+        #       {
+        #         "package": "...",
+        #         "vulnerabilities": [
+        #           {
+        #             "id": "...",
+        #             "justification": null,
+        #             "status": "Fixed"
+        #           }
+        #         ]
+        #       }
+        #     ]
+        #   }
+        # }
+        #
+        rm -f /tmp/recommendations.jsonl
+
+        for ((i=0; i<BATCH_COUNT; i++)); do
+          BATCH="$(jq -c ".[$i]" /tmp/batches.json)"
+
+          echo "Processing batch $((i + 1))/${BATCH_COUNT}..."
+
+          curl "${CURL_OPTS[@]}" \
+            --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "{\"purls\": ${BATCH}}" \
+            "${RHTPA_URL%/}/api/v2/purl/recommend" \
+            >> /tmp/recommendations.jsonl
+
+          echo >> /tmp/recommendations.jsonl
+        done
+
+        #
+        # Diagnostics: show exactly what RHTPA returned before we parse it, so an
+        # empty result can be told apart from an unexpected response shape.
+        #
+        echo
+        echo "----- RAW RHTPA recommend response (first 4000 bytes) -----"
+        head -c 4000 /tmp/recommendations.jsonl || true
+        echo
+        echo "----- Top-level keys seen across all batch responses -----"
+        # `?` tolerates non-object responses (e.g. a bare array or error object).
+        SEEN_KEYS="$(jq -s -c '[ .[] | (objects | keys[]) ] | unique' /tmp/recommendations.jsonl 2>/dev/null || echo '"<not valid JSON objects>"')"
+        echo "${SEEN_KEYS}"
+
+        # How many responses actually carried a non-null "recommendations" object?
+        RESPONSES_WITH_KEY="$(jq -s '[ .[] | select((.recommendations // null) != null) ] | length' /tmp/recommendations.jsonl 2>/dev/null || echo 0)"
+        echo "Batch responses containing a 'recommendations' field: ${RESPONSES_WITH_KEY}/${BATCH_COUNT}"
+
+        if [[ "${RESPONSES_WITH_KEY}" == "0" ]]; then
+          echo
+          echo "WARNING: no batch response contained a 'recommendations' field."
+          echo "         Either RHTPA returned a different response shape than this"
+          echo "         task expects (see the keys above), or the endpoint returned"
+          echo "         no recommendations. The report below will show 0; inspect the"
+          echo "         raw output above to disambiguate before trusting that value."
+        fi
+
+        #
+        # Combine the recommendations returned by each batch.
+        #
+        jq -s '
+          reduce .[] as $response
+            ({recommendations: {}};
+             .recommendations += ($response.recommendations // {})
+            )
+        ' /tmp/recommendations.jsonl > "${OUTPUT}"
+
+        #
+        # Count actual recommendations.
+        #
+        RECOMMENDATION_COUNT="$(
+          jq '
+            [
+              .recommendations
+              | to_entries[]
+              | .value[]
+            ]
+            | length
+          ' "${OUTPUT}"
+        )"
+
+        #
+        # Generate human-readable report.
+        #
+        {
+          echo "# RHTPA Remediation Report"
+          echo
+          echo "**Component:** ${COMPONENT_NAME}"
+          echo
+          echo "**PURLs analyzed:** ${PURL_COUNT}"
+          echo
+          echo "**Recommendations:** ${RECOMMENDATION_COUNT}"
+          echo
+
+          if [[ "${RECOMMENDATION_COUNT}" == "0" ]]; then
+            echo "No remediation recommendations were returned by RHTPA."
+          else
+            echo "## Recommendations"
+            echo
+
+            jq -r '
+              .recommendations
+              | to_entries[]
+              |
+              "### Input PURL\n\n`\(.key)`\n\n" +
+              (
+                .value[]
+                |
+                "**Recommended package:** `\(.package)`\n\n" +
+                (
+                  if (.vulnerabilities | length) == 0 then
+                    "No associated vulnerability information was returned.\n"
+                  else
+                    "#### Vulnerabilities\n\n" +
+                    (
+                      .vulnerabilities[]
+                      |
+                      "- **\(.id)** — status: `\(.status // "null")`, justification: `\(.justification // "null")`"
+                    ) +
+                    "\n"
+                  end
+                )
+              ) +
+              "\n"
+            ' "${OUTPUT}"
+          fi
+        } > "${MARKDOWN}"
+
+        echo
+        echo "========================================"
+        echo "RHTPA Remediation Report"
+        echo "========================================"
+        cat "${MARKDOWN}"
+        echo
+
+        printf '%s' "${OUTPUT}" \
+          > "$(results.REMEDIATION_REPORT.path)"
+
+        printf '%s' "${RECOMMENDATION_COUNT}" \
+          > "$(results.RECOMMENDATION_COUNT.path)"

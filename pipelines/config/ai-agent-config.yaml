@@ -1,0 +1,96 @@
+# -----------------------------------------------------------------------------
+# Pluggable AI backend configuration (non-secret).
+#
+# Every AI task in this pipeline reads its backend settings from this ConfigMap
+# via `envFrom`, so you can point the whole pipeline at a different LLM backend
+# by editing ONLY this file (and the companion Secret ai-agent-secret) -- no
+# pipeline or task edits required.
+#
+# There are two independent switches:
+#
+# AI_PROVIDER -- the wire protocol / hosting for the *reasoning* call
+#                (ai-select-cve) and for Claude Code auth:
+#   anthropic  -> first-party Anthropic API   (Secret: ANTHROPIC_API_KEY)
+#   gateway    -> any Claude-compatible gateway/proxy (e.g. LiteLLM, an
+#                 on-cluster relay). Set AI_BASE_URL; auth via
+#                 ANTHROPIC_AUTH_TOKEN in the Secret.
+#   bedrock    -> Amazon Bedrock             (Secret: AWS_* creds; set AWS_REGION)
+#   vertex     -> Google Vertex AI           (Secret: GCP creds; set VERTEX_*)
+#   openai     -> any OpenAI-compatible endpoint: OpenAI, vLLM, Red Hat OpenShift
+#                 AI, Ollama, or watsonx.ai (openai-compat). This is how you run
+#                 open-weight models such as gpt-oss and IBM Granite. Set
+#                 AI_BASE_URL to the /v1 endpoint; auth via OPENAI_API_KEY in the
+#                 Secret (use any placeholder for servers that don't check it).
+#
+# AI_AGENT -- which coding-agent CLI drives the file-editing tasks
+#             (ai-generate-tests, ai-remediate-dependency):
+#   claude-code -> Claude Code headless (Anthropic protocol only). Use with
+#                  AI_PROVIDER anthropic|gateway|bedrock|vertex.
+#   aider       -> aider (litellm-backed) for OpenAI-compatible models. Use with
+#                  AI_PROVIDER=openai to run gpt-oss / Granite / any vLLM/Ollama/
+#                  watsonx model.
+#
+# Model examples:
+#   Claude   : AI_PROVIDER=anthropic AI_AGENT=claude-code AI_MODEL=claude-opus-5
+#   gpt-oss  : AI_PROVIDER=openai    AI_AGENT=aider        AI_MODEL=gpt-oss-120b
+#              AI_BASE_URL=http://vllm-gpt-oss.my-ns.svc:8000/v1
+#   Granite  : AI_PROVIDER=openai    AI_AGENT=aider        AI_MODEL=granite-3.3-8b-instruct
+#              AI_BASE_URL=http://granite.my-ns.svc:8000/v1
+# For aider, AI_MODEL may be a bare id (defaults to the "openai/" litellm
+# provider) or a full litellm string, e.g. "ollama_chat/granite3.3:8b" or
+# "watsonx/ibm/granite-3-8b-instruct" -- in which case add that provider's own
+# env (OLLAMA_API_BASE, WATSONX_URL, ...) as extra keys here; envFrom passes them
+# through automatically.
+#
+# To plug in a NON-listed implementation, build an image that honours the task
+# contract in README-ai-remediation.md and set AGENT_IMAGE / AI_PYTHON_IMAGE on
+# the PipelineRun -- this ConfigMap stays the single config surface.
+#
+# TLS trust for self-hosted endpoints
+# -----------------------------------
+# A self-hosted AI_BASE_URL served over HTTPS with a private CA (internal PKI or
+# a TLS-reencrypting egress proxy) fails the SDK handshake with
+# "CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate", because
+# the OpenAI/Anthropic Python SDKs verify only against certifi's public roots and
+# ignore SSL_CERT_FILE/SSL_VERIFY. Two ways to fix it:
+#   * Trust the CA (recommended). Create a ConfigMap holding the PEM:
+#       oc create configmap ai-endpoint-ca --from-file=ca-bundle.crt=<your-ca>.pem
+#     (or add the label config.openshift.io/inject-trusted-cabundle=true to have
+#     OpenShift populate ca-bundle.crt with the cluster + proxy trust bundle),
+#     then set AI_CA_BUNDLE below. The ai-select-cve task mounts this ConfigMap
+#     (optional) at /etc/ai-ca.
+#   * Disable verification (AI_TLS_INSECURE, demo/dev ONLY -- never production).
+# aider/litellm reach the endpoint differently: they honor SSL_VERIFY, so for the
+# aider tasks add SSL_VERIFY (a CA path, or "False" for demo-insecure) as an extra
+# key here; envFrom passes it through. Plaintext in-cluster HTTP (http://...svc)
+# sidesteps TLS entirely and needs none of this.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-agent-config
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+data:
+  AI_PROVIDER: "anthropic"
+  AI_AGENT: "claude-code"
+  AI_MODEL: "claude-opus-5"
+  # Endpoint for AI_PROVIDER=gateway or AI_PROVIDER=openai (the model's /v1 URL):
+  AI_BASE_URL: ""
+  # TLS trust for a self-hosted HTTPS endpoint with a private CA (see notes above).
+  # Path to a CA PEM the SDK should trust; empty = default (certifi) trust store.
+  # Point at the ai-endpoint-ca ConfigMap mounted by ai-select-cve, e.g.
+  # "/etc/ai-ca/ca-bundle.crt". For aider tasks, set SSL_VERIFY to the same path.
+  AI_CA_BUNDLE: ""
+  # Demo/dev ONLY: "true" disables TLS certificate verification. Leave "false" in
+  # production; prefer AI_CA_BUNDLE. (aider equivalent: set SSL_VERIFY="False".)
+  AI_TLS_INSECURE: "false"
+  SSL_VERIFY: "False"
+  # Only used when AI_PROVIDER=bedrock:
+  AWS_REGION: "us-east-1"
+  # Only used when AI_PROVIDER=vertex:
+  VERTEX_PROJECT_ID: ""
+  VERTEX_REGION: "global"
+  # Effort / verbosity knob passed to the model where supported (low|medium|high|xhigh|max).
+  # For gpt-oss this maps to reasoning effort; ignored by models that don't support it.
+  AI_EFFORT: "high"
