@@ -110,6 +110,7 @@ spec:
             aider \
               --model "${AIDER_MODEL}" \
               --yes-always --no-auto-commits --no-check-update --no-gitignore \
+              --no-show-model-warnings \
               --message "${PROMPT}" \
               pom.xml 2>&1 | tee /tekton/home/aider-remediate.log
             ;;

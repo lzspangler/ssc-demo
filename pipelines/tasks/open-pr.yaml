@@ -95,19 +95,50 @@ spec:
         TOKEN="$(cat /run/secrets/scm/token)"
         USERNAME="$(cat /run/secrets/scm/username 2>/dev/null || echo oauth2)"
 
-        if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git status --porcelain)" ]; then
-          echo "Changes detected; preparing PR."
-        else
+        # The workspace repo was cloned by a different arbitrary OpenShift uid than
+        # this pod runs as, so git rejects it ("detected dubious ownership") and then
+        # behaves as if there is no repo at all. Mark it safe before any git call.
+        git config --global --add safe.directory "$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+        git config --global --add safe.directory "$(workspaces.source.path)"
+
+        # Confirm we are actually inside the cloned repo. The old diff-based check
+        # treated a git *error* (e.g. dubious ownership -> "not a git repository")
+        # as "changes detected" and pushed on into git config, which then failed
+        # with "not in a git directory". Fail loudly instead.
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          echo "ERROR: $(pwd) is not a git work tree; expected the cloned application repo." >&2
+          exit 1
+        fi
+
+        # Any staged, unstaged, or untracked change means there is something to PR.
+        if [ -z "$(git status --porcelain)" ]; then
           echo "No changes to submit; skipping PR."
+          printf '' > "$(results.PR_URL.path)"
+          exit 0
+        fi
+        echo "Changes detected; preparing PR."
+
+        git config user.email "tekton-bot@${GIT_HOST}"
+        git config user.name  "TSSC Remediation Bot"
+
+        # Commit ONLY the intended remediation artifacts: AI-generated tests, the
+        # dependency bump in pom.xml, and its writeup. The working tree also holds
+        # noise from the agents and the build that must NEVER land in the PR --
+        # aider caches/history (.aider.*), Quarkus-generated openapi.json/.yaml,
+        # maven-generate/settings.xml, target/, etc. Use an explicit allowlist
+        # instead of `git add -A`, which would stage all of it.
+        git add -A -- \
+          'src/test' '*/src/test' \
+          pom.xml '*/pom.xml' \
+          REMEDIATION.md
+        if git diff --cached --quiet; then
+          echo "No test or dependency changes to submit after filtering; skipping PR."
           printf '' > "$(results.PR_URL.path)"
           exit 0
         fi
 
         BRANCH="rhtpa/remediate-${CVE_ID:-update}-$(date +%s)"
-        git config user.email "tekton-bot@${GIT_HOST}"
-        git config user.name  "TSSC Remediation Bot"
         git checkout -b "${BRANCH}"
-        git add -A
         git commit -m "fix(${CVE_ID}): bump ${PACKAGE} to ${FIXED_VERSION} + add unit tests
 
         ${JUSTIFICATION}
