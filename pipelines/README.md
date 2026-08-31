@@ -1,6 +1,6 @@
-# AI vulnerability remediation branch for `maven-build-ci`
+# AI vulnerability remediation
 
-This extends the existing `maven-build-ci` pipeline with an **opt-in** AI branch
+This pipeline provides an **opt-in** AI branch
 that, on top of the normal build → SBOM → RHTPA scan flow:
 
 1. Generates and runs unit tests for the app (AI coding agent).
@@ -15,8 +15,7 @@ that, on top of the normal build → SBOM → RHTPA scan flow:
 5. Re-runs all tests (existing + generated) with `mvn verify`.
 6. Opens a **PR/MR** back to the app repo with the tests + remediation.
 
-The whole branch is gated behind `enable-ai-remediation` (default `"false"`), so
-the pipeline behaves exactly as before until you turn it on.
+The ai capabilities are gated behind `enable-ai-remediation` (default `"false"`).
 
 ## Overview
 

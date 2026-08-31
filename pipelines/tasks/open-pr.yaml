@@ -127,10 +127,15 @@ spec:
         # aider caches/history (.aider.*), Quarkus-generated openapi.json/.yaml,
         # maven-generate/settings.xml, target/, etc. Use an explicit allowlist
         # instead of `git add -A`, which would stage all of it.
-        git add -A -- \
-          'src/test' '*/src/test' \
-          pom.xml '*/pom.xml' \
-          REMEDIATION.md
+        #
+        # Stage each pathspec on its own: `git add` aborts the WHOLE operation
+        # (staging nothing) if any single pathspec matches zero files, and the
+        # module-level globs won't match in a single-module repo. Per-pathspec
+        # with `|| true` lets the ones that exist stage while missing ones are
+        # skipped; the staged-diff check below is the real "did anything change".
+        for ps in src/test '*/src/test' pom.xml '*/pom.xml' REMEDIATION.md; do
+          git add -A -- "${ps}" 2>/dev/null || true
+        done
         if git diff --cached --quiet; then
           echo "No test or dependency changes to submit after filtering; skipping PR."
           printf '' > "$(results.PR_URL.path)"
