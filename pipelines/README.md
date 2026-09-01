@@ -21,87 +21,12 @@ The ai capabilities are gated behind `enable-ai-remediation`, which defaults to
 
 ## Overview
 
-The diagram shows each pipeline task (top-to-bottom in DAG order) and the
-**external systems** it talks to. Solid task-to-task arrows are the always-on
-build/scan chain; dotted arrows are the opt-in AI remediation branch. Solid edges
-to external systems are the interactions each task makes.
-
-```mermaid
-flowchart TB
-    subgraph EXT[External systems]
-        direction LR
-        SCM[("SCM / Git repo<br/>clone + branch + PR/MR")]
-        TAS["RHTAS<br/>Rekor · TUF · Fulcio"]
-        MVN[("Artifact repository<br/>Maven repo / mirror")]
-        REG[("Image registry")]
-        RHTPA["RHTPA / Trustify<br/>SBOM ingest · analyze · recommend"]
-        AI["AI model server<br/>Anthropic · gateway · Bedrock · Vertex · OpenAI-compatible"]
-        EC["Conforma / EC<br/>policy source"]
-        RH[("access.redhat.com<br/>OSV · CVE · CSAF · SBOM data")]
-    end
-
-    subgraph PIPE[agentic-cve-remediation pipeline]
-        direction TB
-        init[init] --> clone[clone-repository]
-        clone --> verify["verify-commit<br/>optional"]
-        verify --> package["package · mvn"]
-        package --> build[build-container]
-        build --> upload[upload-sbom-to-rhtpa]
-        upload --> analyze[rhtpa-vulnerability-analysis]
-        analyze --> recommend[rhtpa-remediation-report]
-
-        recommend -.->|AI branch| conforma[conforma-policy-check]
-        conforma -.-> gentests[ai-generate-tests]
-        gentests -.-> select[ai-select-cve]
-        select -.->|if a CVE is selected| remediate[ai-remediate-dependency]
-        remediate -.-> rerun["re-run-tests · mvn verify"]
-        rerun -.-> openpr[open-pr]
-    end
-
-    clone -->|git clone| SCM
-    verify -->|verify signature| TAS
-    package -->|resolve deps| MVN
-    build -->|push image| REG
-    upload -->|upload SBOM| RHTPA
-    analyze -->|POST /vulnerability/analyze| RHTPA
-    recommend -->|POST /purl/recommend| RHTPA
-    gentests -->|reasoning + edits| AI
-    conforma -.->|optional policy fetch| EC
-    select -->|CVE selection| AI
-    remediate -->|reasoning + edits| AI
-    remediate -->|verify compile| MVN
-    rerun -->|resolve deps| MVN
-    openpr -->|push branch + open PR/MR| SCM
-    RHTPA -.->|importers ingest| RH
-```
-
-Notes:
-
-- **Base chain** (`init` → … → `rhtpa-remediation-report`) runs on every
-  PipelineRun. **`verify-commit`** only runs with `verify-commit="true"` (needs
-  RHTAS). The **AI branch** (dotted) only runs with `enable-ai-remediation="true"`
-  (the default on this pipeline), and
-  `ai-remediate-dependency`/`re-run-tests`/`open-pr` additionally require
-  `ai-select-cve` to actually pick a CVE.
-- The **AI branch is a linear chain** appended after the scan/policy stages
-  (`rhtpa-remediation-report` → `conforma-policy-check` → `ai-generate-tests` →
-  `ai-select-cve` → …), not a parallel fork. It runs strictly after the
-  build/scan tasks so nothing writes `target/` on the shared workspace while the
-  agent tasks run — avoiding a concurrent-writer race on the PVC.
-- **RHTPA** must already contain vulnerability data — it populates itself from
-  `access.redhat.com` via its importers (dotted edge), independent of this
-  pipeline. See [RHTPA importers](#rhtpa-importers-populate-the-vulnerability-data).
-- The **AI model server** is whatever `ai-agent-config` points at (first-party
-  Anthropic, a gateway/proxy, Bedrock, Vertex, or any OpenAI-compatible endpoint
-  serving gpt-oss / Granite / etc.).
-
 ### Pipeline steps
 
-Tasks in DAG order, then the two `finally` tasks. "Runs when" marks the gating:
-_base_ runs on every PipelineRun; _AI branch_ needs `enable-ai-remediation="true"`;
-_AI branch, if CVE selected_ additionally needs `ai-select-cve` to set `SELECTED="1"`.
+The table below lists each pipeline task (in DAG order, then the two `finally`
+tasks) with description and the **external systems** it talks to.
 
-| Step (`taskRef`) | Runs when | What it does | External systems / endpoints |
+| Step (`taskRef`) | Runs when | Description | External systems / endpoints |
 |------------------|-----------|--------------|------------------------------|
 | `init` (`init`) | base | Decides whether the output image must be (re)built, setting the `build` result that gates `clone-repository` / `build-container`. | — (internal) |
 | `clone-repository` (`git-clone`) | base | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
