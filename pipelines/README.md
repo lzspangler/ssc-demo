@@ -95,6 +95,31 @@ Notes:
   Anthropic, a gateway/proxy, Bedrock, Vertex, or any OpenAI-compatible endpoint
   serving gpt-oss / Granite / etc.).
 
+### Pipeline steps
+
+Tasks in DAG order, then the two `finally` tasks. "Runs when" marks the gating:
+_base_ runs on every PipelineRun; _AI branch_ needs `enable-ai-remediation="true"`;
+_AI branch, if CVE selected_ additionally needs `ai-select-cve` to set `SELECTED="1"`.
+
+| Step (`taskRef`) | Runs when | What it does | External systems / endpoints |
+|------------------|-----------|--------------|------------------------------|
+| `init` (`init`) | base | Decides whether the output image must be (re)built, setting the `build` result that gates `clone-repository` / `build-container`. | — (internal) |
+| `clone-repository` (`git-clone`) | base | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
+| `verify-commit` (`verify-commit`) | base, only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
+| `package` (`maven`) | base | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
+| `build-container` (`buildah-rhtap`) | base, only if `build="true"` | Builds the container image from `dockerfile`/`path-context` and pushes it; emits `IMAGE_URL`/`IMAGE_DIGEST` and the SBOM. | **Image registry** — pushes the built image (`output-image`). |
+| `upload-sbom-to-rhtpa` (`upload-sbom-to-rhtpa`) | base | Uploads the generated SBOM(s) to RHTPA/Trustify for the component. | **RHTPA / Trustify** — SBOM ingest (auth via `tpa-secret` OIDC). |
+| `rhtpa-vulnerability-analysis` (`rhtpa-vulnerability-analysis`) | base | Analyzes the uploaded SBOM against RHTPA's vuln data; writes the authoritative `VULNERABILITY_REPORT` (CVE + severity + affected PURL). | **RHTPA / Trustify** — `POST /vulnerability/analyze`. |
+| `rhtpa-remediation-report` (`rhtpa-remediation-report`) | base | Looks up vendor fixed-version recommendations; writes the supplemental `REMEDIATION_REPORT` (usually empty for upstream-only Maven deps). | **RHTPA / Trustify** — `POST /purl/recommend`. |
+| `conforma-policy-check` (`conforma-policy-check`) | AI branch | Turns the vuln report into a policy **must-fix** CVE set (Conforma/EC gate, severity-based fallback); writes `MUST_FIX_PATH`. | **Conforma / EC** — optional policy source fetch (`conforma-policy-configuration`); empty uses the local severity fallback. |
+| `ai-generate-tests` (`ai-generate-tests`) | AI branch | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for compiling/running tests). |
+| `ai-select-cve` (`ai-select-cve`) | AI branch | AI selects **exactly one** CVE from the must-fix set, steered by `ai-remediation-policy`; emits structured results (`SELECTED`, `CVE_ID`, `PACKAGE`, `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`). | **AI model server** — CVE-selection reasoning call (`ai-python-image`). |
+| `ai-remediate-dependency` (`ai-remediate-dependency`) | AI branch, if CVE selected | AI edits `pom.xml` to bump only the vulnerable dependency to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for the verify-compile). |
+| `re-run-tests` (`maven`) | AI branch, if CVE selected | Runs `mvn verify` (existing + generated tests) against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
+| `open-pr` (`open-pr`) | AI branch, if CVE selected | Commits the tests + remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
+| `show-sbom` (`show-sbom-rhdh`) | `finally` | Displays the SBOM for the built image in the PipelineRun output. | **Image registry** — reads the image/SBOM referenced by `IMAGE_URL`. |
+| `show-summary` (`summary`) | `finally` | Prints a PipelineRun summary (git URL/commit, image URL, build-task status). | — (internal) |
+
 ## Files
 
 | File | Purpose |
