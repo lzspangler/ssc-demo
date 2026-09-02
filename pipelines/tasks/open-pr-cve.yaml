@@ -9,8 +9,8 @@ metadata:
     tekton.dev/tags: "git, pull-request, gitlab, github"
 spec:
   description: >-
-    Commit the accumulated working-tree changes (generated tests + dependency
-    remediation) to a new branch and open a PR/MR back to the application repo.
+    Commit the accumulated working-tree changes (dependency
+    remediation + justification) to a new branch and open a PR/MR back to the application repo.
     Supports GitLab (glab) and GitHub (gh). Auth comes from the SCM_SECRET_NAME
     secret (keys: token, username).
   params:
@@ -121,7 +121,7 @@ spec:
         git config user.email "tekton-bot@${GIT_HOST}"
         git config user.name  "TSSC Remediation Bot"
 
-        # Commit ONLY the intended remediation artifacts: AI-generated tests, the
+        # Commit ONLY the intended remediation artifacts: the
         # dependency bump in pom.xml, and its writeup. The working tree also holds
         # noise from the agents and the build that must NEVER land in the PR --
         # aider caches/history (.aider.*), Quarkus-generated openapi.json/.yaml,
@@ -133,36 +133,34 @@ spec:
         # module-level globs won't match in a single-module repo. Per-pathspec
         # with `|| true` lets the ones that exist stage while missing ones are
         # skipped; the staged-diff check below is the real "did anything change".
-        for ps in src/test '*/src/test' pom.xml '*/pom.xml' REMEDIATION.md; do
+        for ps in pom.xml '*/pom.xml' REMEDIATION.md; do
           git add -A -- "${ps}" 2>/dev/null || true
         done
         if git diff --cached --quiet; then
-          echo "No test or dependency changes to submit after filtering; skipping PR."
+          echo "No dependency changes to submit after filtering; skipping PR."
           printf '' > "$(results.PR_URL.path)"
           exit 0
         fi
 
         BRANCH="rhtpa/remediate-${CVE_ID:-update}-$(date +%s)"
         git checkout -b "${BRANCH}"
-        git commit -m "fix(${CVE_ID}): bump ${PACKAGE} to ${FIXED_VERSION} + add unit tests
+        git commit -m "fix(${CVE_ID}): bump ${PACKAGE} to ${FIXED_VERSION} 
 
         ${JUSTIFICATION}
 
-        Automated by the maven-build-ci AI remediation pipeline."
+        Automated by the agentic-cve-remediation pipeline."
 
         # Build an authenticated push URL from GIT_URL (strip any scheme/creds).
         REPO_PATH="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
         PUSH_URL="https://${USERNAME}:${TOKEN}@${GIT_HOST}/${REPO_PATH}.git"
         git push "${PUSH_URL}" "${BRANCH}"
 
-        TITLE="Remediate ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION} (+ generated tests)"
-        BODY="Automated remediation from the maven-build-ci pipeline.
+        TITLE="Remediate ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION}"
+        BODY="Automated remediation from the agentic-cve-remediation pipeline.
 
         - CVE: ${CVE_ID}
         - Dependency: ${PACKAGE} -> ${FIXED_VERSION}
-        - Rationale: ${JUSTIFICATION}
-
-        Includes AI-generated unit tests. Please review before merging."
+        - Rationale: ${JUSTIFICATION}"
 
         PR_URL=""
         case "${SCM_PROVIDER}" in

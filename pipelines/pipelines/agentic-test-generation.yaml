@@ -136,11 +136,19 @@ spec:
         - name: source
           workspace: workspace
 
+    # Stop here if the agent produced no new/changed tests: nothing to verify or
+    # PR. Both re-run-tests and open-pr are guarded on TESTS_ADDED != "0" -- the
+    # guard is repeated on open-pr because Tekton still runs a runAfter successor
+    # when its parent is skipped by a when-expression.
     - name: re-run-tests
       runAfter:
         - ai-generate-tests
       taskRef:
         name: maven
+      when:
+        - input: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
       params:
         - name: GOALS
           value: ["verify"]
@@ -157,6 +165,10 @@ spec:
         - re-run-tests
       taskRef:
         name: open-pr-tests
+      when:
+        - input: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
       params:
         - name: SUBDIRECTORY
           value: $(params.subdirectory)
