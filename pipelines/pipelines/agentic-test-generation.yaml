@@ -1,0 +1,196 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.openshift.io/runtime: generic
+    pipelines.openshift.io/strategy: docker
+    pipelines.openshift.io/used-by: build-cloud
+  name: agentic-test-generation
+spec:
+  # Linear chain: clone-repository -> verify-commit (optional) -> package
+  #   -> ai-generate-tests -> re-run-tests (mvn verify) -> open-pr
+  # The AI coding agent generates JUnit tests, the project is re-verified with the
+  # new tests, and a PR/MR is opened with just the generated tests. This is the
+  # ai-generate-tests flow split out of agentic-cve-remediation.yaml.
+  params:
+    - description: Source Repository URL
+      name: git-url
+      type: string
+    - default: ""
+      description: Revision of the Source Repository
+      name: revision
+      type: string
+    - default: source
+      description: Project subdirectory within the source workspace (where pom.xml lives).
+      name: subdirectory
+      type: string
+    # ---------------- verify-commit (optional) ----------------
+    - name: verify-commit
+      type: string
+      default: 'false'
+    - name: certificate-identity
+      type: string
+      default: userX@demo.redhat.com
+    - name: oidc-issuer
+      type: string
+      default: https://sso.<domain>/realms/trusted-artifact-signer
+    - name: rekor-url
+      type: string
+      default: http://rekor-server.tssc-tas.svc
+    - name: tuf-mirror
+      type: string
+      default: http://tuf.tssc-tas.svc
+    # ---------------- SCM (open-pr) ----------------
+    - name: git-host
+      type: string
+      description: SCM host for opening the PR/MR, e.g. gitlab-gitlab.apps.cluster.example.com
+      default: ""
+    - name: scm-provider
+      type: string
+      description: gitlab | github
+      default: gitlab
+    - name: base-branch
+      type: string
+      default: master
+    - name: scm-secret-name
+      type: string
+      default: scm-auth-secret
+    # ---------------- agent runtime ----------------
+    - name: agent-image
+      type: string
+      description: >-
+        AI coding-agent runtime image (JDK17 + Maven + the agent CLI). Use the
+        flavor matching AI_AGENT: ai-agent-maven-claude for claude-code (default),
+        ai-agent-maven-aider for aider. Also used as open-pr's GIT_IMAGE (bundles
+        git/glab/gh).
+      default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+  results:
+    - name: CHAINS-GIT_URL
+      value: $(tasks.clone-repository.results.url)
+    - name: CHAINS-GIT_COMMIT
+      value: $(tasks.clone-repository.results.commit)
+    - name: TESTS_ADDED
+      value: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+    - name: PR_URL
+      value: $(tasks.open-pr.results.PR_URL)
+  tasks:
+    - name: clone-repository
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: workspace
+        - name: basic-auth
+          workspace: git-auth
+    - name: verify-commit
+      params:
+        - name: certificate-identity
+          value: $(params.certificate-identity)
+        - name: oidc-issuer
+          value: $(params.oidc-issuer)
+        - name: rekor-url
+          value: $(params.rekor-url)
+        - name: tuf-mirror
+          value: $(params.tuf-mirror)
+      runAfter:
+        - clone-repository
+      taskRef:
+        kind: Task
+        name: verify-commit
+      when:
+        - input: "$(params.verify-commit)"
+          operator: in
+          values: ["true"]
+      workspaces:
+        - name: repository
+          workspace: workspace
+    - name: package
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+      runAfter:
+        - verify-commit
+      taskRef:
+        name: maven
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: maven_settings
+          workspace: maven-settings
+    - name: ai-generate-tests
+      runAfter:
+        - package
+      taskRef:
+        name: ai-generate-tests
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: AGENT_IMAGE
+          value: $(params.agent-image)
+      workspaces:
+        - name: source
+          workspace: workspace
+
+    # Stop here if the agent produced no new/changed tests: nothing to verify or
+    # PR. Both re-run-tests and open-pr are guarded on TESTS_ADDED != "0" -- the
+    # guard is repeated on open-pr because Tekton still runs a runAfter successor
+    # when its parent is skipped by a when-expression.
+    - name: re-run-tests
+      runAfter:
+        - ai-generate-tests
+      taskRef:
+        name: maven
+      when:
+        - input: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
+      params:
+        - name: GOALS
+          value: ["verify"]
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: maven_settings
+          workspace: maven-settings
+
+    - name: open-pr
+      runAfter:
+        - re-run-tests
+      taskRef:
+        name: open-pr-tests
+      when:
+        - input: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: GIT_HOST
+          value: $(params.git-host)
+        - name: SCM_PROVIDER
+          value: $(params.scm-provider)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
+        - name: SCM_SECRET_NAME
+          value: $(params.scm-secret-name)
+        # open-pr needs git + glab + gh; the default git-init image ships git only,
+        # so run it on the agent image, which bundles all three (both flavors do).
+        - name: GIT_IMAGE
+          value: $(params.agent-image)
+      workspaces:
+        - name: source
+          workspace: workspace
+  workspaces:
+    - name: workspace
+    - name: maven-settings
+    - name: git-auth
+      optional: true

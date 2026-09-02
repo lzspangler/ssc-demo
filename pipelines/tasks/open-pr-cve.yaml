@@ -1,0 +1,193 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: open-pr
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "git, pull-request, gitlab, github"
+spec:
+  description: >-
+    Commit the accumulated working-tree changes (dependency
+    remediation + justification) to a new branch and open a PR/MR back to the application repo.
+    Supports GitLab (glab) and GitHub (gh). Auth comes from the SCM_SECRET_NAME
+    secret (keys: token, username).
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      default: source
+    - name: GIT_URL
+      type: string
+      description: HTTPS URL of the application repository.
+    - name: GIT_HOST
+      type: string
+      description: SCM host, e.g. gitlab-gitlab.apps.cluster.example.com
+    - name: SCM_PROVIDER
+      type: string
+      description: gitlab | github
+      default: gitlab
+    - name: BASE_BRANCH
+      type: string
+      default: master
+    - name: CVE_ID
+      type: string
+    - name: PACKAGE
+      type: string
+    - name: FIXED_VERSION
+      type: string
+    - name: JUSTIFICATION
+      type: string
+      default: ""
+    - name: SCM_SECRET_NAME
+      type: string
+      default: scm-auth-secret
+    - name: GIT_IMAGE
+      type: string
+      description: >-
+        Image this task runs in. It MUST contain git AND the SCM CLI it calls
+        (glab for GitLab, gh for GitHub). The pipeline overrides this with the
+        agent image, which bundles all three. WARNING: the default below
+        (pipelines-git-init) ships git ONLY -- no glab/gh -- so override it (or
+        supply your own git+glab+gh image) when running this task standalone.
+      default: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8:latest
+  workspaces:
+    - name: source
+  results:
+    - name: PR_URL
+      description: URL of the created PR/MR (empty if none created).
+  volumes:
+    - name: scm-secret
+      secret:
+        secretName: $(params.SCM_SECRET_NAME)
+        optional: false
+  steps:
+    - name: open-pr
+      image: $(params.GIT_IMAGE)
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      volumeMounts:
+        - name: scm-secret
+          mountPath: /run/secrets/scm
+          readOnly: true
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: JUSTIFICATION
+          value: $(params.JUSTIFICATION)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        TOKEN="$(cat /run/secrets/scm/token)"
+        USERNAME="$(cat /run/secrets/scm/username 2>/dev/null || echo oauth2)"
+
+        # The workspace repo was cloned by a different arbitrary OpenShift uid than
+        # this pod runs as, so git rejects it ("detected dubious ownership") and then
+        # behaves as if there is no repo at all. Mark it safe before any git call.
+        git config --global --add safe.directory "$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+        git config --global --add safe.directory "$(workspaces.source.path)"
+
+        # Confirm we are actually inside the cloned repo. The old diff-based check
+        # treated a git *error* (e.g. dubious ownership -> "not a git repository")
+        # as "changes detected" and pushed on into git config, which then failed
+        # with "not in a git directory". Fail loudly instead.
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          echo "ERROR: $(pwd) is not a git work tree; expected the cloned application repo." >&2
+          exit 1
+        fi
+
+        # Any staged, unstaged, or untracked change means there is something to PR.
+        if [ -z "$(git status --porcelain)" ]; then
+          echo "No changes to submit; skipping PR."
+          printf '' > "$(results.PR_URL.path)"
+          exit 0
+        fi
+        echo "Changes detected; preparing PR."
+
+        git config user.email "tekton-bot@${GIT_HOST}"
+        git config user.name  "TSSC Remediation Bot"
+
+        # Commit ONLY the intended remediation artifacts: the
+        # dependency bump in pom.xml, and its writeup. The working tree also holds
+        # noise from the agents and the build that must NEVER land in the PR --
+        # aider caches/history (.aider.*), Quarkus-generated openapi.json/.yaml,
+        # maven-generate/settings.xml, target/, etc. Use an explicit allowlist
+        # instead of `git add -A`, which would stage all of it.
+        #
+        # Stage each pathspec on its own: `git add` aborts the WHOLE operation
+        # (staging nothing) if any single pathspec matches zero files, and the
+        # module-level globs won't match in a single-module repo. Per-pathspec
+        # with `|| true` lets the ones that exist stage while missing ones are
+        # skipped; the staged-diff check below is the real "did anything change".
+        for ps in pom.xml '*/pom.xml' REMEDIATION.md; do
+          git add -A -- "${ps}" 2>/dev/null || true
+        done
+        if git diff --cached --quiet; then
+          echo "No dependency changes to submit after filtering; skipping PR."
+          printf '' > "$(results.PR_URL.path)"
+          exit 0
+        fi
+
+        BRANCH="rhtpa/remediate-${CVE_ID:-update}-$(date +%s)"
+        git checkout -b "${BRANCH}"
+        git commit -m "fix(${CVE_ID}): bump ${PACKAGE} to ${FIXED_VERSION} 
+
+        ${JUSTIFICATION}
+
+        Automated by the agentic-cve-remediation pipeline."
+
+        # Build an authenticated push URL from GIT_URL (strip any scheme/creds).
+        REPO_PATH="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
+        PUSH_URL="https://${USERNAME}:${TOKEN}@${GIT_HOST}/${REPO_PATH}.git"
+        git push "${PUSH_URL}" "${BRANCH}"
+
+        TITLE="Remediate ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION}"
+        BODY="Automated remediation from the agentic-cve-remediation pipeline.
+
+        - CVE: ${CVE_ID}
+        - Dependency: ${PACKAGE} -> ${FIXED_VERSION}
+        - Rationale: ${JUSTIFICATION}"
+
+        PR_URL=""
+        case "${SCM_PROVIDER}" in
+          gitlab)
+            export GITLAB_HOST="${GIT_HOST}"
+            export GITLAB_TOKEN="${TOKEN}"
+            PR_URL="$(glab mr create \
+              --source-branch "${BRANCH}" \
+              --target-branch "${BASE_BRANCH}" \
+              --title "${TITLE}" \
+              --description "${BODY}" \
+              --yes 2>&1 | grep -Eo 'https?://[^ ]+/-/merge_requests/[0-9]+' | head -1 || true)"
+            ;;
+          github)
+            export GH_HOST="${GIT_HOST}"
+            export GH_TOKEN="${TOKEN}"
+            PR_URL="$(gh pr create \
+              --base "${BASE_BRANCH}" \
+              --head "${BRANCH}" \
+              --title "${TITLE}" \
+              --body "${BODY}" 2>&1 | grep -Eo 'https?://[^ ]+/pull/[0-9]+' | head -1 || true)"
+            ;;
+          *)
+            echo "Unsupported SCM_PROVIDER: ${SCM_PROVIDER}" >&2
+            exit 1
+            ;;
+        esac
+
+        echo "PR/MR: ${PR_URL:-<none captured>}"
+        printf '%s' "${PR_URL}" > "$(results.PR_URL.path)"

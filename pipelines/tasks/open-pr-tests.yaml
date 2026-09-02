@@ -1,18 +1,19 @@
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: open-pr
+  name: open-pr-tests
   labels:
     app.kubernetes.io/part-of: maven-build-ci
   annotations:
     tekton.dev/pipelines.minVersion: "0.41.0"
-    tekton.dev/tags: "git, pull-request, gitlab, github"
+    tekton.dev/tags: "git, pull-request, gitlab, github, testing"
 spec:
   description: >-
-    Commit the accumulated working-tree changes (generated tests + dependency
-    remediation) to a new branch and open a PR/MR back to the application repo.
-    Supports GitLab (glab) and GitHub (gh). Auth comes from the SCM_SECRET_NAME
-    secret (keys: token, username).
+    Tests-only variant of open-pr: commit the AI-generated unit tests (src/test)
+    to a new branch and open a PR/MR back to the application repo. Unlike open-pr
+    it carries no CVE/dependency-remediation context -- it only submits the
+    generated tests. Supports GitLab (glab) and GitHub (gh). Auth comes from the
+    SCM_SECRET_NAME secret (keys: token, username).
   params:
     - name: SUBDIRECTORY
       type: string
@@ -30,15 +31,6 @@ spec:
     - name: BASE_BRANCH
       type: string
       default: master
-    - name: CVE_ID
-      type: string
-    - name: PACKAGE
-      type: string
-    - name: FIXED_VERSION
-      type: string
-    - name: JUSTIFICATION
-      type: string
-      default: ""
     - name: SCM_SECRET_NAME
       type: string
       default: scm-auth-secret
@@ -80,14 +72,6 @@ spec:
           value: $(params.SCM_PROVIDER)
         - name: BASE_BRANCH
           value: $(params.BASE_BRANCH)
-        - name: CVE_ID
-          value: $(params.CVE_ID)
-        - name: PACKAGE
-          value: $(params.PACKAGE)
-        - name: FIXED_VERSION
-          value: $(params.FIXED_VERSION)
-        - name: JUSTIFICATION
-          value: $(params.JUSTIFICATION)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -119,12 +103,11 @@ spec:
         echo "Changes detected; preparing PR."
 
         git config user.email "tekton-bot@${GIT_HOST}"
-        git config user.name  "TSSC Remediation Bot"
+        git config user.name  "TSSC Test Generation Bot"
 
-        # Commit ONLY the intended remediation artifacts: AI-generated tests, the
-        # dependency bump in pom.xml, and its writeup. The working tree also holds
-        # noise from the agents and the build that must NEVER land in the PR --
-        # aider caches/history (.aider.*), Quarkus-generated openapi.json/.yaml,
+        # Commit ONLY the AI-generated tests. The working tree also holds noise from
+        # the agent and the build that must NEVER land in the PR -- aider
+        # caches/history (.aider.*), Quarkus-generated openapi.json/.yaml,
         # maven-generate/settings.xml, target/, etc. Use an explicit allowlist
         # instead of `git add -A`, which would stage all of it.
         #
@@ -133,36 +116,30 @@ spec:
         # module-level globs won't match in a single-module repo. Per-pathspec
         # with `|| true` lets the ones that exist stage while missing ones are
         # skipped; the staged-diff check below is the real "did anything change".
-        for ps in src/test '*/src/test' pom.xml '*/pom.xml' REMEDIATION.md; do
+        for ps in src/test '*/src/test'; do
           git add -A -- "${ps}" 2>/dev/null || true
         done
         if git diff --cached --quiet; then
-          echo "No test or dependency changes to submit after filtering; skipping PR."
+          echo "No generated test changes to submit after filtering; skipping PR."
           printf '' > "$(results.PR_URL.path)"
           exit 0
         fi
 
-        BRANCH="rhtpa/remediate-${CVE_ID:-update}-$(date +%s)"
+        BRANCH="ai-tests/generated-$(date +%s)"
         git checkout -b "${BRANCH}"
-        git commit -m "fix(${CVE_ID}): bump ${PACKAGE} to ${FIXED_VERSION} + add unit tests
+        git commit -m "test: add AI-generated unit tests
 
-        ${JUSTIFICATION}
-
-        Automated by the maven-build-ci AI remediation pipeline."
+        Automated by the maven-build-ci AI test-generation pipeline."
 
         # Build an authenticated push URL from GIT_URL (strip any scheme/creds).
         REPO_PATH="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
         PUSH_URL="https://${USERNAME}:${TOKEN}@${GIT_HOST}/${REPO_PATH}.git"
         git push "${PUSH_URL}" "${BRANCH}"
 
-        TITLE="Remediate ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION} (+ generated tests)"
-        BODY="Automated remediation from the maven-build-ci pipeline.
+        TITLE="Add AI-generated unit tests"
+        BODY="Automated unit-test generation from the maven-build-ci pipeline.
 
-        - CVE: ${CVE_ID}
-        - Dependency: ${PACKAGE} -> ${FIXED_VERSION}
-        - Rationale: ${JUSTIFICATION}
-
-        Includes AI-generated unit tests. Please review before merging."
+        Includes AI-generated JUnit tests under src/test. Please review before merging."
 
         PR_URL=""
         case "${SCM_PROVIDER}" in
