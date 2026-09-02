@@ -1,62 +1,76 @@
 # AI vulnerability remediation
 
-This pipeline provides an **opt-in** AI branch
-that, on top of the normal build → SBOM → RHTPA scan flow:
+This repo splits the agentic security flow into **three focused pipelines** that
+share the same tasks and images. Each has a single, distinct responsibility and
+can be run on its own:
 
-1. Generates and runs unit tests for the app (AI coding agent).
-2. Turns the RHTPA **vulnerability-analysis** report into a policy **must-fix**
-   set (Conforma/Enterprise Contract gate, with a severity-based fallback). The
-   analyze report is the source of truth (CVE + severity + affected PURL); the
-   recommend report is supplemental (it is a Red Hat-rebuild catalog lookup and is
-   usually empty for upstream-only Maven deps).
-3. Asks the AI to select **exactly one** CVE to remediate, constrained to the
-   must-fix set and steered by a user-defined policy.
-4. Has the AI update the vulnerable Maven dependency to its fixed version.
-5. Re-runs all tests (existing + generated) with `mvn verify`.
-6. Opens a **PR/MR** back to the app repo with the tests + remediation.
+1. **`agentic-cve-selection`** — *decide what to fix.* Builds the image, uploads
+   the SBOM to RHTPA, scans it, applies the policy **must-fix** gate, and asks the
+   AI to select **exactly one** CVE. Ends at `ai-select-cve` and exposes that
+   decision as pipeline results.
+2. **`agentic-cve-remediation`** — *apply a fix.* Takes a CVE-selection decision
+   **as params**, has the AI bump the vulnerable Maven dependency to its fixed
+   version, re-runs `mvn verify`, and opens a **PR/MR**. Does no discovery or
+   scanning of its own.
+3. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
+   **test-generation** flow (clone → build → generate tests → `mvn verify` →
+   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
 
-The ai capabilities are gated behind `enable-ai-remediation`, which defaults to
-`"true"` on this pipeline (`pipelines/agentic-cve-remediation.yaml`). Set it to
-`"false"` to run only the base build → SBOM → RHTPA scan chain.
-
-A second pipeline, **`pipelines/agentic-test-generation.yaml`**, runs just the AI
-**test-generation** flow (clone → build → generate tests → `mvn verify` →
-tests-only PR/MR) with no image build, SBOM/scan, or CVE remediation. See the
-[Overview](#overview).
+`agentic-cve-selection` and `agentic-cve-remediation` are two halves of one
+workflow: selection produces a six-field decision
+(`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`)
+and remediation consumes it. The hand-off is by **params + manual start** — see
+[Hand-off: selection → remediation](#hand-off-selection--remediation). See the
+[Overview](#overview) for per-step detail.
 
 ## Overview
 
-This repo defines **two** pipelines that share the same tasks and images:
+This repo defines **three** pipelines that share the same tasks and images:
 
-- **`pipelines/agentic-cve-remediation.yaml`** — the full build → SBOM → RHTPA
-  scan → AI-remediation flow, with the AI branch gated behind
-  `enable-ai-remediation`.
+- **`pipelines/agentic-cve-selection.yaml`** — self-contained CVE discovery,
+  prioritization, and selection (build → SBOM → RHTPA scan → must-fix gate → AI
+  select). Outputs the selection decision as pipeline results; changes nothing in
+  the repo.
+- **`pipelines/agentic-cve-remediation.yaml`** — applies a selection decision
+  (passed in as params) to the git project: clone → AI bump the dependency →
+  `mvn verify` → PR/MR. The remediation tail runs only when `SELECTED="1"`.
 - **`pipelines/agentic-test-generation.yaml`** — a standalone AI
   **test-generation** flow (clone → build → generate tests → `mvn verify` →
   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
 
-### `agentic-cve-remediation` steps
+### `agentic-cve-selection` steps
 
 The table below lists each pipeline task (in DAG order, then the two `finally`
 tasks) with description and the **external systems** it talks to.
 
 | Step (`taskRef`) | Runs when | Description | External systems / endpoints |
 |------------------|-----------|--------------|------------------------------|
-| `init` (`init`) | base | Decides whether the output image must be (re)built, setting the `build` result that gates `clone-repository` / `build-container`. | — (internal) |
-| `clone-repository` (`git-clone`) | base | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
-| `verify-commit` (`verify-commit`) | base, only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
-| `package` (`maven`) | base | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
-| `build-container` (`buildah-rhtap`) | base, only if `build="true"` | Builds the container image from `dockerfile`/`path-context` and pushes it; emits `IMAGE_URL`/`IMAGE_DIGEST` and the SBOM. | **Image registry** — pushes the built image (`output-image`). |
-| `upload-sbom-to-rhtpa` (`upload-sbom-to-rhtpa`) | base | Uploads the generated SBOM(s) to RHTPA/Trustify for the component. | **RHTPA / Trustify** — SBOM ingest (auth via `tpa-secret` OIDC). |
-| `rhtpa-vulnerability-analysis` (`rhtpa-vulnerability-analysis`) | base | Analyzes the uploaded SBOM against RHTPA's vuln data; writes the authoritative `VULNERABILITY_REPORT` (CVE + severity + affected PURL). | **RHTPA / Trustify** — `POST /vulnerability/analyze`. |
-| `rhtpa-remediation-report` (`rhtpa-remediation-report`) | base | Looks up vendor fixed-version recommendations; writes the supplemental `REMEDIATION_REPORT` (usually empty for upstream-only Maven deps). | **RHTPA / Trustify** — `POST /purl/recommend`. |
-| `conforma-policy-check` (`conforma-policy-check`) | AI branch | Turns the vuln report into a policy **must-fix** CVE set (Conforma/EC gate, severity-based fallback); writes `MUST_FIX_PATH`. | **Conforma / EC** — optional policy source fetch (`conforma-policy-configuration`); empty uses the local severity fallback. |
-| `ai-select-cve` (`ai-select-cve`) | AI branch | AI selects **exactly one** CVE from the must-fix set, steered by `ai-remediation-policy`; emits structured results (`SELECTED`, `CVE_ID`, `PACKAGE`, `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`). | **AI model server** — CVE-selection reasoning call (`ai-python-image`). |
-| `ai-remediate-dependency` (`ai-remediate-dependency`) | AI branch, if CVE selected | AI edits `pom.xml` to bump only the vulnerable dependency to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for the verify-compile). |
-| `re-run-tests` (`maven`) | AI branch, if CVE selected | Runs `mvn verify` (existing + generated tests) against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
-| `open-pr` (`open-pr`) | AI branch, if CVE selected | Commits the tests + remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
+| `init` (`init`) | always | Decides whether the output image must be (re)built, setting the `build` result that gates `clone-repository` / `build-container`. | — (internal) |
+| `clone-repository` (`git-clone`) | if `build="true"` | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
+| `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
+| `package` (`maven`) | always | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
+| `build-container` (`buildah-rhtap`) | if `build="true"` | Builds the container image from `dockerfile`/`path-context` and pushes it; emits `IMAGE_URL`/`IMAGE_DIGEST` and the SBOM. | **Image registry** — pushes the built image (`output-image`). |
+| `upload-sbom-to-rhtpa` (`upload-sbom-to-rhtpa`) | always | Uploads the generated SBOM(s) to RHTPA/Trustify for the component. | **RHTPA / Trustify** — SBOM ingest (auth via `tpa-secret` OIDC). |
+| `rhtpa-vulnerability-analysis` (`rhtpa-vulnerability-analysis`) | always | Analyzes the uploaded SBOM against RHTPA's vuln data; writes the authoritative `VULNERABILITY_REPORT` (CVE + severity + affected PURL). | **RHTPA / Trustify** — `POST /vulnerability/analyze`. |
+| `rhtpa-remediation-report` (`rhtpa-remediation-report`) | always | Looks up vendor fixed-version recommendations; writes the supplemental `REMEDIATION_REPORT` (usually empty for upstream-only Maven deps). | **RHTPA / Trustify** — `POST /purl/recommend`. |
+| `conforma-policy-check` (`conforma-policy-check`) | always | Turns the vuln report into a policy **must-fix** CVE set (Conforma/EC gate, severity-based fallback); writes `MUST_FIX_PATH`. | **Conforma / EC** — optional policy source fetch (`conforma-policy-configuration`); empty uses the local severity fallback. |
+| `ai-select-cve` (`ai-select-cve`) | always | AI selects **exactly one** CVE from the must-fix set, steered by `ai-remediation-policy`; emits structured results (`SELECTED`, `CVE_ID`, `PACKAGE`, `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`) that become this pipeline's results. | **AI model server** — CVE-selection reasoning call (`ai-python-image`). |
 | `show-sbom` (`show-sbom-rhdh`) | `finally` | Displays the SBOM for the built image in the PipelineRun output. | **Image registry** — reads the image/SBOM referenced by `IMAGE_URL`. |
 | `show-summary` (`summary`) | `finally` | Prints a PipelineRun summary (git URL/commit, image URL, build-task status). | — (internal) |
+
+### `agentic-cve-remediation` steps
+
+Every task runs unconditionally except **`verify-commit`** (optional) and the
+remediation tail, which is gated on `SELECTED="1"`. No discovery, scan, or
+selection — those live in `agentic-cve-selection`.
+
+| Step (`taskRef`) | Runs when | Description | External systems / endpoints |
+|------------------|-----------|-------------|------------------------------|
+| `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
+| `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
+| `ai-remediate-dependency` (`ai-remediate-dependency`) | if `SELECTED="1"` | AI edits `pom.xml` to bump only the vulnerable dependency (`PACKAGE`) to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for the verify-compile). |
+| `re-run-tests` (`maven`) | if `SELECTED="1"` | Runs `mvn verify` against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
+| `open-pr` (`open-pr`) | if `SELECTED="1"` | Commits the remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR (carries the CVE/fix context). Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
 ### `agentic-test-generation` steps
 
@@ -76,7 +90,8 @@ image build, SBOM upload, or RHTPA scan.
 
 | File | Purpose |
 |------|---------|
-| `pipelines/agentic-cve-remediation.yaml` | Pipeline with the gated AI branch wired into the existing DAG |
+| `pipelines/agentic-cve-selection.yaml` | Self-contained CVE discovery/scan/selection pipeline (build → SBOM → RHTPA scan → must-fix gate → AI select); outputs the selection decision as results |
+| `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
@@ -94,7 +109,7 @@ image build, SBOM upload, or RHTPA scan.
 
 ## DAG
 
-### `agentic-cve-remediation`
+### `agentic-cve-selection`
 
 ```
 init → clone-repository → verify-commit → package → build-container → upload-sbom-to-rhtpa → rhtpa-vulnerability-analysis → rhtpa-remediation-report
@@ -102,60 +117,128 @@ init → clone-repository → verify-commit → package → build-container → 
                                                                                                                         conforma-policy-check
                                                                                                                                        │
                                                                                                                              ai-select-cve
-                                                                                                                                       │  (only if ai-select-cve.SELECTED == "1")
-                                                                                                                     ai-remediate-dependency
-                                                                                                                                       │
-                                                                                                                       re-run-tests (mvn verify)
-                                                                                                                                       │
-                                                                                                                                    open-pr
 ```
 
-The whole thing is a single linear chain. The AI branch is appended after
-`rhtpa-remediation-report` (not forked off `clone-repository`) so the
-agent/`mvn verify` tasks never run concurrently with the build/scan tasks that
-write `target/` on the shared workspace — a concurrent writer there bumps the
-workdir mtime mid-read and breaks the agents' `tar` of the source, so
-serializing avoids that race and is simpler to reason about.
+A single linear chain that ends at `ai-select-cve`. The scan/select tasks run
+after the build (not forked off `clone-repository`) so nothing runs concurrently
+with the build/scan tasks that write `target/` on the shared workspace — a
+concurrent writer there bumps the workdir mtime mid-read and breaks the agents'
+`tar` of the source, so serializing avoids that race and is simpler to reason
+about. The pipeline **changes nothing in the repo**; its whole output is the
+selection decision, exposed as results
+(`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`,
+plus `IMAGE_URL`/`IMAGE_DIGEST`/`CHAINS-GIT_*`). `verify-commit` is optional.
 
-`ai-remediate-dependency`, `re-run-tests`, and `open-pr` are additionally gated on
-`ai-select-cve` actually picking a CVE (`SELECTED == "1"`), so a clean scan
-(nothing must-fix) skips remediation and the PR. Because Tekton's
-"skipped-parent still runs the successor" semantics don't apply when the
-successor's own `when` fails, the tail of the branch is short-circuited cleanly
-when there's nothing to fix.
+### `agentic-cve-remediation`
+
+```
+clone-repository → verify-commit → ai-remediate-dependency → re-run-tests (mvn verify) → open-pr
+                                                        (whole tail only if SELECTED == "1")
+```
+
+This pipeline is now **param-driven**: it takes the selection decision in as
+params rather than computing it. There is no build, SBOM upload, or RHTPA scan —
+it clones the repo, has the AI bump the one dependency, re-verifies, and opens the
+PR. `ai-remediate-dependency`, `re-run-tests`, and `open-pr` are each gated on
+`SELECTED == "1"`, so passing `SELECTED="0"` (or omitting it — it defaults to
+`"0"`) makes the pipeline a clean no-op after the clone. The guard is repeated on
+all three tasks because Tekton's "skipped-parent still runs the successor"
+semantics don't short-circuit a `runAfter` successor unless the successor's own
+`when` also fails. `verify-commit` is optional. Like the other pipelines the
+agent and `mvn verify` run in a pod-local scratch copy to avoid the
+shared-`target/` race.
 
 ### `agentic-test-generation`
 
 ```
 clone-repository → verify-commit → package → ai-generate-tests → re-run-tests (mvn verify) → open-pr
+                                                          (re-run-tests + open-pr only if TESTS_ADDED != "0")
 ```
 
 The standalone test-generation pipeline (`pipelines/agentic-test-generation.yaml`)
 is the `ai-generate-tests` flow split out on its own. It has no `init`, image
-build, SBOM upload, or RHTPA scan; every task runs unconditionally (there is no
-`enable-ai-remediation` gate) except **`verify-commit`**, which stays optional
-(runs only with `verify-commit="true"`). The final `open-pr` step uses the
-**`open-pr-tests`** task — a tests-only variant that commits just the generated
-tests (`src/test`) to an `ai-tests/*` branch with no CVE/fix wording, and no-ops
-if the agent produced no test changes. Like the CVE pipeline, the agent and
-`mvn verify` run in a pod-local scratch copy to avoid the shared-`target/` race.
-It needs the `ai-agent-config`/`ai-agent-secret` and `scm-auth-secret` objects
-(and the agent image), but not `tpa-secret`, RHTPA, or TAS.
+build, SBOM upload, or RHTPA scan; every task runs unconditionally except
+**`verify-commit`** (optional) and the `re-run-tests`/`open-pr` tail, which is
+gated on `ai-generate-tests` actually producing new/changed tests
+(`TESTS_ADDED != "0"`) — a run that generates nothing ends cleanly after
+`ai-generate-tests`. The final `open-pr` step uses the **`open-pr-tests`** task —
+a tests-only variant that commits just the generated tests (`src/test`) to an
+`ai-tests/*` branch with no CVE/fix wording, and no-ops if nothing changed. Like
+the CVE pipelines the agent and `mvn verify` run in a pod-local scratch copy to
+avoid the shared-`target/` race. It needs the `ai-agent-config`/`ai-agent-secret`
+and `scm-auth-secret` objects (and the agent image), but not `tpa-secret`, RHTPA,
+or TAS.
+
+## Hand-off: selection → remediation
+
+`agentic-cve-selection` and `agentic-cve-remediation` are deliberately decoupled:
+selection emits a six-field decision as **PipelineRun results**, and remediation
+reads that decision from **params**. The two are joined by a manual start (the
+transport is "params + manual start" — no shared workspace or event wiring), so a
+human reviews the selected CVE before any repo change happens.
+
+The contract is these six results/params (identical names on both sides):
+
+| Field | Meaning |
+|-------|---------|
+| `SELECTED` | `"1"` if a CVE was selected, `"0"` otherwise. Remediation's tail runs only on `"1"`. |
+| `CVE_ID` | The selected CVE identifier. |
+| `PACKAGE` | Maven coordinates (`groupId:artifactId`) of the dependency to bump. |
+| `CURRENT_VERSION` | The currently-resolved (vulnerable) version. |
+| `FIXED_VERSION` | The concrete version to bump to. |
+| `JUSTIFICATION` | Why this CVE was chosen (goes into the PR body). |
+
+**1. Run selection and read its results** (PipelineRuns are ephemeral/pruned, so
+capture them promptly):
+
+```bash
+# start selection (component/image/git params as appropriate)
+tkn -n tssc-app-ci pipeline start agentic-cve-selection \
+  -p component-name=my-app -p git-url=https://… -p output-image=quay.io/… \
+  -w name=workspace,… -w name=maven-settings,… --showlog
+
+# once it finishes, read the decision from the PipelineRun results
+PR=<selection-pipelinerun-name>
+oc -n tssc-app-ci get pipelinerun "$PR" \
+  -o jsonpath='{range .status.results[*]}{.name}={.value}{"\n"}{end}'
+```
+
+**2. If `SELECTED=1`, review the decision, then start remediation** with those
+values as params:
+
+```bash
+tkn -n tssc-app-ci pipeline start agentic-cve-remediation \
+  -p git-url=https://…            -p subdirectory=source \
+  -p SELECTED=1 \
+  -p CVE_ID="CVE-2024-…"          -p PACKAGE="com.example:widget" \
+  -p CURRENT_VERSION="1.2.3"      -p FIXED_VERSION="1.2.4" \
+  -p JUSTIFICATION="…"            \
+  -p git-host=gitlab.example.com  -p scm-provider=gitlab -p base-branch=main \
+  -w name=workspace,…  -w name=maven-settings,…  -w name=git-auth,… --showlog
+```
+
+> **Result-size note:** long free-text `JUSTIFICATION` can be truncated by
+> Tekton's result-size limit (results ride the step's termination message). Keep
+> the selector's justification concise, or trim it before passing it on.
 
 ## Prerequisites
 
 Everything below is assumed to be in place **before** the `## One-time setup`
-commands. Items marked _(base pipeline)_ are required even with the AI branch off;
-the rest are only needed when `enable-ai-remediation="true"`. The examples use the
-namespace `tssc-app-ci` — substitute your own.
+commands. Items marked _(scan chain)_ are needed by **`agentic-cve-selection`**
+(the build → SBOM → RHTPA scan half); the AI/SCM items are needed by whichever
+pipelines you run (`agentic-cve-selection` uses the AI model server;
+`agentic-cve-remediation` and `agentic-test-generation` additionally push a
+PR/MR). `agentic-cve-remediation` and `agentic-test-generation` do **not** need
+RHTPA or `tpa-secret`. The examples use the namespace `tssc-app-ci` — substitute
+your own.
 
 ### Platform
 
 | Requirement | Notes |
 |-------------|-------|
-| OpenShift 4.x _(base pipeline)_ | Target cluster. |
-| **OpenShift Pipelines** (Tekton) operator _(base pipeline)_ | Provides `Task`/`Pipeline`/`PipelineRun` CRDs and the referenced cluster tasks (`init`, `git-clone`, `maven`, `build-container`/buildah, `verify-commit`). |
-| **RHTPA 2.2.6** (Red Hat Trusted Profile Analyzer / Trustify) _(base pipeline)_ | Reachable from the cluster, with its OIDC issuer. Its vulnerability data must be **populated** — see [RHTPA importers](#rhtpa-importers-populate-the-vulnerability-data). |
+| OpenShift 4.x _(scan chain)_ | Target cluster. |
+| **OpenShift Pipelines** (Tekton) operator _(scan chain)_ | Provides `Task`/`Pipeline`/`PipelineRun` CRDs and the referenced cluster tasks (`init`, `git-clone`, `maven`, `build-container`/buildah, `verify-commit`). |
+| **RHTPA 2.2.6** (Red Hat Trusted Profile Analyzer / Trustify) _(scan chain)_ | Reachable from the cluster, with its OIDC issuer. Its vulnerability data must be **populated** — see [RHTPA importers](#rhtpa-importers-populate-the-vulnerability-data). |
 | **Trusted Artifact Signer** (TAS) — _optional_ | Only if you run with `verify-commit="true"`. Supplies Rekor/TUF/Fulcio; drives the `oidc-issuer`, `rekor-url`, `tuf-mirror`, `certificate-identity` params. Left `"false"` by default. |
 | Egress | RHTPA importers reach `access.redhat.com` (Red Hat SBOM/CSAF/OSV data); the AI provider endpoint (`api.anthropic.com:443` by default, or your gateway/Bedrock/Vertex/OpenAI-compatible host); the SCM host (`gitlab.com`/`github.com` or your on-prem SCM); and the image registry. Image **builds** additionally pull from `archive.apache.org`, `rpm.nodesource.com`, `gitlab.com`, `github.com`. |
 
@@ -163,15 +246,16 @@ namespace `tssc-app-ci` — substitute your own.
 
 | Object | Kind | Required when | Keys / contents |
 |--------|------|---------------|-----------------|
-| `tpa-secret` | Secret | _(base pipeline)_ | `bombastic_api_url`, `oidc_issuer_url`, `oidc_client_id`, `oidc_client_secret`. Consumed by the RHTPA tasks **and** the importer Job. (Name overridable via `trustification-secret-name`.) |
-| `ai-agent-config` | ConfigMap | AI branch | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
-| `ai-agent-secret` | Secret | AI branch | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
-| `scm-auth-secret` | Secret | AI branch (PR step) | `username` + `token` with push + PR/MR-create scope (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
+| `tpa-secret` | Secret | `agentic-cve-selection` only | `bombastic_api_url`, `oidc_issuer_url`, `oidc_client_id`, `oidc_client_secret`. Consumed by the RHTPA tasks **and** the importer Job. (Name overridable via `trustification-secret-name`.) |
+| `ai-agent-config` | ConfigMap | all pipelines | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
+| `ai-agent-secret` | Secret | all pipelines | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
+| `scm-auth-secret` | Secret | remediation + test-gen (PR step) | `username` + `token` with push + PR/MR-create scope (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
 
 #### SCM token scopes (`scm-auth-secret`)
 
-The `open-pr` task uses this token for exactly two privileged operations: a
-`git push` of the remediation branch over HTTPS, and a `glab mr create` /
+The `open-pr` / `open-pr-tests` tasks use this token for exactly two privileged
+operations: a `git push` of the branch (`rhtpa/*` for remediation, `ai-tests/*`
+for test-gen) over HTTPS, and a `glab mr create` /
 `gh pr create` API call. (The initial repo **clone** uses a *different* secret —
 the `git-auth` workspace — so this token does not need clone/read access to the
 whole instance.)
@@ -184,8 +268,8 @@ whole instance.)
 | `write_repository` | Required to `git push` the branch over HTTPS. (`api` often permits push too, but include this to avoid version-specific edge cases.) |
 
 - **Role:** the token identity needs at least **Developer** on the target
-  project (enough to push a non-protected `rhtpa/*` branch and open an MR). Use
-  **Maintainer** only if that branch namespace is protected.
+  project (enough to push a non-protected `rhtpa/*` or `ai-tests/*` branch and
+  open an MR). Use **Maintainer** only if that branch namespace is protected.
 - **Token type:** a **Project Access Token** scoped to the one repo (bot identity,
   Developer role, `api` + `write_repository`) is the least-privilege choice and
   auto-expires. A Personal Access Token works but reaches every project the user
@@ -343,10 +427,12 @@ catalog is populated.
    oc -n tssc-app-ci create -f secrets/scm-auth-secret.example.yaml   # after editing REPLACE_ME
    ```
 
-5. **Apply the tasks + pipeline:**
+5. **Apply the tasks + pipelines** (apply all three, or just the ones you use):
    ```
    oc -n tssc-app-ci apply -f tasks/
+   oc -n tssc-app-ci apply -f pipelines/agentic-cve-selection.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-remediation.yaml
+   oc -n tssc-app-ci apply -f pipelines/agentic-test-generation.yaml
    ```
 
 6. **Egress:** the cluster must allow the selected provider's endpoint
@@ -356,12 +442,18 @@ catalog is populated.
 
 ## Turning it on
 
-Set the gate and the SCM params on the PipelineRun (or in the PaC template):
+There is no single on/off gate anymore — you **start whichever pipeline** does the
+job. A typical CVE run is two steps: `agentic-cve-selection` to decide, then
+`agentic-cve-remediation` with that decision as params (see
+[Hand-off](#hand-off-selection--remediation)). `agentic-test-generation` runs
+independently.
+
+The pipelines that open a PR/MR (`agentic-cve-remediation`,
+`agentic-test-generation`) need the SCM params set on the PipelineRun (or in the
+PaC template):
 
 ```yaml
 params:
-  - name: enable-ai-remediation
-    value: "true"
   - name: git-host
     value: gitlab-gitlab.apps.cluster.example.com
   - name: scm-provider
@@ -370,8 +462,9 @@ params:
     value: main
 ```
 
-Optional: override `ai-remediation-policy` (free-form CVE-prioritization policy
-for the AI) and/or `conforma-policy-configuration` (an EC policy source; empty
+Optional (on `agentic-cve-selection`): override `ai-remediation-policy` (free-form
+CVE-prioritization policy for the AI) and/or `conforma-policy-configuration` (an
+EC policy source; empty
 uses the severity fallback keeping analyze findings at/above `high`). The fallback
 does **not** require a structured fixed version — analyze exposes the fix only as
 free text in the CVE title/description, so `ai-select-cve` resolves the concrete
