@@ -19,9 +19,23 @@ The ai capabilities are gated behind `enable-ai-remediation`, which defaults to
 `"true"` on this pipeline (`pipelines/agentic-cve-remediation.yaml`). Set it to
 `"false"` to run only the base build → SBOM → RHTPA scan chain.
 
+A second pipeline, **`pipelines/agentic-test-generation.yaml`**, runs just the AI
+**test-generation** flow (clone → build → generate tests → `mvn verify` →
+tests-only PR/MR) with no image build, SBOM/scan, or CVE remediation. See the
+[Overview](#overview).
+
 ## Overview
 
-### Pipeline steps
+This repo defines **two** pipelines that share the same tasks and images:
+
+- **`pipelines/agentic-cve-remediation.yaml`** — the full build → SBOM → RHTPA
+  scan → AI-remediation flow, with the AI branch gated behind
+  `enable-ai-remediation`.
+- **`pipelines/agentic-test-generation.yaml`** — a standalone AI
+  **test-generation** flow (clone → build → generate tests → `mvn verify` →
+  tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
+
+### `agentic-cve-remediation` steps
 
 The table below lists each pipeline task (in DAG order, then the two `finally`
 tasks) with description and the **external systems** it talks to.
@@ -37,7 +51,6 @@ tasks) with description and the **external systems** it talks to.
 | `rhtpa-vulnerability-analysis` (`rhtpa-vulnerability-analysis`) | base | Analyzes the uploaded SBOM against RHTPA's vuln data; writes the authoritative `VULNERABILITY_REPORT` (CVE + severity + affected PURL). | **RHTPA / Trustify** — `POST /vulnerability/analyze`. |
 | `rhtpa-remediation-report` (`rhtpa-remediation-report`) | base | Looks up vendor fixed-version recommendations; writes the supplemental `REMEDIATION_REPORT` (usually empty for upstream-only Maven deps). | **RHTPA / Trustify** — `POST /purl/recommend`. |
 | `conforma-policy-check` (`conforma-policy-check`) | AI branch | Turns the vuln report into a policy **must-fix** CVE set (Conforma/EC gate, severity-based fallback); writes `MUST_FIX_PATH`. | **Conforma / EC** — optional policy source fetch (`conforma-policy-configuration`); empty uses the local severity fallback. |
-| `ai-generate-tests` (`ai-generate-tests`) | AI branch | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for compiling/running tests). |
 | `ai-select-cve` (`ai-select-cve`) | AI branch | AI selects **exactly one** CVE from the must-fix set, steered by `ai-remediation-policy`; emits structured results (`SELECTED`, `CVE_ID`, `PACKAGE`, `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`). | **AI model server** — CVE-selection reasoning call (`ai-python-image`). |
 | `ai-remediate-dependency` (`ai-remediate-dependency`) | AI branch, if CVE selected | AI edits `pom.xml` to bump only the vulnerable dependency to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for the verify-compile). |
 | `re-run-tests` (`maven`) | AI branch, if CVE selected | Runs `mvn verify` (existing + generated tests) against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
@@ -45,11 +58,26 @@ tasks) with description and the **external systems** it talks to.
 | `show-sbom` (`show-sbom-rhdh`) | `finally` | Displays the SBOM for the built image in the PipelineRun output. | **Image registry** — reads the image/SBOM referenced by `IMAGE_URL`. |
 | `show-summary` (`summary`) | `finally` | Prints a PipelineRun summary (git URL/commit, image URL, build-task status). | — (internal) |
 
+### `agentic-test-generation` steps
+
+Every task runs unconditionally except **`verify-commit`** (optional). No `init`,
+image build, SBOM upload, or RHTPA scan.
+
+| Step (`taskRef`) | Runs when | Description | External systems / endpoints |
+|------------------|-----------|-------------|------------------------------|
+| `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
+| `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
+| `package` (`maven`) | always | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
+| `ai-generate-tests` (`ai-generate-tests`) | always | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for compiling/running tests). |
+| `re-run-tests` (`maven`) | always | Runs `mvn verify` (existing + generated tests) against the tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
+| `open-pr` (`open-pr-tests`) | always | Commits **only** the generated tests (`src/test`) to an `ai-tests/*` branch and opens a tests-only PR/MR (no CVE/fix wording); no-ops if nothing changed. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `pipelines/agentic-cve-remediation.yaml` | Pipeline with the gated AI branch wired into the existing DAG |
+| `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
@@ -58,19 +86,20 @@ tasks) with description and the **external systems** it talks to.
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
-| `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR (runs on the **agent image** — see note below) |
+| `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR — tests + CVE remediation (runs on the **agent image** — see note below) |
+| `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipeline |
 | `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
 | `images/ai-agent-maven-aider/Dockerfile` | Agent runtime, **aider** flavor (ubi-minimal + JDK17 + Maven + Python/aider + git/glab/gh) |
 | `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic + OpenAI Python SDKs) |
 
 ## DAG
 
+### `agentic-cve-remediation`
+
 ```
 init → clone-repository → verify-commit → package → build-container → upload-sbom-to-rhtpa → rhtpa-vulnerability-analysis → rhtpa-remediation-report
                                                                                                                                        │
                                                                                                                         conforma-policy-check
-                                                                                                                                       │
-                                                                                                                          ai-generate-tests
                                                                                                                                        │
                                                                                                                              ai-select-cve
                                                                                                                                        │  (only if ai-select-cve.SELECTED == "1")
@@ -90,11 +119,28 @@ serializing avoids that race and is simpler to reason about.
 
 `ai-remediate-dependency`, `re-run-tests`, and `open-pr` are additionally gated on
 `ai-select-cve` actually picking a CVE (`SELECTED == "1"`), so a clean scan
-(nothing must-fix) skips remediation and the PR but still contributes the
-generated tests from `ai-generate-tests` to the workspace. Because Tekton's
+(nothing must-fix) skips remediation and the PR. Because Tekton's
 "skipped-parent still runs the successor" semantics don't apply when the
 successor's own `when` fails, the tail of the branch is short-circuited cleanly
 when there's nothing to fix.
+
+### `agentic-test-generation`
+
+```
+clone-repository → verify-commit → package → ai-generate-tests → re-run-tests (mvn verify) → open-pr
+```
+
+The standalone test-generation pipeline (`pipelines/agentic-test-generation.yaml`)
+is the `ai-generate-tests` flow split out on its own. It has no `init`, image
+build, SBOM upload, or RHTPA scan; every task runs unconditionally (there is no
+`enable-ai-remediation` gate) except **`verify-commit`**, which stays optional
+(runs only with `verify-commit="true"`). The final `open-pr` step uses the
+**`open-pr-tests`** task — a tests-only variant that commits just the generated
+tests (`src/test`) to an `ai-tests/*` branch with no CVE/fix wording, and no-ops
+if the agent produced no test changes. Like the CVE pipeline, the agent and
+`mvn verify` run in a pod-local scratch copy to avoid the shared-`target/` race.
+It needs the `ai-agent-config`/`ai-agent-secret` and `scm-auth-secret` objects
+(and the agent image), but not `tpa-secret`, RHTPA, or TAS.
 
 ## Prerequisites
 
