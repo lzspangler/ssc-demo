@@ -176,6 +176,19 @@ the agent image (which has `glab`/`gh`); the git task does **no** JSON parsing.
 Best-effort dedupe skips a CVE that already has an open issue, so re-runs don't
 pile up duplicates.
 
+`ai-analyze-cves` processes the must-fix set in **batches** rather than one giant
+prompt — a large list (e.g. 77 CVEs) otherwise blows the model's combined
+thinking+output token budget and comes back empty. It splits the CVEs into chunks,
+trims the vuln report per-batch to what each chunk needs, retries a failed batch
+once, and accumulates the decisions. Two params on the `ai-analyze-cves` task tune
+this (both have working defaults; wire them through a pipeline param to override
+per run):
+
+| Param | Default | Effect |
+|-------|---------|--------|
+| `BATCH_SIZE` | `12` | CVEs per model call. Lower it if batches still return truncated/empty on a verbose report; raise it to cut the number of calls. |
+| `MAX_TOKENS` | `8000` | Combined thinking+output budget per call (Anthropic counts both against `max_tokens`). Raise it if a batch's output is cut off mid-JSON. |
+
 ### `agentic-cve-remediation`
 
 ```
@@ -380,6 +393,26 @@ Common failures: `interceptor ... not found` → the `ClusterRoleBinding` subjec
 namespace is wrong (step 4 caveat); a 401 / token mismatch → the GitLab **Secret
 token** ≠ `gitlab-webhook-secret`; no run and no reject logged → the comment
 didn't start with `/remediate`, or it was on an MR rather than an issue.
+
+> **Debugging silent drops (`started`→`done`, no PipelineRun, no error in the EL
+> log).** A `cel` interceptor that rejects or errors logs the reason in the
+> **shared** core-interceptors service, *not* in the EventListener pod:
+> ```
+> oc -n openshift-pipelines logs deploy/tekton-triggers-core-interceptors --since=2m -f
+> ```
+> Two non-obvious `cel` gotchas cost real debugging time here, both baked into the
+> trigger's layout now:
+> - **Overlays within a single `cel` interceptor do not chain.** They're all
+>   evaluated against the same starting `extensions` (empty), so an overlay can't
+>   read one a sibling just set — you get `failed to evaluate: no such key: …`.
+>   Extensions only become visible to the **next** interceptor, so a multi-step
+>   merge must be split into a **sequence** of `cel` interceptors (this trigger
+>   uses three: raw text → parsed maps → merged fields).
+> - **The overlay `key` is relative to the extensions root — keep it bare.** Write
+>   `key: issueRaw` (stored as `extensions.issueRaw`), **not**
+>   `key: extensions.issueRaw`, which double-nests to `extensions.extensions.issueRaw`
+>   and the next stage's `extensions.issueRaw` then can't find it. By contrast, the
+>   `expression` and the `TriggerBinding` refs *do* use the `extensions.` prefix.
 
 The `TriggerTemplate` binds a fresh `workspace` PVC per run and mounts
 `maven-settings` (ConfigMap) and `git-auth` (Secret); override

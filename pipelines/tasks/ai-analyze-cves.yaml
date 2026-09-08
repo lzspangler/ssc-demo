@@ -50,6 +50,19 @@ spec:
       type: string
       description: Image with the Anthropic Python SDK installed.
       default: quay.io/REPLACE_ME/ai-python:v1.0.0
+    - name: BATCH_SIZE
+      type: string
+      description: >-
+        CVEs analyzed per model call. Large must-fix lists are split into batches
+        so no single response blows the token budget (empty/truncated output);
+        lower this on verbose reports, raise it to cut the number of calls.
+      default: "12"
+    - name: MAX_TOKENS
+      type: string
+      description: >-
+        Combined thinking+output token budget per model call (Anthropic counts
+        both against max_tokens). Raise if a batch's output is cut off mid-JSON.
+      default: "8000"
   workspaces:
     - name: workspace
   results:
@@ -94,6 +107,10 @@ spec:
           value: $(params.MUST_FIX_PATH)
         - name: POLICY_CONTEXT
           value: $(params.POLICY_CONTEXT)
+        - name: AI_ANALYZE_BATCH_SIZE
+          value: $(params.BATCH_SIZE)
+        - name: AI_ANALYZE_MAX_TOKENS
+          value: $(params.MAX_TOKENS)
         # Result file paths, passed to Python via env to avoid source interpolation.
         - name: R_COUNT
           value: $(results.COUNT.path)
