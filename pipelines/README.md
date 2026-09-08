@@ -92,10 +92,12 @@ image build, SBOM upload, or RHTPA scan.
 | `pipelines/agentic-cve-selection.yaml` | Self-contained CVE discovery/scan/selection pipeline (build → SBOM → RHTPA scan → must-fix gate → AI select); outputs the selection decision as results |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
+| `triggers/agentic-cve-remediation-issue-trigger.yaml` | Tekton Triggers wiring to start `agentic-cve-remediation` from a GitLab issue `/remediate` comment (EventListener + interceptors + binding/template + RBAC + Route) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
 | `secrets/scm-auth-secret.example.yaml` | Example Secret — Git token for opening the PR/MR |
+| `secrets/gitlab-webhook-secret.example.yaml` | Example Secret — shared token validating the GitLab issue webhook |
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
@@ -219,6 +221,79 @@ tkn -n tssc-app-ci pipeline start agentic-cve-remediation \
 > **Result-size note:** long free-text `JUSTIFICATION` can be truncated by
 > Tekton's result-size limit (results ride the step's termination message). Keep
 > the selector's justification concise, or trim it before passing it on.
+
+## Triggering remediation from a GitLab issue
+
+Instead of the manual `tkn pipeline start` above, you can let a reviewer kick off
+`agentic-cve-remediation` by **commenting `/remediate` on a GitLab issue**. The
+wiring lives in `triggers/agentic-cve-remediation-issue-trigger.yaml`
+(EventListener + `gitlab`/`cel` interceptors + TriggerBinding/TriggerTemplate +
+RBAC + Route).
+
+**Where the decision comes from.** The six-field decision is read from the
+**issue body**, where it sits inside an HTML-comment marker so it stays invisible
+in rendered markdown (a natural place to paste the output of
+`agentic-cve-selection`):
+
+```
+<!-- cve-decision
+SELECTED: "1"
+CVE_ID: CVE-2024-12345
+PACKAGE: com.example:widget
+CURRENT_VERSION: 1.2.3
+FIXED_VERSION: 1.2.4
+JUSTIFICATION: High-severity RCE with a clean single-dependency bump.
+-->
+```
+
+**Overriding from the comment.** A commenter can override **any** of the six
+fields by putting YAML **or** JSON (no code fences) right after the command:
+
+```
+/remediate
+FIXED_VERSION: 1.2.5
+JUSTIFICATION: bump to the latest patch instead
+```
+
+```
+/remediate {"FIXED_VERSION": "1.2.5"}
+```
+
+The `cel` interceptor parses both the issue marker and the comment, then merges
+**comment > issue > default** field-by-field. Anything absent from both falls back
+to a default; `SELECTED` defaults to `"1"` because a human explicitly asked to
+remediate. If the merged `SELECTED` is `"0"`, the pipeline clones and then no-ops
+(its tail is gated on `SELECTED == "1"`). Only comments whose first characters are
+`/remediate`, on an **issue** (not an MR), and that pass the webhook token check
+start a run.
+
+**Setup:**
+
+1. Create the shared webhook token and apply the trigger resources (edit the
+   `ClusterRoleBinding` subject namespace to match yours first):
+   ```
+   oc -n tssc-app-ci create -f secrets/gitlab-webhook-secret.example.yaml   # after editing REPLACE_ME
+   oc -n tssc-app-ci apply  -f triggers/agentic-cve-remediation-issue-trigger.yaml
+   ```
+2. Get the EventListener's public URL:
+   ```
+   oc -n tssc-app-ci get route agentic-cve-remediation-issue -o jsonpath='https://{.spec.host}{"\n"}'
+   ```
+3. In the GitLab project: **Settings → Webhooks → Add** — URL = the Route above,
+   **Secret token** = the value you put in `gitlab-webhook-secret`, and enable
+   **Comment events** (Note Hook). Leave SSL verification on (the Route is
+   edge-terminated TLS).
+
+The `TriggerTemplate` binds a fresh `workspace` PVC per run and mounts
+`maven-settings` (ConfigMap) and `git-auth` (Secret); override
+`maven-settings-configmap` / `git-auth-secret` / `workspace-size` /
+`scm-secret-name` params if your names differ. `git-url`, `git-host`, and
+`base-branch` are derived from the webhook payload, so the same trigger serves any
+project pointed at it.
+
+> **Note on comment format:** put the override YAML/JSON **directly** after
+> `/remediate` — don't wrap it in ```` ``` ```` code fences (the parser reads the
+> raw text after the command). JSON works because it is valid YAML.
 
 ## Prerequisites
 
