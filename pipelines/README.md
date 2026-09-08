@@ -77,8 +77,8 @@ each.
 | Step (`taskRef`) | Runs when | Description | External systems / endpoints |
 |------------------|-----------|--------------|------------------------------|
 | `clone-repository` … `conforma-policy-check` | as above | Same eight tasks as `agentic-cve-selection` (build → SBOM → RHTPA scan → must-fix gate). | RHTAS / Image registry / RHTPA / Conforma (as above). |
-| `ai-analyze-cves` (`ai-analyze-cves`) | always | AI produces a remediation decision for **every** fixable CVE in the must-fix set (concrete fixed version required), steered by `ai-remediation-policy`. Writes the validated decisions to the workspace and **pre-renders one issue title/body file per CVE** (each body embeds the six fields in a `<!-- cve-decision -->` marker). Results: `COUNT`, `DECISIONS_PATH`, `ISSUES_DIR`. | **AI model server** — per-CVE reasoning call (`ai-python-image`). |
-| `open-cve-issues` (`open-cve-issues`) | if `COUNT != "0"` | Opens one issue per rendered file (best-effort dedupe: skips a CVE that already has an open issue). Runs on the **agent image** (bundles glab/gh). `ISSUES_CREATED` result. | **SCM / Git repo** — `glab issue create` / `gh issue create` (creds from `scm-auth-secret`). |
+| `ai-analyze-cves` (`ai-analyze-cves`) | always | AI produces a remediation decision for **every** fixable CVE in the must-fix set (concrete fixed version required), steered by `ai-remediation-policy`. Each decision also captures the CVE **severity** and the list of **available fixed versions**. Writes the validated decisions to the workspace and **pre-renders one issue title/body/labels triple per CVE** — the body embeds the six fields in a `<!-- cve-decision -->` marker and also shows severity, the **recommended version** (= `fixed_version`) and the available fixed versions; the `.labels` file carries the severity. Results: `COUNT`, `DECISIONS_PATH`, `ISSUES_DIR`. | **AI model server** — per-CVE reasoning call (`ai-python-image`). |
+| `open-cve-issues` (`open-cve-issues`) | if `COUNT != "0"` | Opens one issue per rendered file, applying the base `LABELS` plus the per-CVE **severity** label from the `.labels` sidecar (best-effort dedupe: skips a CVE that already has an open issue). Runs on the **agent image** (bundles glab/gh). `ISSUES_CREATED` result. | **SCM / Git repo** — `glab issue create` / `gh issue create` (creds from `scm-auth-secret`). |
 | `show-sbom` / `show-summary` | `finally` | Same as `agentic-cve-selection`. | Image registry / internal. |
 
 ### `agentic-cve-remediation` steps
@@ -126,8 +126,8 @@ image build, SBOM upload, or RHTPA scan.
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
-| `tasks/ai-analyze-cves.yaml` | AI decides per fixable CVE; renders one issue title/body file each |
-| `tasks/open-cve-issues.yaml` | Opens one GitLab/GitHub issue per rendered file (runs on the **agent image**) |
+| `tasks/ai-analyze-cves.yaml` | AI decides per fixable CVE (with severity + available fixed versions); renders one issue title/body/labels triple each |
+| `tasks/open-cve-issues.yaml` | Opens one GitLab/GitHub issue per rendered file, applying the base + per-CVE severity label (runs on the **agent image**) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR — tests + CVE remediation (runs on the **agent image** — see note below) |
 | `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipeline |
@@ -167,14 +167,18 @@ clone-repository → … → conforma-policy-check → ai-analyze-cves → open-
 The head (`clone-repository` through `conforma-policy-check`) is identical to
 `agentic-cve-selection`. The tail replaces the single-CVE selector with a
 fan-out: `ai-analyze-cves` produces a decision for **every** fixable CVE and
-pre-renders one issue title/body file per CVE onto the workspace (each body embeds
-the six fields in a `<!-- cve-decision -->` marker, values JSON-encoded so the
-block is valid for the `/remediate` trigger's parser). `open-cve-issues` then
-submits them, gated on `COUNT != "0"` so a clean scan opens nothing. Splitting the
-two lets the AI parsing stay in the Python image while the issue creation runs on
-the agent image (which has `glab`/`gh`); the git task does **no** JSON parsing.
-Best-effort dedupe skips a CVE that already has an open issue, so re-runs don't
-pile up duplicates.
+pre-renders one issue **title/body/labels** triple per CVE onto the workspace. The
+body embeds the six fields in a `<!-- cve-decision -->` marker (values JSON-encoded
+so the block is valid for the `/remediate` trigger's parser) and, above it, a
+human-readable summary showing the CVE **severity**, the **recommended version**
+(the model's single pick — still `fixed_version` in the marker, just relabelled for
+readers) and the list of **available fixed versions**. The `.labels` sidecar holds
+the severity so it can become an issue label. `open-cve-issues` then submits them,
+applying the base `LABELS` plus each CVE's severity label, gated on `COUNT != "0"`
+so a clean scan opens nothing. Splitting the two lets the AI parsing stay in the
+Python image while the issue creation runs on the agent image (which has
+`glab`/`gh`); the git task does **no** JSON parsing. Best-effort dedupe skips a CVE
+that already has an open issue, so re-runs don't pile up duplicates.
 
 `ai-analyze-cves` processes the must-fix set in **batches** rather than one giant
 prompt — a large list (e.g. 77 CVEs) otherwise blows the model's combined
