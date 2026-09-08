@@ -1,0 +1,593 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ai-analyze-cves
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "ai, security, remediation"
+spec:
+  description: >-
+    Ask the AI to produce a remediation decision for EVERY fixable dependency
+    vulnerability in the Conforma must-fix set (not just one), given the RHTPA
+    vulnerability-analysis report (authoritative CVE/severity/affected PURL),
+    the RHTPA remediation (recommend) report (supplemental), and a user-defined
+    policy. Writes the validated, fixable decisions to the workspace as a JSON
+    array (each decision also carries the CVE severity and the list of available
+    fixed versions) AND pre-renders one issue title/body/labels triple per CVE (so
+    the downstream issue-opening task needs no JSON parser). Each rendered body
+    carries the same six remediation fields as ai-select-cve (selected / cve_id /
+    package / current_version / fixed_version / justification) inside a
+    <!-- cve-decision --> marker, so the issue is directly consumable by the
+    /remediate trigger; the body also shows the severity, the recommended version
+    (== fixed_version), and the available fixed versions, and the .labels file
+    carries the severity for open-cve-issues to apply as a label. Backend is
+    pluggable via ai-agent-config / ai-agent-secret; runtime via AI_PYTHON_IMAGE.
+  params:
+    - name: VULNERABILITY_REPORT_PATH
+      type: string
+      description: >-
+        Absolute path (on the workspace) to the RHTPA vulnerability-analysis JSON
+        (authoritative: .findings + per-CVE details carry severity, affected
+        PURLs, and the fix version in the title/description prose).
+      default: ""
+    - name: REMEDIATION_REPORT_PATH
+      type: string
+      description: >-
+        Absolute path (on the workspace) to the RHTPA remediation (recommend)
+        JSON. Supplemental only; often empty for upstream-only Maven deps.
+      default: ""
+    - name: MUST_FIX_PATH
+      type: string
+      description: Absolute path (on the workspace) to the Conforma must-fix JSON array.
+      default: ""
+    - name: POLICY_CONTEXT
+      type: string
+      description: User-defined prioritization policy (natural language).
+      default: >-
+        Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
+        version. Avoid major-version bumps unless required to obtain the fix.
+        Never propose a CVE without a concrete fixed version. Prefer changes that
+        touch a single dependency.
+    - name: AI_PYTHON_IMAGE
+      type: string
+      description: Image with the Anthropic Python SDK installed.
+      default: quay.io/REPLACE_ME/ai-python:v1.0.0
+    - name: BATCH_SIZE
+      type: string
+      description: >-
+        CVEs analyzed per model call. Large must-fix lists are split into batches
+        so no single response blows the token budget (empty/truncated output);
+        lower this on verbose reports, raise it to cut the number of calls.
+      default: "12"
+    - name: MAX_TOKENS
+      type: string
+      description: >-
+        Combined thinking+output token budget per model call (Anthropic counts
+        both against max_tokens). Raise if a batch's output is cut off mid-JSON.
+      default: "8000"
+  workspaces:
+    - name: workspace
+  results:
+    - name: COUNT
+      description: Number of fixable vulnerabilities (== number of issue files rendered).
+    - name: DECISIONS_PATH
+      description: Absolute path (on the workspace) to the JSON array of decisions.
+    - name: ISSUES_DIR
+      description: Absolute path (on the workspace) to the directory of rendered issue files.
+  stepTemplate:
+    envFrom:
+      - configMapRef:
+          name: ai-agent-config
+      - secretRef:
+          name: ai-agent-secret
+  volumes:
+    # Optional CA bundle for self-hosted / internal AI endpoints whose cert is
+    # signed by a private CA (or a TLS-reencrypting egress proxy). Create a
+    # ConfigMap named ai-endpoint-ca with the PEM, then set AI_CA_BUNDLE in
+    # ai-agent-config to the mounted file. Optional so the pod starts without it.
+    - name: endpoint-ca
+      configMap:
+        name: ai-endpoint-ca
+        optional: true
+  steps:
+    - name: analyze
+      image: $(params.AI_PYTHON_IMAGE)
+      volumeMounts:
+        - name: endpoint-ca
+          mountPath: /etc/ai-ca
+          readOnly: true
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: WORKSPACE_PATH
+          value: $(workspaces.workspace.path)
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(params.VULNERABILITY_REPORT_PATH)
+        - name: REMEDIATION_REPORT_PATH
+          value: $(params.REMEDIATION_REPORT_PATH)
+        - name: MUST_FIX_PATH
+          value: $(params.MUST_FIX_PATH)
+        - name: POLICY_CONTEXT
+          value: $(params.POLICY_CONTEXT)
+        - name: AI_ANALYZE_BATCH_SIZE
+          value: $(params.BATCH_SIZE)
+        - name: AI_ANALYZE_MAX_TOKENS
+          value: $(params.MAX_TOKENS)
+        # Result file paths, passed to Python via env to avoid source interpolation.
+        - name: R_COUNT
+          value: $(results.COUNT.path)
+        - name: R_DECISIONS_PATH
+          value: $(results.DECISIONS_PATH.path)
+        - name: R_ISSUES_DIR
+          value: $(results.ISSUES_DIR.path)
+      script: |
+        #!/usr/bin/env python3
+        import json, os, re, sys
+
+        provider = os.environ.get("AI_PROVIDER", "anthropic")
+        model = os.environ.get("AI_MODEL", "claude-opus-5")
+        effort = os.environ.get("AI_EFFORT", "high")
+        ws = os.environ["WORKSPACE_PATH"]
+        outdir = os.path.join(ws, "analysis")
+        issuesdir = os.path.join(outdir, "issues")
+        os.makedirs(issuesdir, exist_ok=True)
+        decisions_path = os.path.join(outdir, "decisions.json")
+
+        # Char budgets so the prompt stays under the model's context window (see
+        # ai-select-cve for the reasoning). Analysis needs the whole must-fix set,
+        # so keep the same generous vuln budget.
+        VULN_CHAR_BUDGET = int(os.environ.get("AI_VULN_CHAR_BUDGET", "260000"))
+        REPORT_CHAR_BUDGET = int(os.environ.get("AI_REPORT_CHAR_BUDGET", "40000"))
+        # Combined thinking+output token budget per model call, and how many CVEs to
+        # analyze per call. Asking for all N at once is unreliable on large lists (the
+        # model can return an empty {} or truncate); small batches keep each response
+        # well within MAX_TOKENS and let a failed batch retry without losing the rest.
+        MAX_TOKENS = int(os.environ.get("AI_ANALYZE_MAX_TOKENS", "8000"))
+        BATCH_SIZE = int(os.environ.get("AI_ANALYZE_BATCH_SIZE", "12"))
+
+        def read_json(path, default):
+            try:
+                with open(path) as f:
+                    return f.read()
+            except Exception:
+                return default
+
+        def write_result(name_env, value):
+            with open(os.environ[name_env], "w") as f:
+                f.write(str(value))
+
+        vuln_path = os.environ.get("VULNERABILITY_REPORT_PATH") or f"{ws}/rhtpa/vulnerabilities.json"
+        report_path = os.environ.get("REMEDIATION_REPORT_PATH") or f"{ws}/rhtpa/remediation.json"
+        mustfix_path = os.environ.get("MUST_FIX_PATH") or f"{ws}/rhtpa/must-fix-cves.json"
+        vuln = read_json(vuln_path, "{}")
+        report = read_json(report_path, "{}")
+        mustfix = read_json(mustfix_path, "[]")
+
+        def finish(decisions):
+            with open(decisions_path, "w") as f:
+                json.dump(decisions, f, indent=2)
+            write_result("R_DECISIONS_PATH", decisions_path)
+            write_result("R_ISSUES_DIR", issuesdir)
+            write_result("R_COUNT", str(len(decisions)))
+            print("Fixable vulnerabilities: %d" % len(decisions))
+            print(json.dumps(decisions, indent=2))
+            sys.exit(0)
+
+        # If the policy gate produced nothing to fix, exit cleanly with COUNT=0.
+        try:
+            if len(json.loads(mustfix)) == 0:
+                print("No must-fix CVEs; nothing to analyze.")
+                finish([])
+        except Exception:
+            pass
+
+        # ---- Trim the analyze report to the must-fix CVEs to fit the context window ----
+        def _mustfix_ids(raw):
+            ids = set()
+            try:
+                arr = json.loads(raw)
+            except Exception:
+                arr = []
+            for item in (arr if isinstance(arr, list) else []):
+                if isinstance(item, str):
+                    ids.add(item)
+                elif isinstance(item, dict):
+                    for k in ("cve_id", "id", "cve", "identifier", "term"):
+                        v = item.get(k)
+                        if isinstance(v, str):
+                            ids.add(v)
+            return ids
+
+        def _cve_toks(ids):
+            toks = set()
+            for i in ids:
+                toks.add(i)
+                for m in re.findall(r"CVE-\d{4}-\d+", i, re.I):
+                    toks.add(m.upper())
+            return toks
+
+        def _trim_vuln(raw, ids):
+            try:
+                v = json.loads(raw)
+            except Exception:
+                return raw
+            if not isinstance(v, dict):
+                return raw
+            idset = set(ids)
+            toks = _cve_toks(ids)
+            def match(cid):
+                return isinstance(cid, str) and (cid in idset or cid.upper() in toks)
+            findings = [f for f in (v.get("findings") or [])
+                        if isinstance(f, dict) and match(f.get("cve_id"))]
+            details = [d for d in (v.get("details") or [])
+                       if isinstance(d, dict) and match(d.get("identifier") or d.get("id"))]
+            if not findings:
+                findings = [f for f in (v.get("findings") or []) if isinstance(f, dict)]
+            return json.dumps({"findings": findings, "details": details})
+
+        def _cap(s, limit):
+            if len(s) <= limit:
+                return s
+            return s[:limit] + "\n...[truncated %d chars to fit the model context]..." % (len(s) - limit)
+
+        ids = _mustfix_ids(mustfix)
+        toks = _cve_toks(ids)
+        vuln_raw = vuln          # keep the untrimmed report; each batch trims per-CVE
+        report = _cap(report, REPORT_CHAR_BUDGET)
+
+        # ---- TLS trust for self-hosted / internal endpoints (see ai-select-cve) ----
+        def _tls_verify():
+            if os.environ.get("AI_TLS_INSECURE", "").strip().lower() in ("1", "true", "yes"):
+                sys.stderr.write("WARNING: AI_TLS_INSECURE set -- TLS certificate "
+                                 "verification is DISABLED. Do not use in production.\n")
+                return False
+            ca = os.environ.get("AI_CA_BUNDLE", "").strip()
+            return ca if ca else True
+
+        def _http_client(sdk_module):
+            verify = _tls_verify()
+            if verify is True:
+                return None
+            import importlib
+            bc = importlib.import_module(sdk_module + "._base_client")
+            hx = getattr(bc, "httpx", None) or getattr(bc, "httpx2", None)
+            if hx is None:
+                for mod in ("httpx2", "httpx"):
+                    try:
+                        hx = importlib.import_module(mod)
+                        break
+                    except ImportError:
+                        continue
+            return hx.Client(verify=verify)
+
+        # ---- Build the provider-appropriate client ----
+        family = "openai" if provider == "openai" else "anthropic"
+        if family == "openai":
+            from openai import OpenAI
+            oai = OpenAI(
+                base_url=(os.environ.get("AI_BASE_URL") or None),
+                api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
+                http_client=_http_client("openai"),
+            )
+        else:
+            import anthropic
+            if provider == "bedrock":
+                from anthropic import AnthropicBedrockMantle
+                client = AnthropicBedrockMantle(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
+                if not model.startswith("anthropic."):
+                    model = "anthropic." + model
+            elif provider == "vertex":
+                from anthropic import AnthropicVertex
+                client = AnthropicVertex(
+                    project_id=os.environ["VERTEX_PROJECT_ID"],
+                    region=os.environ.get("VERTEX_REGION", "global"),
+                )
+            elif provider == "gateway":
+                client = anthropic.Anthropic(base_url=os.environ["AI_BASE_URL"],
+                                             http_client=_http_client("anthropic"))
+            else:
+                client = anthropic.Anthropic(http_client=_http_client("anthropic"))
+
+        # One decision object per must-fix CVE; selected=true only when a concrete
+        # fixed version can be determined.
+        item_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["selected", "cve_id", "package", "current_version",
+                         "fixed_version", "available_fixed_versions", "severity",
+                         "justification"],
+            "properties": {
+                "selected": {"type": "boolean"},
+                "cve_id": {"type": "string"},
+                "package": {"type": "string",
+                            "description": "Maven groupId:artifactId to update"},
+                "current_version": {"type": "string"},
+                "fixed_version": {"type": "string",
+                                  "description": "The single RECOMMENDED version to "
+                                  "upgrade to (on the same release line as current)"},
+                "available_fixed_versions": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "ALL candidate fixed versions found for this CVE "
+                    "(fixed_version_hints plus versions named in the advisory prose); "
+                    "the recommended fixed_version must be one of these"},
+                "severity": {"type": "string",
+                             "description": "CVE severity from the finding, e.g. "
+                             "critical / high / medium / low"},
+                "justification": {"type": "string"},
+            },
+        }
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["decisions"],
+            "properties": {"decisions": {"type": "array", "items": item_schema}},
+        }
+
+        system = (
+            "You are a security remediation planner. Respond with ONLY a single "
+            "JSON object {\"decisions\": [...]} that conforms to the given schema, "
+            "populated with real values derived from the input. Do NOT output the "
+            "schema itself, field types, comments, code fences, or placeholders."
+        )
+
+        def build_user(mf_json, vuln_str):
+            return (
+                "User-defined policy:\n" + os.environ["POLICY_CONTEXT"] + "\n\n"
+                "Conforma must-fix CVEs (policy gate -- analyze ALL of these):\n"
+                + mf_json + "\n\n"
+                "AUTHORITATIVE SOURCE -- RHTPA vulnerability-analysis report. Its "
+                "'.findings[]' give each CVE's severity, affected_purls (the exact "
+                "vulnerable dependency, e.g. pkg:maven/group/artifact@1.2.3 -- derive "
+                "the Maven groupId:artifactId and CURRENT_VERSION from these), and "
+                "'fixed_version_hints' (best-effort version tokens scraped from the "
+                "advisory text). '.details[]' hold the full CVE title/description. The "
+                "concrete fixed version is usually stated only in that prose (e.g. "
+                "'before versions 2.13.4.1 and 2.12.17.1', 'fixed in 2.14.0'); use the "
+                "hints as candidates and read the title/description to pick the correct "
+                "fixed version on the SAME release line as the current version:\n"
+                + vuln_str + "\n\n"
+                "SUPPLEMENTAL -- RHTPA remediation (recommend) report. Recommended "
+                "fixed packages are PURLs; this is a Red Hat-rebuild catalog lookup and "
+                "is frequently empty for upstream-only Maven deps -- treat it as a "
+                "cross-check, not the source of truth:\n" + report + "\n\n"
+                "Return one decision object for EACH must-fix CVE listed above (even if "
+                "there is only one). Determine PACKAGE and CURRENT_VERSION from its "
+                "affected_purl and the FIXED_VERSION from the analyze findings/details "
+                "as described above. Set selected=true ONLY when you can supply a "
+                "concrete fixed version; if you cannot confidently determine one for a "
+                "CVE, set selected=false for it (it will be skipped). Provide a concise "
+                "justification per CVE.\n\n"
+                "Also populate, for each CVE: 'severity' -- the finding's severity "
+                "(critical / high / medium / low); and 'available_fixed_versions' -- a "
+                "list of ALL candidate fixed versions you can find (the "
+                "fixed_version_hints plus any versions named in the title/description "
+                "prose). 'fixed_version' stays the single RECOMMENDED version to bump "
+                "to (prefer the lowest version on the SAME release line as the current "
+                "version that resolves the CVE), and it MUST be one of the entries in "
+                "available_fixed_versions.\n\n"
+                "Every field must hold a REAL value taken from the data above -- e.g. "
+                "package \"com.fasterxml.jackson.core:jackson-databind\", "
+                "current_version \"2.13.2\", fixed_version \"2.13.4.2\", "
+                "available_fixed_versions [\"2.13.4.2\", \"2.14.0\"], "
+                "severity \"high\", cve_id \"CVE-2020-36518\". Never emit a JSON "
+                "Schema, field types, comments, code fences, or placeholder words "
+                "like \"string\"."
+            )
+
+        def call_model(user):
+            if family == "openai":
+                def openai_call(response_format):
+                    return oai.chat.completions.create(
+                        model=model,
+                        max_tokens=MAX_TOKENS,
+                        response_format=response_format,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                    )
+                try:
+                    resp = openai_call({
+                        "type": "json_schema",
+                        "json_schema": {"name": "cve_analysis", "schema": schema, "strict": True},
+                    })
+                except Exception as e:
+                    print("json_schema not supported (%s); retrying with json_object" % e,
+                          file=sys.stderr)
+                    resp = openai_call({"type": "json_object"})
+                return resp.choices[0].message.content or ""
+            resp = client.messages.create(
+                model=model,
+                max_tokens=MAX_TOKENS,
+                thinking={"type": "adaptive"},
+                output_config={"effort": effort,
+                               "format": {"type": "json_schema", "schema": schema}},
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                print("WARNING: response hit max_tokens (%d) -- raise AI_ANALYZE_MAX_TOKENS "
+                      "or lower AI_ANALYZE_BATCH_SIZE." % MAX_TOKENS, file=sys.stderr)
+            return "".join(b.text for b in resp.content if b.type == "text")
+
+        # Accept {"decisions": [...]} OR a bare [...] (some backends drop the
+        # wrapper). Always returns a list (possibly empty).
+        def _extract_decisions(t):
+            if not t:
+                return []
+            t = t.strip()
+            t = re.sub(r"^\s*(assistant|analysis|final|commentary)\b[:>]*", "", t, flags=re.I)
+            t = t.replace("```json5", "").replace("```json", "").replace("```", "")
+            for opener, closer in (("{", "}"), ("[", "]")):
+                s, e = t.find(opener), t.rfind(closer)
+                if s == -1 or e == -1 or e <= s:
+                    continue
+                cand = re.sub(r"/\*.*?\*/", "", t[s:e + 1], flags=re.S)
+                try:
+                    obj = json.loads(cand)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("decisions"), list):
+                    return obj["decisions"]
+                if isinstance(obj, list):
+                    return obj
+            return []
+
+        # ---- Analyze the must-fix set in small batches ----
+        def _id_of(item):
+            if isinstance(item, str):
+                return item
+            if isinstance(item, dict):
+                for k in ("cve_id", "id", "cve", "identifier", "term"):
+                    v = item.get(k)
+                    if isinstance(v, str):
+                        return v
+            return None
+
+        try:
+            mustfix_arr = json.loads(mustfix)
+        except Exception:
+            mustfix_arr = []
+        if not isinstance(mustfix_arr, list):
+            mustfix_arr = []
+
+        def analyze_batch(items, tag):
+            batch_ids = set(filter(None, (_id_of(x) for x in items)))
+            vuln_b = _cap(_trim_vuln(vuln_raw, batch_ids), VULN_CHAR_BUDGET)
+            mf_b = json.dumps(items)
+            user_b = build_user(mf_b, vuln_b)
+            print("%s: %d CVEs, prompt chars mustfix=%d vuln=%d report=%d"
+                  % (tag, len(items), len(mf_b), len(vuln_b), len(report)), file=sys.stderr)
+            last = ""
+            for attempt in (1, 2):
+                last = call_model(user_b)
+                decs = _extract_decisions(last)
+                if decs:
+                    return decs
+                print("%s attempt %d: no decisions (raw len=%d)" % (tag, attempt, len(last)),
+                      file=sys.stderr)
+            print("%s: giving up after retries; raw:\n%s" % (tag, last[:2000]), file=sys.stderr)
+            return []
+
+        decisions_in = []
+        if mustfix_arr:
+            batches = [mustfix_arr[i:i + BATCH_SIZE]
+                       for i in range(0, len(mustfix_arr), BATCH_SIZE)]
+            print("Analyzing %d must-fix CVEs in %d batch(es) of up to %d."
+                  % (len(mustfix_arr), len(batches), BATCH_SIZE), file=sys.stderr)
+            for i, b in enumerate(batches, 1):
+                decisions_in += analyze_batch(b, "batch %d/%d" % (i, len(batches)))
+        else:
+            # Must-fix wasn't a JSON array we could split; try one whole-list call.
+            vuln_all = _cap(_trim_vuln(vuln_raw, ids), VULN_CHAR_BUDGET)
+            decisions_in = _extract_decisions(call_model(build_user(mustfix, vuln_all)))
+
+        if not decisions_in:
+            print("No decisions returned by the model for any batch.", file=sys.stderr)
+            finish([])
+
+        # Validate each decision the same way ai-select-cve validates its single
+        # pick: real package (groupId:artifactId), versions with digits, and a CVE
+        # that is actually in the must-fix set. Only fixable, valid ones become
+        # issues -- junk can never produce a bogus issue.
+        def _placeholder(v):
+            if not isinstance(v, str):
+                return True
+            s = v.strip().lower()
+            return (not s or s in ("string", "null", "none", "n/a")
+                    or "schema" in s or "/*" in s or "assistant" in s or "```" in s)
+
+        def _clean_versions(raw, recommended):
+            # Normalize available_fixed_versions to a de-duped list of real version
+            # strings, guaranteeing the recommended version is present and first.
+            out, seen_v = [], set()
+            for v in ([recommended] + (raw if isinstance(raw, list) else [])):
+                s = str(v).strip()
+                if not s or _placeholder(s) or re.search(r"\d", s) is None:
+                    continue
+                if s not in seen_v:
+                    seen_v.add(s)
+                    out.append(s)
+            return out
+
+        toks = _cve_toks(ids)
+        kept, seen = [], set()
+        for d in decisions_in:
+            if not isinstance(d, dict):
+                continue
+            pkg = str(d.get("package", "")).strip()
+            cur = str(d.get("current_version", "")).strip()
+            fix = str(d.get("fixed_version", "")).strip()
+            cve = str(d.get("cve_id", "")).strip()
+            valid = (
+                bool(d.get("selected"))
+                and ":" in pkg and not _placeholder(pkg)
+                and not _placeholder(fix) and re.search(r"\d", fix) is not None
+                and not _placeholder(cur) and re.search(r"\d", cur) is not None
+                and (not ids or cve in ids or cve.upper() in toks)
+            )
+            if not valid:
+                continue
+            if cve in seen:      # one issue per CVE
+                continue
+            seen.add(cve)
+            sev = str(d.get("severity", "")).strip().lower()
+            if _placeholder(sev):
+                sev = ""
+            kept.append({
+                "selected": True, "cve_id": cve, "package": pkg,
+                "current_version": cur, "fixed_version": fix,
+                "available_fixed_versions": _clean_versions(
+                    d.get("available_fixed_versions"), fix),
+                "severity": sev,
+                "justification": str(d.get("justification", "")).strip(),
+            })
+
+        # Render one title/body file pair per kept decision. The body embeds the six
+        # remediation fields inside a <!-- cve-decision --> marker (values JSON-encoded
+        # so the block is valid YAML/JSON for the /remediate trigger's parser), plus a
+        # human-readable summary above it. NOTE: the marker keeps FIXED_VERSION (the
+        # trigger + agentic-cve-remediation consume that key); the body just relabels
+        # it "Recommended version" for human readers. A per-CVE .labels file carries
+        # the severity so open-cve-issues can apply it as a label (that task does no
+        # JSON parsing).
+        for d in kept:
+            cve = d["cve_id"]
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", cve) or "cve"
+            avail = d["available_fixed_versions"]
+            avail_str = ", ".join("`%s`" % v for v in avail) if avail else "—"
+            title = "Remediate %s: %s %s -> %s" % (
+                cve, d["package"], d["current_version"], d["fixed_version"])
+            marker = "\n".join(
+                "%s: %s" % (k, json.dumps(v)) for k, v in (
+                    ("SELECTED", "1"),
+                    ("CVE_ID", cve),
+                    ("PACKAGE", d["package"]),
+                    ("CURRENT_VERSION", d["current_version"]),
+                    ("FIXED_VERSION", d["fixed_version"]),
+                    ("JUSTIFICATION", d["justification"]),
+                )
+            )
+            body = (
+                "## Vulnerability remediation: %s\n\n" % cve
+                + (d["justification"] + "\n\n" if d["justification"] else "")
+                + "| Field | Value |\n|---|---|\n"
+                + ("| Severity | `%s` |\n" % d["severity"] if d["severity"] else "")
+                + "| Package | `%s` |\n" % d["package"]
+                + "| Current version | `%s` |\n" % d["current_version"]
+                + "| Recommended version | `%s` |\n" % d["fixed_version"]
+                + "| Available fixed versions | %s |\n\n" % avail_str
+                + "To remediate automatically, comment `/remediate` on this issue.\n\n"
+                + "<!-- cve-decision\n" + marker + "\n-->\n"
+            )
+            with open(os.path.join(issuesdir, safe + ".title"), "w") as f:
+                f.write(title)
+            with open(os.path.join(issuesdir, safe + ".body"), "w") as f:
+                f.write(body)
+            # Severity label for open-cve-issues (empty file if severity unknown).
+            with open(os.path.join(issuesdir, safe + ".labels"), "w") as f:
+                f.write(d["severity"])
+
+        finish(kept)
