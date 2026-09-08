@@ -1,39 +1,49 @@
 # AI vulnerability remediation
 
-This repo splits the agentic security flow into **three focused pipelines** that
+This repo splits the agentic security flow into **four focused pipelines** that
 share the same tasks and images. Each has a single, distinct responsibility and
 can be run on its own:
 
-1. **`agentic-cve-selection`** — *decide what to fix.* Builds the image, uploads
-   the SBOM to RHTPA, scans it, applies the policy **must-fix** gate, and asks the
-   AI to select **exactly one** CVE. Ends at `ai-select-cve` and exposes that
-   decision as pipeline results.
-2. **`agentic-cve-remediation`** — *apply a fix.* Takes a CVE-selection decision
-   **as params**, has the AI bump the vulnerable Maven dependency to its fixed
+1. **`agentic-cve-selection`** — *decide what to fix (one).* Builds the image,
+   uploads the SBOM to RHTPA, scans it, applies the policy **must-fix** gate, and
+   asks the AI to select **exactly one** CVE. Ends at `ai-select-cve` and exposes
+   that decision as pipeline results.
+2. **`agentic-cve-analysis`** — *decide what to fix (all) → issues.* Same
+   build → scan → must-fix chain, but asks the AI for a decision **per fixable
+   CVE** and opens **one GitLab/GitHub issue per vulnerability**. Each issue
+   carries the same six fields so commenting `/remediate` on it starts pipeline 3.
+3. **`agentic-cve-remediation`** — *apply a fix.* Takes a CVE decision **as
+   params**, has the AI bump the vulnerable Maven dependency to its fixed
    version, re-runs `mvn verify`, and opens a **PR/MR**. Does no discovery or
    scanning of its own.
-3. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
+4. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
    **test-generation** flow (clone → build → generate tests → `mvn verify` →
    tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
 
-`agentic-cve-selection` and `agentic-cve-remediation` are two halves of one
-workflow: selection produces a six-field decision
-(`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`)
-and remediation consumes it. The hand-off is by **params + manual start** — see
-[Hand-off: selection → remediation](#hand-off-selection--remediation). See the
-[Overview](#overview) for per-step detail.
+The CVE pipelines share one six-field decision contract
+(`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`):
+`agentic-cve-selection` emits it as results (hand off by **params + manual
+start** — see [Hand-off](#hand-off-selection--remediation)), while
+`agentic-cve-analysis` embeds it in each issue so the
+[`/remediate` trigger](#triggering-remediation-from-a-gitlab-issue) can feed it to
+`agentic-cve-remediation` automatically. See the [Overview](#overview) for
+per-step detail.
 
 ## Overview
 
-This repo defines **three** pipelines that share the same tasks and images:
+This repo defines **four** pipelines that share the same tasks and images:
 
 - **`pipelines/agentic-cve-selection.yaml`** — self-contained CVE discovery,
   prioritization, and selection (build → SBOM → RHTPA scan → must-fix gate → AI
   select). Outputs the selection decision as pipeline results; changes nothing in
   the repo.
-- **`pipelines/agentic-cve-remediation.yaml`** — applies a selection decision
-  (passed in as params) to the git project: clone → AI bump the dependency →
-  `mvn verify` → PR/MR. The remediation tail runs only when `SELECTED="1"`.
+- **`pipelines/agentic-cve-analysis.yaml`** — same build → scan → must-fix chain,
+  but fans out: the AI produces a decision **per fixable CVE** and the pipeline
+  opens **one issue per vulnerability** (each issue carries the six-field
+  decision). Changes nothing in the repo beyond creating issues.
+- **`pipelines/agentic-cve-remediation.yaml`** — applies a decision (passed in as
+  params) to the git project: clone → AI bump the dependency → `mvn verify` →
+  PR/MR. The remediation tail runs only when `SELECTED="1"`.
 - **`pipelines/agentic-test-generation.yaml`** — a standalone AI
   **test-generation** flow (clone → build → generate tests → `mvn verify` →
   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
@@ -56,6 +66,20 @@ tasks) with description and the **external systems** it talks to.
 | `ai-select-cve` (`ai-select-cve`) | always | AI selects **exactly one** CVE from the must-fix set, steered by `ai-remediation-policy`; emits structured results (`SELECTED`, `CVE_ID`, `PACKAGE`, `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`) that become this pipeline's results. | **AI model server** — CVE-selection reasoning call (`ai-python-image`). |
 | `show-sbom` (`show-sbom-rhdh`) | `finally` | Displays the SBOM for the built image in the PipelineRun output. | **Image registry** — reads the image/SBOM referenced by `IMAGE_URL`. |
 | `show-summary` (`summary`) | `finally` | Prints a PipelineRun summary (git URL/commit, image URL, build-task status). | — (internal) |
+
+### `agentic-cve-analysis` steps
+
+Identical to `agentic-cve-selection` from `clone-repository` through
+`conforma-policy-check` (and the same `finally` tasks). The tail differs: instead
+of selecting one CVE, it analyzes **all** fixable ones and opens an issue for
+each.
+
+| Step (`taskRef`) | Runs when | Description | External systems / endpoints |
+|------------------|-----------|--------------|------------------------------|
+| `clone-repository` … `conforma-policy-check` | as above | Same eight tasks as `agentic-cve-selection` (build → SBOM → RHTPA scan → must-fix gate). | RHTAS / Image registry / RHTPA / Conforma (as above). |
+| `ai-analyze-cves` (`ai-analyze-cves`) | always | AI produces a remediation decision for **every** fixable CVE in the must-fix set (concrete fixed version required), steered by `ai-remediation-policy`. Writes the validated decisions to the workspace and **pre-renders one issue title/body file per CVE** (each body embeds the six fields in a `<!-- cve-decision -->` marker). Results: `COUNT`, `DECISIONS_PATH`, `ISSUES_DIR`. | **AI model server** — per-CVE reasoning call (`ai-python-image`). |
+| `open-cve-issues` (`open-cve-issues`) | if `COUNT != "0"` | Opens one issue per rendered file (best-effort dedupe: skips a CVE that already has an open issue). Runs on the **agent image** (bundles glab/gh). `ISSUES_CREATED` result. | **SCM / Git repo** — `glab issue create` / `gh issue create` (creds from `scm-auth-secret`). |
+| `show-sbom` / `show-summary` | `finally` | Same as `agentic-cve-selection`. | Image registry / internal. |
 
 ### `agentic-cve-remediation` steps
 
@@ -90,6 +114,7 @@ image build, SBOM upload, or RHTPA scan.
 | File | Purpose |
 |------|---------|
 | `pipelines/agentic-cve-selection.yaml` | Self-contained CVE discovery/scan/selection pipeline (build → SBOM → RHTPA scan → must-fix gate → AI select); outputs the selection decision as results |
+| `pipelines/agentic-cve-analysis.yaml` | Same scan chain, but analyzes every fixable CVE and opens one issue per vulnerability (each carries the six-field decision) |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
 | `triggers/agentic-cve-remediation-issue-trigger.yaml` | Tekton Triggers wiring to start `agentic-cve-remediation` from a GitLab issue `/remediate` comment (EventListener + interceptors + binding/template + RBAC + Route) |
@@ -101,12 +126,14 @@ image build, SBOM upload, or RHTPA scan.
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
+| `tasks/ai-analyze-cves.yaml` | AI decides per fixable CVE; renders one issue title/body file each |
+| `tasks/open-cve-issues.yaml` | Opens one GitLab/GitHub issue per rendered file (runs on the **agent image**) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR — tests + CVE remediation (runs on the **agent image** — see note below) |
 | `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipeline |
 | `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
 | `images/ai-agent-maven-aider/Dockerfile` | Agent runtime, **aider** flavor (ubi-minimal + JDK17 + Maven + Python/aider + git/glab/gh) |
-| `images/ai-python/Dockerfile` | CVE-selector runtime (Anthropic + OpenAI Python SDKs) |
+| `images/ai-python/Dockerfile` | CVE selection/analysis runtime (Anthropic + OpenAI Python SDKs) |
 
 ## DAG
 
@@ -129,6 +156,25 @@ about. The pipeline **changes nothing in the repo**; its whole output is the
 selection decision, exposed as results
 (`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`,
 plus `IMAGE_URL`/`IMAGE_DIGEST`/`CHAINS-GIT_*`). `verify-commit` is optional.
+
+### `agentic-cve-analysis`
+
+```
+clone-repository → … → conforma-policy-check → ai-analyze-cves → open-cve-issues
+                                                                 (only if COUNT != "0")
+```
+
+The head (`clone-repository` through `conforma-policy-check`) is identical to
+`agentic-cve-selection`. The tail replaces the single-CVE selector with a
+fan-out: `ai-analyze-cves` produces a decision for **every** fixable CVE and
+pre-renders one issue title/body file per CVE onto the workspace (each body embeds
+the six fields in a `<!-- cve-decision -->` marker, values JSON-encoded so the
+block is valid for the `/remediate` trigger's parser). `open-cve-issues` then
+submits them, gated on `COUNT != "0"` so a clean scan opens nothing. Splitting the
+two lets the AI parsing stay in the Python image while the issue creation runs on
+the agent image (which has `glab`/`gh`); the git task does **no** JSON parsing.
+Best-effort dedupe skips a CVE that already has an open issue, so re-runs don't
+pile up duplicates.
 
 ### `agentic-cve-remediation`
 
@@ -246,6 +292,13 @@ JUSTIFICATION: High-severity RCE with a clean single-dependency bump.
 -->
 ```
 
+Issues opened by `agentic-cve-analysis` already embed this marker, so the whole
+comment body is just the command on its own line:
+
+```
+/remediate
+```
+
 **Overriding from the comment.** A commenter can override **any** of the six
 fields by putting YAML **or** JSON (no code fences) right after the command:
 
@@ -267,22 +320,66 @@ remediate. If the merged `SELECTED` is `"0"`, the pipeline clones and then no-op
 `/remediate`, on an **issue** (not an MR), and that pass the webhook token check
 start a run.
 
-**Setup:**
+### Cluster setup for the `/remediate` trigger
 
-1. Create the shared webhook token and apply the trigger resources (edit the
-   `ClusterRoleBinding` subject namespace to match yours first):
-   ```
-   oc -n tssc-app-ci create -f secrets/gitlab-webhook-secret.example.yaml   # after editing REPLACE_ME
-   oc -n tssc-app-ci apply  -f triggers/agentic-cve-remediation-issue-trigger.yaml
-   ```
-2. Get the EventListener's public URL:
-   ```
-   oc -n tssc-app-ci get route agentic-cve-remediation-issue -o jsonpath='https://{.spec.host}{"\n"}'
-   ```
-3. In the GitLab project: **Settings → Webhooks → Add** — URL = the Route above,
-   **Secret token** = the value you put in `gitlab-webhook-secret`, and enable
-   **Comment events** (Note Hook). Leave SSL verification on (the Route is
-   edge-terminated TLS).
+Everything the cluster needs, in order. Steps 1–2 are usually already true from
+the [One-time setup](#one-time-setup); steps 3–5 are trigger-specific.
+
+**1. Operators / interceptors (cluster-level).** The Red Hat OpenShift Pipelines
+operator must be installed **with** the Tekton Triggers stack, which provides the
+`gitlab` and `cel` **ClusterInterceptors** the EventListener calls:
+```
+oc get clusterinterceptors      # expect at least: cel, gitlab
+```
+
+**2. The pipeline + its tasks must already be applied.** The trigger only creates
+a PipelineRun that references `agentic-cve-remediation`; that Pipeline and every
+Task it uses must exist in the namespace (your normal `oc apply` of `pipelines/`
+and `tasks/`).
+
+**3. Secrets & configs the run mounts** (in the pipeline namespace — the
+`TriggerTemplate` wires these in, so the names must match or you override the
+`tt.params` defaults):
+
+| Name | Purpose |
+|---|---|
+| `gitlab-webhook-secret` (key `secretToken`) | Shared token the `gitlab` interceptor checks against GitLab's `X-Gitlab-Token`. |
+| `git-auth` (Secret) | Clone/push credentials for the app repo (remediation pushes a branch). |
+| `scm-auth-secret` (Secret) | SCM token to open the MR (`api` scope on GitLab). |
+| `maven-settings` (ConfigMap) | Maven settings for the verify build. |
+| `ai-agent-config` + `ai-agent-secret` | AI backend config (as for the other pipelines). |
+
+**4. Apply the trigger stack** (one file — ServiceAccount, RBAC, TriggerBinding,
+TriggerTemplate, EventListener, Route). ⚠️ First edit the `ClusterRoleBinding`
+subject namespace to match yours, and apply into that **same** namespace:
+```
+oc -n tssc-app-ci create secret generic gitlab-webhook-secret \
+  --from-literal=secretToken=$(openssl rand -hex 20)          # or: create -f secrets/gitlab-webhook-secret.example.yaml after editing REPLACE_ME
+oc -n tssc-app-ci apply -f triggers/agentic-cve-remediation-issue-trigger.yaml
+```
+
+**5. Expose + register the webhook in GitLab.** Get the listener URL:
+```
+oc -n tssc-app-ci get route agentic-cve-remediation-issue -o jsonpath='https://{.spec.host}{"\n"}'
+```
+Then in the GitLab project **Settings → Webhooks → Add**: URL = the Route above,
+**Secret token** = the value in `gitlab-webhook-secret`, and enable **Comment
+events** (Note Hook). Leave SSL verification on (the Route is edge-terminated TLS).
+
+**Verify before commenting:**
+```
+oc -n tssc-app-ci get eventlistener agentic-cve-remediation-issue          # ADDRESS populated
+oc -n tssc-app-ci get pods -l eventlistener=agentic-cve-remediation-issue  # el-... pod Running
+```
+Use GitLab's webhook **Test → Comment events**, then watch the interceptor and the run:
+```
+oc -n tssc-app-ci logs deploy/el-agentic-cve-remediation-issue -f   # accept/reject + reason
+oc -n tssc-app-ci get pipelineruns -l trigger=gitlab-issue -w        # a PipelineRun appears
+```
+Common failures: `interceptor ... not found` → the `ClusterRoleBinding` subject
+namespace is wrong (step 4 caveat); a 401 / token mismatch → the GitLab **Secret
+token** ≠ `gitlab-webhook-secret`; no run and no reject logged → the comment
+didn't start with `/remediate`, or it was on an MR rather than an issue.
 
 The `TriggerTemplate` binds a fresh `workspace` PVC per run and mounts
 `maven-settings` (ConfigMap) and `git-auth` (Secret); override
@@ -323,7 +420,7 @@ your own.
 | `tpa-secret` | Secret | `agentic-cve-selection` only | `bombastic_api_url`, `oidc_issuer_url`, `oidc_client_id`, `oidc_client_secret`. Consumed by the RHTPA tasks **and** the importer Job. (Name overridable via `trustification-secret-name`.) |
 | `ai-agent-config` | ConfigMap | all pipelines | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
 | `ai-agent-secret` | Secret | all pipelines | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
-| `scm-auth-secret` | Secret | remediation + test-gen (PR step) | `username` + `token` with push + PR/MR-create scope (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
+| `scm-auth-secret` | Secret | analysis (issues) + remediation + test-gen (PR step) | `username` + `token` with push + PR/MR-create scope, and issue-create for analysis (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
 
 #### SCM token scopes (`scm-auth-secret`)
 
@@ -352,8 +449,10 @@ whole instance.)
   HTTPS push, and `glab` authenticates via the token regardless of username.
 
 **GitHub** — a fine-grained token with **Contents: read & write** (push the
-branch) and **Pull requests: read & write** (open the PR), scoped to the target
-repo. A classic token needs the `repo` scope.
+branch), **Pull requests: read & write** (open the PR), and — for
+`agentic-cve-analysis` — **Issues: read & write** (open issues), scoped to the
+target repo. A classic token needs the `repo` scope. (On GitLab the `api` scope
+already covers issue creation, so no extra scope is needed there.)
 
 ### Workspaces / PVCs
 
@@ -505,6 +604,7 @@ catalog is populated.
    ```
    oc -n tssc-app-ci apply -f tasks/
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-selection.yaml
+   oc -n tssc-app-ci apply -f pipelines/agentic-cve-analysis.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-remediation.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-test-generation.yaml
    ```
