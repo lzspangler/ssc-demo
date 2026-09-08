@@ -14,12 +14,16 @@ spec:
     vulnerability-analysis report (authoritative CVE/severity/affected PURL),
     the RHTPA remediation (recommend) report (supplemental), and a user-defined
     policy. Writes the validated, fixable decisions to the workspace as a JSON
-    array AND pre-renders one issue title/body file per CVE (so the downstream
-    issue-opening task needs no JSON parser). Each rendered body carries the same
-    six fields as ai-select-cve (selected / cve_id / package / current_version /
-    fixed_version / justification) inside a <!-- cve-decision --> marker, so the
-    issue is directly consumable by the /remediate trigger. Backend is pluggable
-    via ai-agent-config / ai-agent-secret; runtime via AI_PYTHON_IMAGE.
+    array (each decision also carries the CVE severity and the list of available
+    fixed versions) AND pre-renders one issue title/body/labels triple per CVE (so
+    the downstream issue-opening task needs no JSON parser). Each rendered body
+    carries the same six remediation fields as ai-select-cve (selected / cve_id /
+    package / current_version / fixed_version / justification) inside a
+    <!-- cve-decision --> marker, so the issue is directly consumable by the
+    /remediate trigger; the body also shows the severity, the recommended version
+    (== fixed_version), and the available fixed versions, and the .labels file
+    carries the severity for open-cve-issues to apply as a label. Backend is
+    pluggable via ai-agent-config / ai-agent-secret; runtime via AI_PYTHON_IMAGE.
   params:
     - name: VULNERABILITY_REPORT_PATH
       type: string
@@ -292,14 +296,25 @@ spec:
             "type": "object",
             "additionalProperties": False,
             "required": ["selected", "cve_id", "package", "current_version",
-                         "fixed_version", "justification"],
+                         "fixed_version", "available_fixed_versions", "severity",
+                         "justification"],
             "properties": {
                 "selected": {"type": "boolean"},
                 "cve_id": {"type": "string"},
                 "package": {"type": "string",
                             "description": "Maven groupId:artifactId to update"},
                 "current_version": {"type": "string"},
-                "fixed_version": {"type": "string"},
+                "fixed_version": {"type": "string",
+                                  "description": "The single RECOMMENDED version to "
+                                  "upgrade to (on the same release line as current)"},
+                "available_fixed_versions": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "ALL candidate fixed versions found for this CVE "
+                    "(fixed_version_hints plus versions named in the advisory prose); "
+                    "the recommended fixed_version must be one of these"},
+                "severity": {"type": "string",
+                             "description": "CVE severity from the finding, e.g. "
+                             "critical / high / medium / low"},
                 "justification": {"type": "string"},
             },
         }
@@ -344,11 +359,21 @@ spec:
                 "concrete fixed version; if you cannot confidently determine one for a "
                 "CVE, set selected=false for it (it will be skipped). Provide a concise "
                 "justification per CVE.\n\n"
+                "Also populate, for each CVE: 'severity' -- the finding's severity "
+                "(critical / high / medium / low); and 'available_fixed_versions' -- a "
+                "list of ALL candidate fixed versions you can find (the "
+                "fixed_version_hints plus any versions named in the title/description "
+                "prose). 'fixed_version' stays the single RECOMMENDED version to bump "
+                "to (prefer the lowest version on the SAME release line as the current "
+                "version that resolves the CVE), and it MUST be one of the entries in "
+                "available_fixed_versions.\n\n"
                 "Every field must hold a REAL value taken from the data above -- e.g. "
                 "package \"com.fasterxml.jackson.core:jackson-databind\", "
                 "current_version \"2.13.2\", fixed_version \"2.13.4.2\", "
-                "cve_id \"CVE-2020-36518\". Never emit a JSON Schema, field types, "
-                "comments, code fences, or placeholder words like \"string\"."
+                "available_fixed_versions [\"2.13.4.2\", \"2.14.0\"], "
+                "severity \"high\", cve_id \"CVE-2020-36518\". Never emit a JSON "
+                "Schema, field types, comments, code fences, or placeholder words "
+                "like \"string\"."
             )
 
         def call_model(user):
@@ -474,6 +499,19 @@ spec:
             return (not s or s in ("string", "null", "none", "n/a")
                     or "schema" in s or "/*" in s or "assistant" in s or "```" in s)
 
+        def _clean_versions(raw, recommended):
+            # Normalize available_fixed_versions to a de-duped list of real version
+            # strings, guaranteeing the recommended version is present and first.
+            out, seen_v = [], set()
+            for v in ([recommended] + (raw if isinstance(raw, list) else [])):
+                s = str(v).strip()
+                if not s or _placeholder(s) or re.search(r"\d", s) is None:
+                    continue
+                if s not in seen_v:
+                    seen_v.add(s)
+                    out.append(s)
+            return out
+
         toks = _cve_toks(ids)
         kept, seen = [], set()
         for d in decisions_in:
@@ -495,19 +533,31 @@ spec:
             if cve in seen:      # one issue per CVE
                 continue
             seen.add(cve)
+            sev = str(d.get("severity", "")).strip().lower()
+            if _placeholder(sev):
+                sev = ""
             kept.append({
                 "selected": True, "cve_id": cve, "package": pkg,
                 "current_version": cur, "fixed_version": fix,
+                "available_fixed_versions": _clean_versions(
+                    d.get("available_fixed_versions"), fix),
+                "severity": sev,
                 "justification": str(d.get("justification", "")).strip(),
             })
 
-        # Render one title/body file pair per kept decision. The body embeds all
-        # six fields inside a <!-- cve-decision --> marker (values JSON-encoded so
-        # the block is valid YAML/JSON for the /remediate trigger's parser), plus a
-        # human-readable summary above it.
+        # Render one title/body file pair per kept decision. The body embeds the six
+        # remediation fields inside a <!-- cve-decision --> marker (values JSON-encoded
+        # so the block is valid YAML/JSON for the /remediate trigger's parser), plus a
+        # human-readable summary above it. NOTE: the marker keeps FIXED_VERSION (the
+        # trigger + agentic-cve-remediation consume that key); the body just relabels
+        # it "Recommended version" for human readers. A per-CVE .labels file carries
+        # the severity so open-cve-issues can apply it as a label (that task does no
+        # JSON parsing).
         for d in kept:
             cve = d["cve_id"]
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", cve) or "cve"
+            avail = d["available_fixed_versions"]
+            avail_str = ", ".join("`%s`" % v for v in avail) if avail else "—"
             title = "Remediate %s: %s %s -> %s" % (
                 cve, d["package"], d["current_version"], d["fixed_version"])
             marker = "\n".join(
@@ -524,9 +574,11 @@ spec:
                 "## Vulnerability remediation: %s\n\n" % cve
                 + (d["justification"] + "\n\n" if d["justification"] else "")
                 + "| Field | Value |\n|---|---|\n"
+                + ("| Severity | `%s` |\n" % d["severity"] if d["severity"] else "")
                 + "| Package | `%s` |\n" % d["package"]
                 + "| Current version | `%s` |\n" % d["current_version"]
-                + "| Fixed version | `%s` |\n\n" % d["fixed_version"]
+                + "| Recommended version | `%s` |\n" % d["fixed_version"]
+                + "| Available fixed versions | %s |\n\n" % avail_str
                 + "To remediate automatically, comment `/remediate` on this issue.\n\n"
                 + "<!-- cve-decision\n" + marker + "\n-->\n"
             )
@@ -534,5 +586,8 @@ spec:
                 f.write(title)
             with open(os.path.join(issuesdir, safe + ".body"), "w") as f:
                 f.write(body)
+            # Severity label for open-cve-issues (empty file if severity unknown).
+            with open(os.path.join(issuesdir, safe + ".labels"), "w") as f:
+                f.write(d["severity"])
 
         finish(kept)
