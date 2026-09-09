@@ -1,12 +1,19 @@
 # =============================================================================
-# Trigger: run agentic-cve-remediation from a GitLab issue comment.
+# Issue-comment triggers: start a pipeline by commenting a slash-command on a
+# GitLab issue. One EventListener (one webhook / Route) hosts BOTH commands; each
+# trigger's cel `filter` picks the command it handles, so a comment only starts the
+# matching pipeline:
+#
+#   /remediate       ->  agentic-cve-remediation   (reads a decision from the issue)
+#   /generate-tests  ->  agentic-test-generation   (no decision needed)
 #
 # Flow:  GitLab issue comment  ->  webhook (Note Hook)  ->  EventListener
 #        ->  gitlab interceptor (validate X-Gitlab-Token, event type)
-#        ->  cel interceptor (filter on "/remediate" + merge the decision)
+#        ->  cel interceptor (filter on the command [+ merge the decision])
 #        ->  TriggerBinding (extensions/body -> params)
-#        ->  TriggerTemplate (create a PipelineRun of agentic-cve-remediation)
+#        ->  TriggerTemplate (create the PipelineRun)
 #
+# ---- /remediate --------------------------------------------------------------
 # The six-field decision (SELECTED / CVE_ID / PACKAGE / CURRENT_VERSION /
 # FIXED_VERSION / JUSTIFICATION) is read from the ISSUE BODY, where it must sit
 # inside an HTML-comment marker so it stays invisible in rendered markdown:
@@ -136,8 +143,6 @@ spec:
     # Workspace backing — override to match your cluster's storage/config.
     - name: workspace-size
       default: 2Gi
-    - name: maven-settings-configmap
-      default: maven-settings
     - name: scm-secret-name
       default: scm-auth-secret
   resourcetemplates:
@@ -186,9 +191,17 @@ spec:
                 resources:
                   requests:
                     storage: $(tt.params.workspace-size)
+          # maven-settings is OPTIONAL on the maven task: its generate step writes a
+          # default settings.xml when none is supplied, so an emptyDir is enough. Do
+          # NOT back this with a configMap unless that configMap actually exists --
+          # a configMap-backed workspace whose configMap is missing leaves the
+          # package pod stuck in PodInitializing forever (never errors, just hangs),
+          # the same trap as a missing git-auth secret. For a private Maven mirror,
+          # create the configMap first, then swap this for:
+          #   configMap:
+          #     name: maven-settings
           - name: maven-settings
-            configMap:
-              name: $(tt.params.maven-settings-configmap)
+            emptyDir: {}
           # NOTE: git-auth (clone credentials) is intentionally NOT bound here.
           # It is optional on the pipeline, and a secret-backed workspace whose
           # secret is missing leaves the clone pod stuck in PodInitializing
@@ -200,10 +213,94 @@ spec:
           #     secret:
           #       secretName: git-auth
 ---
+# ---- /generate-tests ---------------------------------------------------------
+# The test-generation command carries no decision -- it only needs the repo
+# coordinates (git-url from the payload, git-host + base-branch derived in cel),
+# so its binding/template are much simpler than the remediation pair above.
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: test-generation-issue-binding
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  params:
+    - name: git-url
+      value: $(body.project.git_http_url)
+    - name: git-host
+      value: $(extensions.git_host)
+    - name: base-branch
+      value: $(extensions.base_branch)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: test-generation-issue-template
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  params:
+    - name: git-url
+    - name: git-host
+    - name: base-branch
+      default: main
+    - name: scm-provider
+      default: gitlab
+    - name: subdirectory
+      default: source
+    # Workspace backing -- override to match your cluster's storage/config.
+    - name: workspace-size
+      default: 2Gi
+    - name: scm-secret-name
+      default: scm-auth-secret
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: agentic-test-generation-issue-
+        labels:
+          app.kubernetes.io/part-of: maven-build-ci
+          tekton.dev/pipeline: agentic-test-generation
+          trigger: gitlab-issue
+      spec:
+        pipelineRef:
+          name: agentic-test-generation
+        params:
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-host
+            value: $(tt.params.git-host)
+          - name: base-branch
+            value: $(tt.params.base-branch)
+          - name: scm-provider
+            value: $(tt.params.scm-provider)
+          - name: subdirectory
+            value: $(tt.params.subdirectory)
+          - name: scm-secret-name
+            value: $(tt.params.scm-secret-name)
+        workspaces:
+          - name: workspace
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: $(tt.params.workspace-size)
+          # maven-settings backed by an emptyDir (optional workspace; maven generates
+          # a default settings.xml). See the remediation template above for why this
+          # is NOT a configMap. For a private Maven mirror, create a `maven-settings`
+          # configMap and swap this for `configMap: {name: maven-settings}`.
+          - name: maven-settings
+            emptyDir: {}
+          # git-auth intentionally NOT bound -- same reasoning as the remediation
+          # template above (optional workspace; a missing secret hangs the clone
+          # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
+---
 apiVersion: triggers.tekton.dev/v1beta1
 kind: EventListener
 metadata:
-  name: agentic-cve-remediation-issue
+  name: agentic-issue-commands
   labels:
     app.kubernetes.io/part-of: maven-build-ci
 spec:
@@ -306,19 +403,57 @@ spec:
         - ref: cve-remediation-issue-binding
       template:
         ref: cve-remediation-issue-template
+    - name: gitlab-issue-generate-tests
+      interceptors:
+        # 1) Validate the shared secret token and that this is a comment event.
+        - ref:
+            name: gitlab
+          params:
+            - name: secretRef
+              value:
+                secretName: gitlab-webhook-secret
+                secretKey: secretToken
+            - name: eventTypes
+              value:
+                - "Note Hook"
+        # 2) Only act on issue comments beginning with /generate-tests, and derive
+        #    the SCM coordinates. Both overlays read only `body`, so ONE cel
+        #    interceptor suffices -- unlike /remediate, nothing here depends on an
+        #    extension set by a sibling overlay (see the chaining gotcha above).
+        #    Overlay keys are BARE (key: git_host), not extensions.-prefixed.
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: >-
+                body.object_attributes.noteable_type == 'Issue' &&
+                body.object_attributes.system == false &&
+                body.object_attributes.note.startsWith('/generate-tests')
+            - name: overlays
+              value:
+                - key: git_host
+                  expression: >-
+                    body.project.git_http_url.parseURL().host
+                - key: base_branch
+                  expression: >-
+                    (has(body.project.default_branch) && body.project.default_branch != null) ? body.project.default_branch : "main"
+      bindings:
+        - ref: test-generation-issue-binding
+      template:
+        ref: test-generation-issue-template
 ---
 # Expose the EventListener so GitLab can reach it. Point the GitLab webhook URL at
 # this Route's https:// host. (OpenShift-specific; drop if you expose it another way.)
 apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
-  name: agentic-cve-remediation-issue
+  name: agentic-issue-commands
   labels:
     app.kubernetes.io/part-of: maven-build-ci
 spec:
   to:
     kind: Service
-    name: el-agentic-cve-remediation-issue
+    name: el-agentic-issue-commands
   port:
     targetPort: http-listener
   tls:

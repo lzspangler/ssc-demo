@@ -25,7 +25,7 @@ The CVE pipelines share one six-field decision contract
 `agentic-cve-selection` emits it as results (hand off by **params + manual
 start** — see [Hand-off](#hand-off-selection--remediation)), while
 `agentic-cve-analysis` embeds it in each issue so the
-[`/remediate` trigger](#triggering-remediation-from-a-gitlab-issue) can feed it to
+[`/remediate` trigger](#triggering-pipelines-from-a-gitlab-issue-comment) can feed it to
 `agentic-cve-remediation` automatically. See the [Overview](#overview) for
 per-step detail.
 
@@ -117,7 +117,7 @@ image build, SBOM upload, or RHTPA scan.
 | `pipelines/agentic-cve-analysis.yaml` | Same scan chain, but analyzes every fixable CVE and opens one issue per vulnerability (each carries the six-field decision) |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
-| `triggers/agentic-cve-remediation-issue-trigger.yaml` | Tekton Triggers wiring to start `agentic-cve-remediation` from a GitLab issue `/remediate` comment (EventListener + interceptors + binding/template + RBAC + Route) |
+| `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation` (one EventListener + interceptors + a binding/template pair per command + RBAC + Route) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
@@ -285,13 +285,25 @@ tkn -n tssc-app-ci pipeline start agentic-cve-remediation \
 > Tekton's result-size limit (results ride the step's termination message). Keep
 > the selector's justification concise, or trim it before passing it on.
 
-## Triggering remediation from a GitLab issue
+## Triggering pipelines from a GitLab issue comment
 
 Instead of the manual `tkn pipeline start` above, you can let a reviewer kick off
-`agentic-cve-remediation` by **commenting `/remediate` on a GitLab issue**. The
-wiring lives in `triggers/agentic-cve-remediation-issue-trigger.yaml`
-(EventListener + `gitlab`/`cel` interceptors + TriggerBinding/TriggerTemplate +
-RBAC + Route).
+a pipeline by **commenting a slash-command on a GitLab issue**:
+
+| Comment | Starts | Needs a decision? |
+|---|---|---|
+| `/remediate` | `agentic-cve-remediation` | yes — reads the six-field decision from the issue |
+| `/generate-tests` | `agentic-test-generation` | no — only the repo coordinates |
+
+Both commands share a **single** EventListener, webhook, and Route — the wiring
+lives in `triggers/agentic-issue-triggers.yaml` (EventListener with
+two triggers + `gitlab`/`cel` interceptors + a TriggerBinding/TriggerTemplate pair
+per command + RBAC + Route). Each trigger's `cel` `filter` matches exactly one
+command, so a comment only starts the pipeline it names.
+
+### `/remediate`
+
+Kicks off `agentic-cve-remediation`.
 
 **Where the decision comes from.** The six-field decision is read from the
 **issue body**, where it sits inside an HTML-comment marker so it stays invisible
@@ -337,10 +349,30 @@ remediate. If the merged `SELECTED` is `"0"`, the pipeline clones and then no-op
 `/remediate`, on an **issue** (not an MR), and that pass the webhook token check
 start a run.
 
-### Cluster setup for the `/remediate` trigger
+### `/generate-tests`
+
+Kicks off `agentic-test-generation` (add JUnit tests, run them, open a PR). Unlike
+`/remediate` it carries **no decision** — the comment is just the command on its
+own line:
+
+```
+/generate-tests
+```
+
+There's nothing to read from the issue body and nothing to override, so this
+trigger uses a single `cel` interceptor that only checks the command and derives
+`git-host` / `base-branch` from the payload. Only comments whose first characters
+are `/generate-tests`, on an **issue** (not an MR), that pass the webhook token
+check, start a run.
+
+### Cluster setup for the issue-comment triggers
 
 Everything the cluster needs, in order. Steps 1–2 are usually already true from
-the [One-time setup](#one-time-setup); steps 3–5 are trigger-specific.
+the [One-time setup](#one-time-setup); steps 3–5 are trigger-specific. Both
+`/remediate` and `/generate-tests` are served by the **same** EventListener and
+webhook, so this setup enables both at once — the only extra requirement for
+`/generate-tests` is that the `agentic-test-generation` Pipeline and its Tasks are
+applied (step 2).
 
 **1. Operators / interceptors (cluster-level).** The Red Hat OpenShift Pipelines
 operator must be installed **with** the Tekton Triggers stack, which provides the
@@ -349,10 +381,12 @@ operator must be installed **with** the Tekton Triggers stack, which provides th
 oc get clusterinterceptors      # expect at least: cel, gitlab
 ```
 
-**2. The pipeline + its tasks must already be applied.** The trigger only creates
-a PipelineRun that references `agentic-cve-remediation`; that Pipeline and every
-Task it uses must exist in the namespace (your normal `oc apply` of `pipelines/`
-and `tasks/`).
+**2. The pipelines + their tasks must already be applied.** Each trigger only
+creates a PipelineRun that references its Pipeline (`agentic-cve-remediation` for
+`/remediate`, `agentic-test-generation` for `/generate-tests`); those Pipelines and
+every Task they use must exist in the namespace (your normal `oc apply` of
+`pipelines/` and `tasks/`). Apply only the pipeline(s) whose command you intend to
+enable.
 
 **3. Secrets & configs the run mounts** (in the pipeline namespace — the
 `TriggerTemplate` wires these in, so the names must match or you override the
@@ -361,7 +395,7 @@ and `tasks/`).
 | Name | Purpose |
 |---|---|
 | `gitlab-webhook-secret` (key `secretToken`) | Shared token the `gitlab` interceptor checks against GitLab's `X-Gitlab-Token`. |
-| `git-auth` (Secret) | Clone/push credentials for the app repo (remediation pushes a branch). |
+| `git-auth` (Secret) | **Private repos only** — clone credentials. Not bound by either template by default (see the note at the end of this section); a public app repo needs none. |
 | `scm-auth-secret` (Secret) | SCM token to open the MR (`api` scope on GitLab). |
 | `maven-settings` (ConfigMap) | Maven settings for the verify build. |
 | `ai-agent-config` + `ai-agent-secret` | AI backend config (as for the other pipelines). |
@@ -372,12 +406,12 @@ subject namespace to match yours, and apply into that **same** namespace:
 ```
 oc -n tssc-app-ci create secret generic gitlab-webhook-secret \
   --from-literal=secretToken=$(openssl rand -hex 20)          # or: create -f secrets/gitlab-webhook-secret.example.yaml after editing REPLACE_ME
-oc -n tssc-app-ci apply -f triggers/agentic-cve-remediation-issue-trigger.yaml
+oc -n tssc-app-ci apply -f triggers/agentic-issue-triggers.yaml
 ```
 
 **5. Expose + register the webhook in GitLab.** Get the listener URL:
 ```
-oc -n tssc-app-ci get route agentic-cve-remediation-issue -o jsonpath='https://{.spec.host}{"\n"}'
+oc -n tssc-app-ci get route agentic-issue-commands -o jsonpath='https://{.spec.host}{"\n"}'
 ```
 Then in the GitLab project **Settings → Webhooks → Add**: URL = the Route above,
 **Secret token** = the value in `gitlab-webhook-secret`, and enable **Comment
@@ -385,12 +419,12 @@ events** (Note Hook). Leave SSL verification on (the Route is edge-terminated TL
 
 **Verify before commenting:**
 ```
-oc -n tssc-app-ci get eventlistener agentic-cve-remediation-issue          # ADDRESS populated
-oc -n tssc-app-ci get pods -l eventlistener=agentic-cve-remediation-issue  # el-... pod Running
+oc -n tssc-app-ci get eventlistener agentic-issue-commands          # ADDRESS populated
+oc -n tssc-app-ci get pods -l eventlistener=agentic-issue-commands  # el-... pod Running
 ```
 Use GitLab's webhook **Test → Comment events**, then watch the interceptor and the run:
 ```
-oc -n tssc-app-ci logs deploy/el-agentic-cve-remediation-issue -f   # accept/reject + reason
+oc -n tssc-app-ci logs deploy/el-agentic-issue-commands -f   # accept/reject + reason
 oc -n tssc-app-ci get pipelineruns -l trigger=gitlab-issue -w        # a PipelineRun appears
 ```
 Common failures: `interceptor ... not found` → the `ClusterRoleBinding` subject
@@ -418,12 +452,24 @@ didn't start with `/remediate`, or it was on an MR rather than an issue.
 >   and the next stage's `extensions.issueRaw` then can't find it. By contrast, the
 >   `expression` and the `TriggerBinding` refs *do* use the `extensions.` prefix.
 
-The `TriggerTemplate` binds a fresh `workspace` PVC per run and mounts
-`maven-settings` (ConfigMap) and `git-auth` (Secret); override
-`maven-settings-configmap` / `git-auth-secret` / `workspace-size` /
-`scm-secret-name` params if your names differ. `git-url`, `git-host`, and
-`base-branch` are derived from the webhook payload, so the same trigger serves any
-project pointed at it.
+Both `TriggerTemplate`s bind a fresh `workspace` PVC per run and back
+`maven-settings` with an **`emptyDir`** (override `workspace-size` / `scm-secret-name`
+if your names differ). `maven-settings` is an *optional* workspace on the `maven`
+task — its generate step writes a default `settings.xml` when none is supplied — so
+an `emptyDir` suffices and matches how the manual runs are launched. It is
+deliberately **not** a ConfigMap: a configMap-backed workspace whose ConfigMap
+doesn't exist leaves the `package`/`re-run-tests` pod stuck in `PodInitializing`
+forever (never an error, just hangs — the same trap as a missing `git-auth` Secret,
+below). For a private Maven mirror, create a `maven-settings` ConfigMap and swap the
+binding for `configMap: {name: maven-settings}` (a commented example sits in both
+templates). Neither binds `git-auth`: it's an
+optional pipeline workspace, and a secret-backed workspace whose Secret is missing
+leaves the clone pod stuck in `PodInitializing` forever (never an error, just
+hangs), which can't be bound conditionally in a TriggerTemplate. A public app repo
+clones fine without it; for a **private** repo, create a basic-auth Secret named
+`git-auth` and add the binding back (a commented example sits in both templates).
+`git-url`, `git-host`, and `base-branch` are derived from the webhook payload, so
+the same triggers serve any project pointed at them.
 
 > **Note on comment format:** put the override YAML/JSON **directly** after
 > `/remediate` — don't wrap it in ```` ``` ```` code fences (the parser reads the
