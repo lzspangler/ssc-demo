@@ -55,6 +55,13 @@ spec:
     - name: scm-secret-name
       type: string
       default: scm-auth-secret
+    - name: issue-iid
+      type: string
+      description: >-
+        SCM issue number to cross-reference from the opened MR/PR. Set by the
+        issue-comment trigger; leave empty (the default) for manual or other
+        triggers, in which case the PR carries no issue reference.
+      default: ""
     # ---------------- agent runtime ----------------
     - name: agent-image
       type: string
@@ -182,6 +189,8 @@ spec:
           value: $(params.base-branch)
         - name: SCM_SECRET_NAME
           value: $(params.scm-secret-name)
+        - name: ISSUE_IID
+          value: $(params.issue-iid)
         # open-pr needs git + glab + gh; the default git-init image ships git only,
         # so run it on the agent image, which bundles all three (both flavors do).
         - name: GIT_IMAGE

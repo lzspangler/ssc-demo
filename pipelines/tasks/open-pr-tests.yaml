@@ -31,6 +31,14 @@ spec:
     - name: BASE_BRANCH
       type: string
       default: master
+    - name: ISSUE_IID
+      type: string
+      description: >-
+        SCM issue number to cross-reference from the MR/PR (adds "Related to #N"
+        to the body). Set only when the run was started from an issue comment;
+        empty (the default) for manual or other triggers, which leaves the body
+        with no issue reference.
+      default: ""
     - name: SCM_SECRET_NAME
       type: string
       default: scm-auth-secret
@@ -72,6 +80,8 @@ spec:
           value: $(params.SCM_PROVIDER)
         - name: BASE_BRANCH
           value: $(params.BASE_BRANCH)
+        - name: ISSUE_IID
+          value: $(params.ISSUE_IID)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -140,6 +150,17 @@ spec:
         BODY="Automated unit-test generation from the maven-build-ci pipeline.
 
         Includes AI-generated JUnit tests under src/test. Please review before merging."
+
+        # If this run was started from an issue comment (ISSUE_IID set by the
+        # trigger), link the MR/PR back to that issue. GitLab and GitHub both turn
+        # "#N" in the body into a cross-reference that shows up as a note in the
+        # issue; "Related to" links without auto-closing on merge. Empty ISSUE_IID
+        # (manual / non-issue triggers) leaves the body untouched.
+        if [ -n "${ISSUE_IID}" ]; then
+          BODY="${BODY}
+
+        Related to #${ISSUE_IID}"
+        fi
 
         PR_URL=""
         case "${SCM_PROVIDER}" in

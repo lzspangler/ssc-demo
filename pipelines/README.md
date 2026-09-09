@@ -93,7 +93,7 @@ selection — those live in `agentic-cve-selection`.
 | `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
 | `ai-remediate-dependency` (`ai-remediate-dependency`) | if `SELECTED="1"` | AI edits `pom.xml` to bump only the vulnerable dependency (`PACKAGE`) to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for the verify-compile). |
 | `re-run-tests` (`maven`) | if `SELECTED="1"` | Runs `mvn verify` against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
-| `open-pr` (`open-pr`) | if `SELECTED="1"` | Commits the remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR (carries the CVE/fix context). Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
+| `open-pr` (`open-pr`) | if `SELECTED="1"` | Commits the remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR (carries the CVE/fix context; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger). Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
 ### `agentic-test-generation` steps
 
@@ -107,7 +107,7 @@ image build, SBOM upload, or RHTPA scan.
 | `package` (`maven`) | always | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
 | `ai-generate-tests` (`ai-generate-tests`) | always | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for compiling/running tests). |
 | `re-run-tests` (`maven`) | always | Runs `mvn verify` (existing + generated tests) against the tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
-| `open-pr` (`open-pr-tests`) | always | Commits **only** the generated tests (`src/test`) to an `ai-tests/*` branch and opens a tests-only PR/MR (no CVE/fix wording); no-ops if nothing changed. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
+| `open-pr` (`open-pr-tests`) | always | Commits **only** the generated tests (`src/test`) to an `ai-tests/*` branch and opens a tests-only PR/MR (no CVE/fix wording; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger); no-ops if nothing changed. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
 ## Files
 
@@ -470,6 +470,22 @@ clones fine without it; for a **private** repo, create a basic-auth Secret named
 `git-auth` and add the binding back (a commented example sits in both templates).
 `git-url`, `git-host`, and `base-branch` are derived from the webhook payload, so
 the same triggers serve any project pointed at them.
+
+### Linking the opened MR/PR back to the issue
+
+When a run is started from an issue comment, the trigger also derives the issue's
+project-scoped number (`body.issue.iid`, via an `issue_iid` cel overlay) and threads
+it through to the PR task as `issue-iid` → `ISSUE_IID`. The `open-pr` / `open-pr-tests`
+task then appends a `Related to #N` line to the MR/PR description. GitLab (and GitHub)
+turn that `#N` into a **cross-reference**, so the opened MR shows up as a system note
+**in the issue** — you can jump from the issue to its remediation/test MR and back.
+`Related to` links **without** auto-closing the issue on merge; to auto-close instead,
+change the line to `Closes #N` in the two PR tasks.
+
+`ISSUE_IID` / `issue-iid` is **optional and defaults to empty**. It is populated
+*only* by the issue-comment triggers — a run started manually (`tkn`/CLI) or by any
+other means leaves it empty and the PR body carries no issue reference. So a PR is
+tied to an issue **only** when the pipeline was triggered by that issue's comment.
 
 > **Note on comment format:** put the override YAML/JSON **directly** after
 > `/remediate` — don't wrap it in ```` ``` ```` code fences (the parser reads the

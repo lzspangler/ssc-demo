@@ -39,6 +39,14 @@ spec:
     - name: JUSTIFICATION
       type: string
       default: ""
+    - name: ISSUE_IID
+      type: string
+      description: >-
+        SCM issue number to cross-reference from the MR/PR (adds "Related to #N"
+        to the body). Set only when the run was started from an issue comment;
+        empty (the default) for manual or other triggers, which leaves the body
+        with no issue reference.
+      default: ""
     - name: SCM_SECRET_NAME
       type: string
       default: scm-auth-secret
@@ -88,6 +96,8 @@ spec:
           value: $(params.FIXED_VERSION)
         - name: JUSTIFICATION
           value: $(params.JUSTIFICATION)
+        - name: ISSUE_IID
+          value: $(params.ISSUE_IID)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -161,6 +171,17 @@ spec:
         - CVE: ${CVE_ID}
         - Dependency: ${PACKAGE} -> ${FIXED_VERSION}
         - Rationale: ${JUSTIFICATION}"
+
+        # If this run was started from an issue comment (ISSUE_IID set by the
+        # trigger), link the MR/PR back to that issue. GitLab and GitHub both turn
+        # "#N" in the body into a cross-reference that shows up as a note in the
+        # issue; "Related to" links without auto-closing on merge. Empty ISSUE_IID
+        # (manual / non-issue triggers) leaves the body untouched.
+        if [ -n "${ISSUE_IID}" ]; then
+          BODY="${BODY}
+
+        Related to #${ISSUE_IID}"
+        fi
 
         PR_URL=""
         case "${SCM_PROVIDER}" in
