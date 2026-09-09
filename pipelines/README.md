@@ -452,9 +452,17 @@ didn't start with `/remediate`, or it was on an MR rather than an issue.
 >   and the next stage's `extensions.issueRaw` then can't find it. By contrast, the
 >   `expression` and the `TriggerBinding` refs *do* use the `extensions.` prefix.
 
-Both `TriggerTemplate`s bind a fresh `workspace` PVC per run and mount
-`maven-settings` (ConfigMap); override `maven-settings-configmap` / `workspace-size`
-/ `scm-secret-name` params if your names differ. Neither binds `git-auth`: it's an
+Both `TriggerTemplate`s bind a fresh `workspace` PVC per run and back
+`maven-settings` with an **`emptyDir`** (override `workspace-size` / `scm-secret-name`
+if your names differ). `maven-settings` is an *optional* workspace on the `maven`
+task — its generate step writes a default `settings.xml` when none is supplied — so
+an `emptyDir` suffices and matches how the manual runs are launched. It is
+deliberately **not** a ConfigMap: a configMap-backed workspace whose ConfigMap
+doesn't exist leaves the `package`/`re-run-tests` pod stuck in `PodInitializing`
+forever (never an error, just hangs — the same trap as a missing `git-auth` Secret,
+below). For a private Maven mirror, create a `maven-settings` ConfigMap and swap the
+binding for `configMap: {name: maven-settings}` (a commented example sits in both
+templates). Neither binds `git-auth`: it's an
 optional pipeline workspace, and a secret-backed workspace whose Secret is missing
 leaves the clone pod stuck in `PodInitializing` forever (never an error, just
 hangs), which can't be bound conditionally in a TriggerTemplate. A public app repo

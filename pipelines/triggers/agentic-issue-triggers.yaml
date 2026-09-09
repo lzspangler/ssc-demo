@@ -143,8 +143,6 @@ spec:
     # Workspace backing — override to match your cluster's storage/config.
     - name: workspace-size
       default: 2Gi
-    - name: maven-settings-configmap
-      default: maven-settings
     - name: scm-secret-name
       default: scm-auth-secret
   resourcetemplates:
@@ -193,9 +191,17 @@ spec:
                 resources:
                   requests:
                     storage: $(tt.params.workspace-size)
+          # maven-settings is OPTIONAL on the maven task: its generate step writes a
+          # default settings.xml when none is supplied, so an emptyDir is enough. Do
+          # NOT back this with a configMap unless that configMap actually exists --
+          # a configMap-backed workspace whose configMap is missing leaves the
+          # package pod stuck in PodInitializing forever (never errors, just hangs),
+          # the same trap as a missing git-auth secret. For a private Maven mirror,
+          # create the configMap first, then swap this for:
+          #   configMap:
+          #     name: maven-settings
           - name: maven-settings
-            configMap:
-              name: $(tt.params.maven-settings-configmap)
+            emptyDir: {}
           # NOTE: git-auth (clone credentials) is intentionally NOT bound here.
           # It is optional on the pipeline, and a secret-backed workspace whose
           # secret is missing leaves the clone pod stuck in PodInitializing
@@ -245,8 +251,6 @@ spec:
     # Workspace backing -- override to match your cluster's storage/config.
     - name: workspace-size
       default: 2Gi
-    - name: maven-settings-configmap
-      default: maven-settings
     - name: scm-secret-name
       default: scm-auth-secret
   resourcetemplates:
@@ -283,9 +287,12 @@ spec:
                 resources:
                   requests:
                     storage: $(tt.params.workspace-size)
+          # maven-settings backed by an emptyDir (optional workspace; maven generates
+          # a default settings.xml). See the remediation template above for why this
+          # is NOT a configMap. For a private Maven mirror, create a `maven-settings`
+          # configMap and swap this for `configMap: {name: maven-settings}`.
           - name: maven-settings
-            configMap:
-              name: $(tt.params.maven-settings-configmap)
+            emptyDir: {}
           # git-auth intentionally NOT bound -- same reasoning as the remediation
           # template above (optional workspace; a missing secret hangs the clone
           # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
