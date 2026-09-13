@@ -48,13 +48,13 @@ components:
   # --- Wave 10: TSSC operators / platform ---
   # Chart: automation/gitops/components/rhtas (#4). Enable when cluster is ready to sync.
   rhtas:
-    enabled: false
+    enabled: true
     namespace: trusted-artifact-signer
     syncWave: "10"
 
   # Chart: automation/gitops/components/rhtpa (#5). Enable when SSO + cluster capacity are ready.
   rhtpa:
-    enabled: false
+    enabled: true
     namespace: trusted-profile-analyzer
     syncWave: "10"
 
