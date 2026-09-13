@@ -1,0 +1,260 @@
+# Lightwell Network enterprise artifact manager — Lightwell TSSC workshop
+# Presents Validated / Remediated / OSV tiers (field PoV pattern).
+# Root App-of-Apps injects lightwellRepo.* and deployer.* (see automation/bootstrap-infra).
+
+lightwellRepo:
+  enabled: true
+  namespace: lightwell-repo
+  # proxy = Nexus remote/proxy repos → packages.redhat.com (needs LW_* credentials)
+  # seeded = hosted repos + curated Maven/OSV/SBOM uploads (deterministic RHDP labs)
+  mode: seeded
+  syncWaves:
+    namespace: "0"
+    secrets: "1"
+    config: "1"
+    nexus: "2"
+    route: "3"
+    seed: "4"
+    ocMirror: "4"
+    # Same wave as ocMirror. The workspace PVC has no provision consumer (V2-11);
+    # a later userinfo wave never applies (WaitForFirstConsumer / #54).
+    userinfo: "4"
+
+# Sonatype Nexus Repository Manager 3 (enterprise artifact-manager stand-in)
+nexus:
+  enabled: true
+  name: nexus
+  image: docker.io/sonatype/nexus3:3.70.1
+  replicas: 1
+  # Grant anyuid SCC so fsGroup: 200 is allowed under restricted OpenShift SCCs
+  anyuidScc: true
+  # Nexus admin password is generated on first boot into a Secret; do not commit it.
+  # Document LW_USERNAME / LW_PASSWORD separately for LWN remote auth.
+  service:
+    port: 8081
+  route:
+    enabled: true
+    # When empty: nexus-<namespace>.<deployer.domain>
+    host: ""
+  persistence:
+    enabled: true
+    # Maven/PyPI seed plus room for learner oc-mirror of one Hummingbird runtime (~259Mi) + signatures/SBOM
+    size: 40Gi
+  # Docker Registry API connector (oc-mirror dest). Dedicated Route; not the Maven UI port.
+  docker:
+    enabled: true
+    port: 5000
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  # JVM heap hint via INSTALL4J_ADD_VM_PARAMS (Nexus container convention)
+  javaOpts: "-Xms1200m -Xmx1200m -XX:MaxDirectMemorySize=2g"
+
+# Authoritative LWN remotes (document even when seeding locally)
+channels:
+  validated:
+    name: lightwell-java-validated
+    type: maven
+    description: "Lightwell Network Java Validated — upstream-parity rebuilds"
+    remoteUrl: "https://packages.redhat.com/lightwell/java/validated"
+    # Hosted repo key used in seeded mode
+    hostedName: lightwell-java-validated-hosted
+  remediated:
+    name: lightwell-java-remediated
+    type: maven
+    description: "Lightwell Network Java Remediated — exact-version .rhlw-0000X backports"
+    remoteUrl: "https://packages.redhat.com/lightwell/java/remediated"
+    hostedName: lightwell-java-remediated-hosted
+  osv:
+    name: lightwell-osv-java-remediated
+    type: raw
+    description: "Lightwell Network Java OSV (remediated) — machine-readable fixed-vuln records"
+    remoteUrl: "https://packages.redhat.com/lightwell/osv/java/remediated"
+    hostedName: lightwell-osv-java-remediated-hosted
+  # Python / PyPI (Modules 7–9) — same Validated / Remediated tier names as Java
+  pypiValidated:
+    enabled: true
+    name: lightwell-python-validated
+    type: pypi
+    description: "Lightwell Network Python Validated — upstream-parity rebuilds for pip"
+    remoteUrl: "https://packages.redhat.com/lightwell/python/validated"
+    hostedName: lightwell-python-validated-hosted
+  # REQUIRED true for this workshop (Java + Python catalog). Always seed Remediated marker.
+  pypiRemediated:
+    enabled: true
+    name: lightwell-python-remediated
+    type: pypi
+    description: "Lightwell Network Python Remediated — exact-version .rhlw-0000X backports"
+    remoteUrl: "https://packages.redhat.com/lightwell/python/remediated"
+    hostedName: lightwell-python-remediated-hosted
+  # V2-10 dest for learner oc-mirror. Hosted Docker — created empty; never pre-load HUMMINGBIRD_JAVA_RUNTIME.
+  dockerMirror:
+    enabled: true
+    name: hummingbird-mirror
+    type: docker
+    description: "Empty oc-mirror dest (Track 1). Learners push Hummingbird + signatures + SBOM here."
+    httpPort: 5000
+
+  # Optional enterprise virtual aggregator (Maven points here in proxied PoV delivery)
+  virtualLibsRelease:
+    enabled: true
+    name: libs-release
+    description: "Enterprise libs-release virtual repo aggregating Lightwell Maven tiers"
+
+# LWN registry service account — NEVER commit real values.
+# Inject via RHDP / ExternalSecret: LW_USERNAME, LW_PASSWORD
+credentials:
+  secretName: lightwell-network-credentials
+  createPlaceholder: true
+  # Empty placeholders only
+  username: ""
+  password: ""
+
+# Maven learner UX — settings.xml profiles for validated + remediated
+mavenSettings:
+  enabled: true
+  configMapName: lightwell-maven-settings
+  # When empty, derived from Nexus Route host
+  nexusUrl: ""
+
+# Python learner UX — pip.conf index URLs for Validated + Remediated (always on)
+pipSettings:
+  enabled: true
+  configMapName: lightwell-pip-settings
+  # When empty, derived from Nexus Route host (same helper as Maven)
+  nexusUrl: ""
+
+# Deterministic PyPI seed package (fetched at seed time; usable by FastAPI sample)
+pypiSeed:
+  # Real wheel from public PyPI for Validated hosted repo (Module 7 pip install proof)
+  package: httpx
+  version: "0.27.2"
+  # Content-addressed files.pythonhosted.org URL (override if cluster cannot reach PyPI)
+  wheelUrl: "https://files.pythonhosted.org/packages/56/95/9377bcb415797e44274b51d46e3249eba641711cf3348050f76ee7b15ffc/httpx-0.27.2-py3-none-any.whl"
+  # Workshop marker wheel for Remediated hosted (PEP 440 local +rhlw.*; not a live LWN backport)
+  remediatedPackage: lw-workshop-pypi
+  remediatedVersion: "1.0.0+rhlw.00001"
+
+# Sample OSV JSON demonstrating .rhlw-0000X fixed version (seeded / lab beat)
+sampleOsv:
+  enabled: true
+  configMapName: lightwell-sample-osv
+  # Example pin taught in Module 3 / issue #11 acceptance (spring-core style)
+  packageName: "org.springframework:spring-core"
+  baseVersion: "5.3.18"
+  remediatedVersion: "5.3.18.rhlw-00003"
+  vulnerabilityId: "LW-DEMO-0001"
+  # Path shape inside raw OSV repo (matches packages.redhat.com/lightwell/osv/java/remediated)
+  rawPath: "osv/java/remediated/LW-DEMO-0001.json"
+
+# Track 7 scored VEX/CDX (Q12 C+) — bound to Track 2 commons-lang3 pin, not CSAF
+sampleVex:
+  enabled: true
+  configMapName: lightwell-sample-vex
+  packageName: "org.apache.commons:commons-lang3"
+  baseVersion: "3.14.0"
+  remediatedVersion: "3.14.0.rhlw-00001"
+  vulnerabilityId: "LW-DEMO-0002"
+  mavenCdxClassifier: "cdx"
+  mavenVexClassifier: "vex"
+  rawCdxPath: "sbom/java/remediated/org.apache.commons/commons-lang3/3.14.0.rhlw-00001.cdx.json"
+  rawVexPath: "vex/java/remediated/org.apache.commons/commons-lang3/3.14.0.rhlw-00001.vex.json"
+  liveCsafGate: false
+
+# Repository bootstrap notes (REST sketch) — Job lightwell-repo-seed automates create + seed
+bootstrap:
+  enabled: true
+  configMapName: lightwell-repo-bootstrap
+
+# Seed Job — create channel repos; in seeded mode upload Maven stubs + OSV + CycloneDX
+seed:
+  enabled: true
+  jobName: lightwell-repo-seed
+  configMapName: lightwell-repo-seed
+  serviceAccountName: lightwell-repo-seed
+  rbac:
+    create: true
+  # OpenShift CLI image (oc + curl + bash) for admin.password capture + Nexus REST
+  image: quay.io/openshift/origin-cli:4.17.0
+  imagePullPolicy: IfNotPresent
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  createAdminSecretPlaceholder: true
+  adminSecretName: nexus-admin-credentials
+  adminUsername: admin
+  adminPassword: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# V2-10 oc-mirror tooling. Do not run a provision Job that mirrors the scored image (V2-11 is learner-run).
+ocMirror:
+  enabled: true
+  # Source pin from V2-1 — documentation / userinfo only. Never pulled by this chart.
+  sourcePullSpec: "registry.access.redhat.com/hi/openjdk:21-runtime@sha256:e7c41dc2cba28c49d551c491419e00b75c5aef6c13326cc08765d30e882630ba"
+  sourceRegistry: "registry.access.redhat.com"
+  pluginImage: "registry.redhat.io/openshift4/oc-mirror-plugin-rhel9:v4.20"
+  # #63: tag-based signature copy after oc-mirror (Nexus dest has no OCI referrers).
+  cosignImage: "registry.redhat.io/rhtas/cosign-rhel9:1.3.0"
+  workspace:
+    pvcName: oc-mirror-workspace
+    size: 20Gi
+    # #60: chown workspace for oc-mirror local storage (requires anyuidScc).
+    fsGroup: 1000
+  serviceAccountName: oc-mirror
+  anyuidScc: true
+  dockerSecretName: nexus-docker-push
+  configMapName: oc-mirror-tooling
+  # V2-11 incomplete seed (REPLACE_ME). Learner edits this ConfigMap, then starts the Job.
+  imageSet:
+    configMapName: imageset-configuration
+    key: imageset-config.yaml
+
+# V2-53 incomplete learner stubs (scored ConfigMaps, not Showroom-home-only).
+# Argo ignoreDifferences /data so selfHeal does not revert after Your change.
+labStubs:
+  enabled: true
+  verify:
+    configMapName: stub-01-hummingbird-verify
+    key: published-verify.sh
+  settings:
+    configMapName: stub-03-enterprise-proxy
+    key: settings.xml
+  pom:
+    configMapName: stub-04-remediated-pin
+    key: pom.xml
+  blastRadius:
+    configMapName: stub-18-blast-radius
+    key: blast-radius.txt
+
+# RHDP userinfo ConfigMap
+userInfo:
+  enabled: true
+  title: "Lightwell TSSC Workshop — Artifact Manager (LWN)"
+  instructions: >-
+    Nexus presents Lightwell Validated / Remediated / OSV (Java) and PyPI Validated /
+    Remediated (Python) channels. Default mode is seeded (Job lightwell-repo-seed uploads
+    spring-core stubs, commons-lang3, OSV/CycloneDX, plus httpx for PyPI Validated and a
+    .rhlw-* workshop wheel for PyPI Remediated). For live proxy, set
+    lightwellRepo.mode=proxy and inject LW_USERNAME / LW_PASSWORD.
+    Keep channels.pypiRemediated.enabled=true for this Java+Python catalog (seeded marker).
+    Maven: ConfigMap lightwell-maven-settings. Python: ConfigMap lightwell-pip-settings.
+    Track 1 dest: empty Docker repo hummingbird-mirror (Route registry-lightwell-repo). Do not
+    pre-mirror HUMMINGBIRD_JAVA_RUNTIME. Learners edit ConfigMap imageset-configuration
+    (replace REPLACE_ME_HUMMINGBIRD_PULLSPEC with hummingbird_source_pullspec) then start
+    the Job from ConfigMap oc-mirror-tooling. Incomplete stubs (V2-53): ConfigMaps
+    stub-01-hummingbird-verify, stub-03-enterprise-proxy, stub-04-remediated-pin,
+    stub-18-blast-radius. Do not copy lightwell-maven-settings as the 2.1 scored file.
+
+# Injected by root-app / field content workload
+deployer:
+  domain: ""
+  apiUrl: ""

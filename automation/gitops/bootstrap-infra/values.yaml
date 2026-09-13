@@ -6,15 +6,18 @@
 #    8  — OpenShift Pipelines (Tekton CRDs): pipelines
 #   10  — TSSC operators / platform: rhtas, rhtpa
 #   20  — Artifact manager / LWN pattern: lightwell-repo
-#   45  — Validate Jobs scaffold (V2-51): helper + report ConfigMaps + Job templates
 #
 # Child charts live under automation/gitops/components/<name>/.
 
 # ============================================================
 # GitOps Configuration
 # ============================================================
+deployer: 
+  apiUrl: ""
+  domain: ""
+
 gitops:
-  repoUrl: "https://github.com/ssc-demo/ssc-demo.git"
+  repoUrl: "https://github.com/lzspangler/ssc-demo.git"
   revision: "ssc-demo"
   basePath: "automation/gitops"
 
