@@ -1,0 +1,57 @@
+# Lightwell SSC demo — Bootstrap Infra
+# AgnosticV gitops_path: automation/gitops/bootstrap-infra
+#
+# Sync wave ordering (IdP → pipelines → operators → student git → config → apps → validate):
+#    5  — Workshop Keycloak (SSO for RHTPA): keycloak
+#    8  — OpenShift Pipelines (Tekton CRDs): pipelines
+#   10  — TSSC operators / platform: rhtas, rhtpa
+#   20  — Artifact manager / LWN pattern: lightwell-repo
+#   45  — Validate Jobs scaffold (V2-51): helper + report ConfigMaps + Job templates
+#
+# Child charts live under automation/gitops/components/<name>/.
+
+# ============================================================
+# GitOps Configuration
+# ============================================================
+gitops:
+  repoUrl: "https://github.com/ssc-demo/ssc-demo.git"
+  revision: "main"
+  basePath: "automation/gitops"
+
+# ArgoCD settings
+argocd:
+  namespace: openshift-gitops
+  project: default
+
+# ============================================================
+# Components — enable/disable and configure each child chart
+# ============================================================
+components:
+
+  # --- Wave 5: Workshop IdP (required before RHTPA) ---
+  # Chart: automation/gitops/components/keycloak. Route host sso.<deployer.domain>/realms/tpa.
+  keycloak:
+    enabled: true
+    namespace: sso
+    syncWave: "5"
+
+  # --- Wave 8: OpenShift Pipelines (Tekton) — enable before rhacs Module 5 Tasks ---
+  # Chart: automation/gitops/components/pipelines. OLM Subscription into openshift-operators.
+  pipelines:
+    enabled: true
+    namespace: openshift-operators
+    syncWave: "8"
+
+  # --- Wave 10: TSSC operators / platform ---
+  # Chart: automation/gitops/components/rhtas (#4). Enable when cluster is ready to sync.
+  rhtas:
+    enabled: false
+    namespace: trusted-artifact-signer
+    syncWave: "10"
+
+  # Chart: automation/gitops/components/rhtpa (#5). Enable when SSO + cluster capacity are ready.
+  rhtpa:
+    enabled: false
+    namespace: trusted-profile-analyzer
+    syncWave: "10"
+
