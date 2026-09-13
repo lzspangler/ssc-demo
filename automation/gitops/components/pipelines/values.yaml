@@ -46,5 +46,5 @@ userInfo:
     Do not copy example-pipeline-snippet.yaml.
 
 deployer:
-  domain: ""
-  apiUrl: ""
+  domain: "apps.cluster-mv9t4.dyn.redhatworkshops.io"
+  apiUrl: "https://api.cluster-mv9t4.dyn.redhatworkshops.io:6443"
