@@ -15,7 +15,7 @@
 # ============================================================
 gitops:
   repoUrl: "https://github.com/ssc-demo/ssc-demo.git"
-  revision: "main"
+  revision: "ssc-demo"
   basePath: "automation/gitops"
 
 # ArgoCD settings
