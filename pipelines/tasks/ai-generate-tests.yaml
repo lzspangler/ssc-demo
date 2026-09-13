@@ -39,6 +39,14 @@ spec:
         context. Narrow this (e.g. to a package) on large repos to control token
         cost. Only affects the aider (OpenAI-compatible) path.
       default: src/main/java
+    - name: MAX_ATTEMPTS
+      type: string
+      description: >-
+        How many times to (re)run the agent and verify the tests it generated.
+        On a failing verify, the Maven output is fed back into the next attempt's
+        prompt. If the generated tests still fail after the last attempt, the task
+        fails.
+      default: "6"
   workspaces:
     - name: source
       description: Workspace containing the application source (shared PVC).
@@ -77,7 +85,8 @@ spec:
 
         AGENT="${AI_AGENT:-claude-code}"
         MODEL="${AI_MODEL:-claude-opus-5}"
-        echo "Generating tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL}"
+        MAX_ATTEMPTS="$(params.MAX_ATTEMPTS)"
+        echo "Generating tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL} (up to ${MAX_ATTEMPTS} attempts)"
 
         # This task forks off clone-repository and runs in parallel with the
         # build/scan chain's Maven build, which writes target/ in this same shared
@@ -100,7 +109,7 @@ spec:
         writing tests, run 'mvn -B -q -Dstyle.color=never test' and iterate until the
         tests you added pass. ${TEST_INSTRUCTIONS}"
 
-        # --- Dispatch to the configured coding agent ---
+        # --- One-time setup for the configured coding agent ---
         case "${AGENT}" in
           aider)
             # OpenAI-compatible coding agent (gpt-oss, Granite, any vLLM/RHOAI/
@@ -115,14 +124,6 @@ spec:
             # self-hosted models (gpt-oss/Granite aren't in its cost table).
             READ_ARGS=""
             for p in ${SOURCE_PATHS:-src/main/java}; do READ_ARGS="${READ_ARGS} --read ${p}"; done
-            aider \
-              --model "${AIDER_MODEL}" \
-              --yes-always --no-auto-commits --no-check-update --no-gitignore \
-              --no-show-model-warnings \
-              --map-tokens 1024 --subtree-only \
-              ${READ_ARGS} \
-              --message "${PROMPT}" \
-              2>&1 | tee /tekton/home/aider-generate-tests.log
             ;;
           claude-code|*)
             # Configure Claude Code auth from ai-agent-config / ai-agent-secret.
@@ -133,24 +134,132 @@ spec:
               anthropic|*) : ;;
             esac
             export ANTHROPIC_MODEL="${MODEL}"
-            # Headless, non-interactive run. --allowedTools limits what runs
-            # without prompting; acceptEdits lets it write files unattended.
-            claude -p "${PROMPT}" \
-              --model "${ANTHROPIC_MODEL}" \
-              --permission-mode acceptEdits \
-              --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
-              --output-format json | tee /tekton/home/claude-generate-tests.json
             ;;
         esac
 
-        # Hard gate: the tests the agent added must pass. Runs in the isolated
-        # copy against its own target/, so no collision with the build chain.
-        mvn -B -q -Dstyle.color=never test
+        # Invoke the configured agent with the given prompt. Agent CLI errors are
+        # tolerated (logged, not fatal) so the retry loop can still verify/retry.
+        run_agent() {
+          local prompt="$1"
+          set +e
+          case "${AGENT}" in
+            aider)
+              aider \
+                --model "${AIDER_MODEL}" \
+                --yes-always --no-auto-commits --no-check-update --no-gitignore \
+                --no-show-model-warnings \
+                --map-tokens 1024 --subtree-only \
+                ${READ_ARGS} \
+                --message "${prompt}" \
+                2>&1 | tee /tekton/home/aider-generate-tests.log
+              ;;
+            claude-code|*)
+              # Headless, non-interactive run. --allowedTools limits what runs
+              # without prompting; acceptEdits lets it write files unattended.
+              claude -p "${prompt}" \
+                --model "${ANTHROPIC_MODEL}" \
+                --permission-mode acceptEdits \
+                --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
+                --output-format json | tee /tekton/home/claude-generate-tests.json
+              ;;
+          esac
+          local rc=$?
+          set -e
+          [ "${rc}" -ne 0 ] && echo "WARN: agent exited ${rc}; continuing to verification."
+          return 0
+        }
 
-        # Merge generated/changed test files back onto the shared workspace so
-        # ai-remediate-dependency and open-pr pick them up. Only touch src/test.
+        # ---- Bounded generate -> verify -> retry loop ----
+        # The TASK owns the retry loop rather than trusting the agent to self-
+        # verify: aider is invoked without --auto-test and cannot run Maven, so on
+        # its own its "iterate until tests pass" instruction never actually runs.
+        # Each attempt runs the agent, then compiles+runs ONLY the test classes it
+        # touched this run; on failure the Maven output is fed back into the next
+        # attempt's prompt so the agent fixes (not rewrites) what it produced.
+        attempt=1
+        feedback=""
+        passed=0
+        tests_csv=""
+        while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
+          echo "=== test-generation attempt ${attempt}/${MAX_ATTEMPTS} ==="
+
+          prompt="${PROMPT}"
+          if [ -n "${feedback}" ]; then
+            prompt="${PROMPT}
+
+        Your previous attempt left FAILING tests. Do NOT start over -- fix the tests
+        you already wrote under src/test so they compile and pass. Here is the tail
+        of the Maven output from that attempt:
+        ${feedback}"
+          fi
+          run_agent "${prompt}"
+
+          # Which test files did the agent add/change this run? git status
+          # --porcelain emits "XY <path>"; strip the 3-char status prefix.
+          git add -A 2>/dev/null || true
+          changed="$(git status --porcelain -- 'src/test' 2>/dev/null | cut -c4-)"
+          if [ -z "${changed}" ]; then
+            echo "Agent produced no test changes on attempt ${attempt}."
+            attempt=$((attempt+1))
+            continue
+          fi
+
+          # Derive surefire -Dtest class names from the changed test sources.
+          tests_csv=""
+          while IFS= read -r f; do
+            [ -z "${f}" ] && continue
+            case "${f}" in
+              *Test.java|*Tests.java|*TestCase.java|Test*.java|*IT.java)
+                cls="$(basename "${f}" .java)"
+                tests_csv="${tests_csv:+${tests_csv},}${cls}" ;;
+            esac
+          done <<< "${changed}"
+
+          if [ -z "${tests_csv}" ]; then
+            echo "Changed files under src/test but none are recognizable test classes; nothing to verify."
+            break
+          fi
+
+          # Verify ONLY the generated tests, so unrelated/pre-existing suite
+          # failures can't fail this task. The downstream re-run-tests task runs
+          # full 'mvn verify' over the merged result. Runs in the isolated copy
+          # against its own target/, so no collision with the build chain.
+          echo "Verifying generated tests: ${tests_csv}"
+          set +e
+          build_log="$(mvn -B -q -Dstyle.color=never \
+              -Dsurefire.failIfNoSpecifiedTests=false \
+              -Dtest="${tests_csv}" test 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "${build_log}"
+          if [ "${rc}" -eq 0 ]; then
+            passed=1
+            break
+          fi
+
+          echo "Generated tests failed on attempt ${attempt} (mvn rc=${rc})."
+          feedback="$(printf '%s\n' "${build_log}" | tail -n 120)"
+          attempt=$((attempt+1))
+        done
+
+        # No verifiable tests were produced across all attempts -> nothing to PR;
+        # skip gracefully (the pipeline guards re-run-tests/open-pr on TESTS_ADDED).
+        if [ -z "${tests_csv}" ]; then
+          echo "No test classes were generated; nothing to add."
+          printf '0' > "$(results.TESTS_ADDED.path)"
+          exit 0
+        fi
+
+        # Tests were generated but never passed within the retry budget: fail loud
+        # so the run is visible, rather than opening a PR with broken tests.
+        if [ "${passed}" -ne 1 ]; then
+          echo "ERROR: generated tests still failing after ${MAX_ATTEMPTS} attempt(s)." >&2
+          exit 1
+        fi
+
+        # Merge the passing generated test files back onto the shared workspace so
+        # re-run-tests and open-pr pick them up. Only touch src/test.
         git add -A 2>/dev/null || true
-        # git status --porcelain emits "XY <path>"; strip the 3-char status prefix.
         CHANGED="$(git status --porcelain -- 'src/test' 2>/dev/null | cut -c4-)"
         COUNT=0
         if [ -n "${CHANGED}" ]; then
