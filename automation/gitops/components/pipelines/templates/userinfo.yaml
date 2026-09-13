@@ -1,0 +1,44 @@
+{{- if and .Values.pipelines.enabled .Values.userInfo.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-userinfo-pipelines
+  namespace: {{ .Values.operator.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+    demo.redhat.com/userinfo: ""
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.userinfo | quote }}
+data:
+  demo_title: {{ .Values.userInfo.title | quote }}
+  access_instructions: {{ .Values.userInfo.instructions | quote }}
+  operator_subscription: {{ .Values.operator.name | quote }}
+  operator_namespace: {{ .Values.operator.namespace | quote }}
+  pipelines_namespace: openshift-pipelines
+{{- if .Values.verifyBaseImage.enabled }}
+  verify_base_image_task: {{ .Values.verifyBaseImage.taskName | quote }}
+  verify_base_image_namespace: {{ .Values.verifyBaseImage.namespace | quote }}
+  verify_base_image_in_seeded_pipeline: "false"
+  hummingbird_certificate_identity_regexp: {{ .Values.verifyBaseImage.certificateIdentityRegexp | quote }}
+  hummingbird_certificate_oidc_issuer: {{ .Values.verifyBaseImage.certificateOidcIssuer | quote }}
+{{- end }}
+{{- if .Values.conformaPolicy.enabled }}
+  conforma_policy_task: {{ .Values.conformaPolicy.taskName | quote }}
+  conforma_policy_namespace: {{ .Values.conformaPolicy.namespace | quote }}
+  conforma_policy_configmap: {{ .Values.conformaPolicy.configMapName | quote }}
+  conforma_policy_in_seeded_pipeline: "false"
+  conforma_policy_seed_skip_image_sig_check: {{ .Values.conformaPolicy.skipImageSigCheck | quote }}
+  conforma_policy_seed_max_cve_score: {{ .Values.conformaPolicy.restrictMaxCveScore | quote }}
+{{- end }}
+{{- if .Values.prefetchDependencies.enabled }}
+  prefetch_dependencies_task: {{ .Values.prefetchDependencies.taskName | quote }}
+  prefetch_dependencies_namespace: {{ .Values.prefetchDependencies.namespace | quote }}
+  prefetch_dependencies_in_seeded_pipeline: "false"
+  prefetch_dir: {{ .Values.prefetchDependencies.prefetchDir | quote }}
+  konflux_mapping_hermeto: "prefetch-dependencies"
+{{- end }}
+  cluster_domain: {{ .Values.deployer.domain | quote }}
+  cluster_api_url: {{ .Values.deployer.apiUrl | quote }}
+  deployment_type: helm
+{{- end }}

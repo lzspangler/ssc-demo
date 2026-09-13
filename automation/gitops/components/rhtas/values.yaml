@@ -2,6 +2,9 @@
 # Patterns adapted from Trusted Software Factory / RHADS Securesign installs.
 # Root App-of-Apps injects rhtas.* and deployer.* (see automation/bootstrap-infra).
 
+argocd:
+  namespace: openshift-gitops
+
 rhtas:
   # Chart-level gate (root-app Application only exists when components.rhtas.enabled)
   enabled: true

@@ -1,6 +1,9 @@
 # Minimal workshop Keycloak — issuer https://sso.<deployer.domain>/realms/tpa
 # Matches automation/gitops/components/rhtpa oidc.* defaults (frontend + cli clients).
 
+argocd:
+  namespace: openshift-gitops
+
 keycloak:
   enabled: true
   namespace: sso

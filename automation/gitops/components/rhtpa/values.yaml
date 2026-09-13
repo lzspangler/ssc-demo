@@ -2,6 +2,9 @@
 # Patterns adapted from RHADS / Trusted Software Factory TPA installs.
 # Root App-of-Apps injects rhtpa.* and deployer.* (see automation/bootstrap-infra).
 
+argocd:
+  namespace: openshift-gitops
+
 rhtpa:
   # Chart-level gate (root-app Application only exists when components.rhtpa.enabled)
   enabled: true

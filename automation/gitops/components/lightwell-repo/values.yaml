@@ -2,6 +2,9 @@
 # Presents Validated / Remediated / OSV tiers (field PoV pattern).
 # Root App-of-Apps injects lightwellRepo.* and deployer.* (see automation/bootstrap-infra).
 
+argocd:
+  namespace: openshift-gitops
+
 lightwellRepo:
   enabled: true
   namespace: lightwell-repo
