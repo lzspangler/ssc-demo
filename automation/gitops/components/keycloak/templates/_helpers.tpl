@@ -1,5 +1,5 @@
 {{- define "keycloak.labels" -}}
-demo.redhat.com/application: "lightwell-tssc-workshop"
+demo.redhat.com/application: "ssc-demo"
 app.kubernetes.io/name: keycloak
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}

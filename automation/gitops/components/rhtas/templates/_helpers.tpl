@@ -2,7 +2,7 @@
 Common labels for RHTAS chart resources.
 */}}
 {{- define "rhtas.labels" -}}
-demo.redhat.com/application: "lightwell-tssc-workshop"
+demo.redhat.com/application: "ssc-demo"
 app.kubernetes.io/name: rhtas
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}

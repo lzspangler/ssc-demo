@@ -2,7 +2,7 @@
 Common labels for lightwell-repo chart resources.
 */}}
 {{- define "lightwell-repo.labels" -}}
-demo.redhat.com/application: "lightwell-tssc-workshop"
+demo.redhat.com/application: "ssc-demo"
 app.kubernetes.io/name: lightwell-repo
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}

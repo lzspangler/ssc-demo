@@ -2,7 +2,7 @@
 Common labels for RHTPA chart resources.
 */}}
 {{- define "rhtpa.labels" -}}
-demo.redhat.com/application: "lightwell-tssc-workshop"
+demo.redhat.com/application: "ssc-demo"
 app.kubernetes.io/name: rhtpa
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}

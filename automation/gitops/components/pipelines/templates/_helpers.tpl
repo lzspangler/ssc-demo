@@ -2,7 +2,7 @@
 Common labels for Pipelines chart resources.
 */}}
 {{- define "pipelines.labels" -}}
-demo.redhat.com/application: "lightwell-tssc-workshop"
+demo.redhat.com/application: "ssc-demo"
 app.kubernetes.io/name: pipelines
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
