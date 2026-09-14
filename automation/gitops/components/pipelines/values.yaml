@@ -1,0 +1,50 @@
+# OpenShift Pipelines — Lightwell TSSC workshop
+# Required before RHACS Tasks / student .tekton PipelineRuns (Module 5).
+# Root App-of-Apps injects pipelines.* (see automation/bootstrap-infra).
+
+argocd:
+  namespace: openshift-gitops
+
+pipelines:
+  # Chart-level gate (root-app Application only exists when components.pipelines.enabled)
+  enabled: true
+  syncWaves:
+    operator: "1"
+    userinfo: "3"
+
+# OLM install into openshift-operators (AllNamespaces; OperatorGroup already exists)
+operator:
+  enabled: true
+  # Subscription metadata.name
+  name: openshift-pipelines-operator
+  # OLM package name
+  packageName: openshift-pipelines-operator-rh
+  namespace: openshift-operators
+  channel: latest
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+  # openshift-operators already has an OperatorGroup — do not create another
+  createOperatorGroup: false
+
+# RHDP userinfo ConfigMap (optional orientation for operators / lab authors)
+userInfo:
+  enabled: true
+  title: "Lightwell TSSC Workshop — OpenShift Pipelines"
+  instructions: >-
+    OpenShift Pipelines provides Tekton CRDs (Pipeline, Task, PipelineRun) used by
+    Module 5 student .tekton overlays and RHACS policy-gate Tasks in stackrox.
+    After the Operator is Ready, confirm: oc get crd pipelines.tekton.dev.
+    Task verify-base-image lives in lightwell-tasks (V2-14). It is not in the
+    seeded spring-boot-lw-poc-build-sign pipeline — wire it before openshift-build.
+    Task conforma-policy and ConfigMap conforma-policy live in lightwell-tasks
+    (V2-15). The seed is too permissive (skip signature checks, CVE 999). Copy
+    the ConfigMap to the lab namespace, tighten it, and wire the Task after
+    cosign-sign-keyless. Task prefetch-dependencies lives in lightwell-tasks
+    (V2-23). It is not Hermeto and is not in the seeded pipeline — wire it
+    before openshift-build after stripping public Central from settings.xml.
+    Do not copy example-pipeline-snippet.yaml.
+
+deployer:
+  domain: "apps.cluster-mv9t4.dyn.redhatworkshops.io"
+  apiUrl: "https://api.cluster-mv9t4.dyn.redhatworkshops.io:6443"

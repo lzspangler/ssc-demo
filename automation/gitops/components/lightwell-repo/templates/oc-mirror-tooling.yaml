@@ -1,0 +1,244 @@
+{{- if and .Values.lightwellRepo.enabled .Values.ocMirror.enabled .Values.channels.dockerMirror.enabled }}
+{{- $regHost := include "lightwell-repo.registryHost" . }}
+{{- $regUrl := include "lightwell-repo.registryUrl" . }}
+---
+# Empty workspace for learner-run oc-mirror (V2-11). Provision must not fill this with Hummingbird.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.ocMirror.workspace.pvcName }}
+  namespace: {{ .Values.lightwellRepo.namespace }}
+  labels:
+    {{- include "lightwell-repo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oc-mirror
+  annotations:
+    # No provision Job mounts this PVC (V2-11). WaitForFirstConsumer stays Pending;
+    # Argo treats that as Progressing and will not start a later wave (#54).
+    # ignore-healthcheck: Application health only — it does not advance waves.
+    argocd.argoproj.io/sync-wave: {{ .Values.lightwellRepo.syncWaves.ocMirror | quote }}
+    argocd.argoproj.io/ignore-healthcheck: "true"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.ocMirror.workspace.size | quote }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.ocMirror.serviceAccountName }}
+  namespace: {{ .Values.lightwellRepo.namespace }}
+  labels:
+    {{- include "lightwell-repo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oc-mirror
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.lightwellRepo.syncWaves.ocMirror | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.ocMirror.serviceAccountName }}
+  namespace: {{ .Values.lightwellRepo.namespace }}
+  labels:
+    {{- include "lightwell-repo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oc-mirror
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.lightwellRepo.syncWaves.ocMirror | quote }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps", "persistentvolumeclaims"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.ocMirror.serviceAccountName }}
+  namespace: {{ .Values.lightwellRepo.namespace }}
+  labels:
+    {{- include "lightwell-repo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oc-mirror
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.lightwellRepo.syncWaves.ocMirror | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.ocMirror.serviceAccountName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.ocMirror.serviceAccountName }}
+    namespace: {{ .Values.lightwellRepo.namespace }}
+{{- if .Values.ocMirror.anyuidScc }}
+---
+# #60: Job fsGroup 1000 is outside the restricted-v2 range (namespace 10009…).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.ocMirror.serviceAccountName }}-scc-anyuid
+  namespace: {{ .Values.lightwellRepo.namespace }}
+  labels:
+    {{- include "lightwell-repo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oc-mirror
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.lightwellRepo.syncWaves.ocMirror | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:anyuid
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.ocMirror.serviceAccountName }}
+    namespace: {{ .Values.lightwellRepo.namespace }}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.ocMirror.configMapName }}
+  namespace: {{ .Values.lightwellRepo.namespace }}
+  labels:
+    {{- include "lightwell-repo.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oc-mirror
+    demo.redhat.com/userinfo: ""
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.lightwellRepo.syncWaves.ocMirror | quote }}
+data:
+  dest_registry_host: {{ $regHost | quote }}
+  dest_registry_url: {{ $regUrl | quote }}
+  dest_repo: {{ .Values.channels.dockerMirror.name | quote }}
+  dest_docker: {{ printf "docker://%s" $regHost | quote }}
+  plugin_image: {{ .Values.ocMirror.pluginImage | quote }}
+  source_pull_spec: {{ .Values.ocMirror.sourcePullSpec | quote }}
+  source_registry: {{ .Values.ocMirror.sourceRegistry | quote }}
+  pre_mirror_scored_image: "false"
+  imageset_configmap: {{ .Values.ocMirror.imageSet.configMapName | quote }}
+  imageset_key: {{ .Values.ocMirror.imageSet.key | quote }}
+  README: |
+    V2-10 dest + V2-11 incomplete ImageSet. This cluster does NOT pre-mirror the scored Hummingbird image.
+
+    Dest (empty Docker hosted repo on Nexus):
+      {{ $regUrl }}
+      oc-mirror dest: docker://{{ $regHost }}
+      Nexus repo key: {{ .Values.channels.dockerMirror.name }}
+
+    Source pin (V2-1 — do not invent pull specs):
+      {{ .Values.ocMirror.sourcePullSpec }}
+
+    Incomplete ImageSet (scored — edit this, not example-imageset.yaml):
+      oc -n {{ .Values.lightwellRepo.namespace }} edit configmap {{ .Values.ocMirror.imageSet.configMapName }}
+      Replace REPLACE_ME_HUMMINGBIRD_PULLSPEC with the source pin above (digest, not :latest).
+
+    Run oc-mirror from Showroom (binary is copied onto PATH by V2-20; do not curl github.com):
+      oc -n {{ .Values.lightwellRepo.namespace }} get configmap {{ .Values.ocMirror.configMapName }} \
+        -o jsonpath='{.data.job\.yaml}' | oc create -f -
+
+    Auth: Secret {{ .Values.ocMirror.dockerSecretName }} (written by lightwell-repo-seed).
+    Workspace PVC: {{ .Values.ocMirror.workspace.pvcName }}
+    Signatures: Job does not pass --remove-signatures. oc-mirror v2 still cannot
+    land OCI referrers on Nexus 3.70 Docker dest; the Job then runs cosign copy
+    so tag-based .sig/.att/.sbom artifacts exist for dest verify (#63).
+
+    Do not apply a Job that mirrors HUMMINGBIRD_JAVA_RUNTIME at provision.
+  copy-signatures.sh: |
+{{ .Files.Get "files/oc-mirror/copy-signatures.sh" | indent 4 }}
+  example-imageset.yaml: |
+    # Worked example ONLY — different image from the scored ConfigMap.
+    # Pasting this into imageset-configuration still fails the Check.
+    kind: ImageSetConfiguration
+    apiVersion: mirror.openshift.io/v2alpha1
+    mirror:
+      additionalImages:
+        - name: registry.access.redhat.com/ubi9/ubi-minimal:latest
+  job.yaml: |
+    # Learner-started (V2-11). Not a provision hook.
+    # Requires ConfigMap {{ .Values.ocMirror.imageSet.configMapName }} (incomplete seed; learner edits first).
+    apiVersion: batch/v1
+    kind: Job
+    metadata:
+      name: oc-mirror-learner
+      namespace: {{ .Values.lightwellRepo.namespace }}
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ .Values.ocMirror.serviceAccountName }}
+          {{- if .Values.ocMirror.workspace.fsGroup }}
+          # #60: HOME/.oc-mirror must land on the PVC; fsGroup 1000 needs anyuid (restricted-v2 rejects 1000).
+          securityContext:
+            fsGroup: {{ .Values.ocMirror.workspace.fsGroup }}
+            fsGroupChangePolicy: OnRootMismatch
+          {{- end }}
+          initContainers:
+            - name: oc-mirror
+              image: {{ .Values.ocMirror.pluginImage | quote }}
+              imagePullPolicy: IfNotPresent
+              workingDir: /workspace
+              env:
+                - name: HOME
+                  value: /workspace
+                - name: DOCKER_CONFIG
+                  value: /docker
+              command: ["oc-mirror"]
+              args:
+                - -c
+                - /imageset/imageset-config.yaml
+                - --workspace
+                - file:///workspace
+                - docker://{{ $regHost }}
+                - --v2
+                - --dest-tls-verify=false
+              volumeMounts:
+                - name: docker
+                  mountPath: /docker
+                  readOnly: true
+                - name: imageset
+                  mountPath: /imageset
+                  readOnly: true
+                - name: workspace
+                  mountPath: /workspace
+          containers:
+            # #63: Nexus dest stores tag-based cosign artifacts, not OCI referrers.
+            - name: copy-signatures
+              image: {{ .Values.ocMirror.cosignImage | quote }}
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: DEST_HOST
+                  value: {{ $regHost | quote }}
+                - name: DOCKER_CONFIG
+                  value: /docker
+              command: ["/bin/bash", "/scripts/copy-signatures.sh"]
+              volumeMounts:
+                - name: docker
+                  mountPath: /docker
+                  readOnly: true
+                - name: imageset
+                  mountPath: /imageset
+                  readOnly: true
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+          volumes:
+            - name: docker
+              secret:
+                secretName: {{ .Values.ocMirror.dockerSecretName }}
+                items:
+                  - key: .dockerconfigjson
+                    path: config.json
+            - name: imageset
+              configMap:
+                name: {{ .Values.ocMirror.imageSet.configMapName }}
+                items:
+                  - key: {{ .Values.ocMirror.imageSet.key }}
+                    path: imageset-config.yaml
+            - name: workspace
+              persistentVolumeClaim:
+                claimName: {{ .Values.ocMirror.workspace.pvcName }}
+            - name: scripts
+              configMap:
+                name: {{ .Values.ocMirror.configMapName }}
+                defaultMode: 0755
+                items:
+                  - key: copy-signatures.sh
+                    path: copy-signatures.sh
+{{- end }}

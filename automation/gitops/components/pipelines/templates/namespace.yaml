@@ -1,0 +1,13 @@
+{{- if and .Values.pipelines.enabled (or .Values.verifyBaseImage.enabled .Values.conformaPolicy.enabled .Values.prefetchDependencies.enabled) }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.verifyBaseImage.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+    app.kubernetes.io/component: verify-base-image
+    argocd.argoproj.io/managed-by: {{ .Values.argocd.namespace | default "openshift-gitops" }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.tasks | quote }}
+{{- end }}

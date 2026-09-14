@@ -1,0 +1,39 @@
+{{- if and .Values.rhtpa.enabled (eq .Values.trustedProfileAnalyzer.storage.type "filesystem") .Values.trustedProfileAnalyzer.storage.bindJob }}
+---
+# WaitForFirstConsumer StorageClasses leave PVC storage Pending until a pod
+# mounts it. Off by default: Immediate RBD Binds without this Job (#101).
+# Set trustedProfileAnalyzer.storage.bindJob=true only when storageClassName
+# is empty / WaitForFirstConsumer. Do not set ttlSecondsAfterFinished — TTL
+# deletes a Completed Job and Argo recreates it into Multi-Attach.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tpa-filesystem-bind
+  namespace: {{ .Values.rhtpa.namespace }}
+  labels:
+    {{- include "rhtpa.labels" . | nindent 4 }}
+    app.kubernetes.io/component: tpa-filesystem
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.rhtpa.syncWaves.database | quote }}
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: tpa-filesystem
+        app.kubernetes.io/name: tpa-filesystem-bind
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bind
+          image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/true"]
+          volumeMounts:
+            - name: storage
+              mountPath: /data
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: storage
+{{- end }}
