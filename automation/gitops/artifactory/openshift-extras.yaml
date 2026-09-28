@@ -1,0 +1,441 @@
+# -----------------------------------------------------------------------------
+# OpenShift extras for the Artifactory OSS Helm Application.
+#
+# The chart-repo-sourced Argo Application (application-artifactory.yaml) cannot
+# carry cluster-specific manifests, so these live here. Apply BEFORE the
+# Application so the SCC grant and secrets exist before the StatefulSet pods are
+# admitted. ORDER MATTERS: apply THIS file first (it ships REPLACE_ME secret
+# stubs), THEN oc-create the real secrets so they OVERWRITE the stubs, THEN apply
+# the Application. Doing oc-create before this file would let the stubs clobber
+# your real values. See INSTALL.md for the full runbook.
+#
+#   oc create namespace artifactory --dry-run=client -o yaml | oc apply -f -
+#   oc apply -f openshift-extras.yaml                    # SCC, Route, ConfigMap, stubs
+#   # now OVERWRITE the stubs with real values (do NOT commit real values):
+#   oc -n artifactory create secret generic artifactory-admin \
+#       --from-literal=password='admin@*=<STRONG-PASSWORD>' \
+#       --dry-run=client -o yaml | oc apply -f -
+#   oc -n artifactory create secret generic artifactory-keys \
+#       --from-literal=master-key="$(openssl rand -hex 32)" \
+#       --from-literal=join-key="$(openssl rand -hex 16)" \
+#       --dry-run=client -o yaml | oc apply -f -
+#   oc -n artifactory create secret generic artifactory-postgresql \
+#       --from-literal=postgres-password="$(openssl rand -hex 16)" \
+#       --from-literal=password="$(openssl rand -hex 16)" \
+#       --dry-run=client -o yaml | oc apply -f -
+#   oc apply -f application-artifactory.yaml
+#
+# NOTE ON SCC (verified against chart 107.161.26 on cluster-6jnws): the pods set
+# BOTH a fixed non-root uid (StatefulSet 1030, frontend 1031, jfbus 1127) AND
+# `seccompProfile: RuntimeDefault`. No stock SCC allows both:
+#   * restricted-v2 permits RuntimeDefault seccomp but rejects the fixed uids
+#     (MustRunAsRange to the namespace range);
+#   * anyuid permits any uid but has empty seccompProfiles, so it rejects the
+#     seccomp profile ("seccomp may not be set") and is filtered out entirely.
+# So we ship a custom SCC (= anyuid + seccompProfiles:[runtime/default]) scoped
+# to the two ServiceAccounts the pods run under (StatefulSet -> `artifactory`;
+# frontend/jfbus -> the namespace `default` SA). SCC is CLUSTER-SCOPED.
+# -----------------------------------------------------------------------------
+---
+# Admin bootstrap credential. The chart mounts this VERBATIM as
+# access/bootstrap.creds, so the `password` key MUST be bootstrap.creds format:
+#   admin@*=<PASSWORD>
+# Ships as REPLACE_ME -- DO NOT commit a real secret; prefer `oc create secret`
+# (see header) or an ExternalSecret. This stub only documents the shape.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: artifactory-admin
+  namespace: artifactory
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+type: Opaque
+stringData:
+  password: "admin@*=REPLACE_ME"
+---
+# Mandatory Artifactory master + join keys (new JFbus/Frontend services require
+# them). master-key = 32 bytes hex (openssl rand -hex 32); join-key = 16 bytes
+# hex (openssl rand -hex 16). Ships as REPLACE_ME -- DO NOT commit real values.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: artifactory-keys
+  namespace: artifactory
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+type: Opaque
+stringData:
+  master-key: REPLACE_ME
+  join-key: REPLACE_ME
+---
+# Pinned PostgreSQL credentials for the bundled bitnami subchart.
+# The Application sets postgresql.auth.existingSecret=artifactory-postgresql so
+# that BOTH bitnami PostgreSQL and Artifactory read stable creds from here. If
+# this secret is absent, bitnami generates a RANDOM password into a secret of
+# this same name on EVERY Helm render; an Argo CD re-sync then rewrites it while
+# the postgres data dir still holds the ORIGINAL password ->
+# "password authentication failed for user artifactory" and a crashloop.
+# Keys are what bitnami + the chart expect:
+#   postgres-password = the postgres superuser password
+#   password          = the `artifactory` app-user password
+# Ships as REPLACE_ME -- DO NOT commit real values. Create the real secret with:
+#   oc -n artifactory create secret generic artifactory-postgresql \
+#     --from-literal=postgres-password="$(openssl rand -hex 16)" \
+#     --from-literal=password="$(openssl rand -hex 16)" \
+#     --dry-run=client -o yaml | oc apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: artifactory-postgresql
+  namespace: artifactory
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+type: Opaque
+stringData:
+  postgres-password: REPLACE_ME
+  password: REPLACE_ME
+---
+# Custom SCC: anyuid (any UID/GID) PLUS the RuntimeDefault seccomp profile the
+# JFrog chart requires. Granted directly to the two ServiceAccounts the pods run
+# under (SCC is cluster-scoped, so the grant is via .users, not a RoleBinding).
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: artifactory-scc
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    kubernetes.io/description: >-
+      Like anyuid (any UID/GID) but also permits the RuntimeDefault seccomp
+      profile set by the JFrog Artifactory chart. Scoped to the Artifactory
+      ServiceAccounts.
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegeEscalation: true
+allowPrivilegedContainer: false
+allowedCapabilities: null
+defaultAddCapabilities: null
+fsGroup:
+  type: RunAsAny
+priority: 10
+readOnlyRootFilesystem: false
+requiredDropCapabilities:
+  - MKNOD
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  # RunAsAny (not anyuid's MustRunAs): the bundled postgres pod sets an empty
+  # seLinuxOptions.level, which MustRunAs rejects. RunAsAny lets the node assign.
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+supplementalGroups:
+  type: RunAsAny
+users:
+  - system:serviceaccount:artifactory:artifactory              # StatefulSet (uid 1030)
+  - system:serviceaccount:artifactory:default                  # frontend (1031) + jfbus (1127)
+  - system:serviceaccount:artifactory:artifactory-postgresql   # bundled PostgreSQL (uid 1001)
+volumes:
+  - configMap
+  - csi
+  - downwardAPI
+  - emptyDir
+  - ephemeral
+  - image
+  - persistentVolumeClaim
+  - projected
+  - secret
+---
+# Edge-terminated Route to the JFrog unified port (8082 serves the UI + the
+# /artifactory REST API via the router). Service name/port verified against the
+# rendered chart: Service `artifactory`, ClusterIP, ports 8082 + 8081 (unnamed,
+# so a numeric targetPort is correct).
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: artifactory
+  namespace: artifactory
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  to:
+    kind: Service
+    name: artifactory
+    weight: 100
+  port:
+    targetPort: 8082          # router/jfrog unified port (UI + REST)
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+---
+# Repository bootstrap for Artifactory OSS 7.161.
+#
+# WHY THIS EXISTS: on OSS the repository management REST/UI APIs
+# (PUT/POST /api/repositories/{key}, /ui/api/v1/ui/repositories/{type}) are all
+# Pro-gated ("This REST API is available only in Artifactory Pro"), and 7.161
+# also moved repositories OUT of the config descriptor (artifactory.config.xml)
+# into a separate JSON store -- so importing repos via the descriptor is rejected
+# ("config descriptor contains old repositories configuration, please use the new
+# repositories export format instead"). The ONLY unguarded way to preconfigure
+# repos on OSS is the first-boot bootstrap importer, which reads
+#   etc/artifactory/artifactory.repository.config.import.json
+# (deserialized to org.artifactory.model.AggregatedReposConfig) and imports it
+# when only the default repos exist. The chart delivers this file via
+# artifactory.artifactory.configMapName + copyOnEveryStartup (see
+# application-artifactory.yaml).
+#
+# Defines two REMOTE Maven proxies (lightwell-validated, lightwell-remediated)
+# and a VIRTUAL Maven repo (lightwell) aggregating them. Point Maven at
+#   <route>/artifactory/lightwell
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifactory-repo-bootstrap
+  namespace: artifactory
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+data:
+  artifactory.repository.config.import.json: |
+    {
+      "localRepoConfigs": [],
+      "federatedRepoConfigs": [],
+      "releaseBundleRepoConfigs": [],
+      "remoteRepoConfigs": [
+        {
+          "type": "remote",
+          "key": "lightwell-validated",
+          "packageType": "maven",
+          "baseConfig": {
+            "modelVersion": 2,
+            "description": "Proxy: Lightwell validated Java packages",
+            "repoLayoutRef": "maven-2-default",
+            "includesPattern": "**/*",
+            "federationConfig": {
+              "federationOnGrid": false,
+              "members": [],
+              "modificationDate": 0,
+              "federated": false
+            }
+          },
+          "repoTypeConfig": {
+            "url": "https://packages.redhat.com/lightwell/public-lightwell-demo/java/validated/",
+            "offline": false,
+            "blackedOut": false,
+            "archiveBrowsingEnabled": false,
+            "storeArtifactsLocally": true,
+            "hardFail": false,
+            "propertySetRefs": [],
+            "downloadRedirectConfig": {
+              "enabled": false
+            },
+            "checksumPolicyType": "generate-if-absent",
+            "retrievalCachePeriodSecs": 7200,
+            "assumedOfflinePeriodSecs": 300,
+            "missedRetrievalCachePeriodSecs": 1800,
+            "metadataRetrievalTimeoutSecs": 60,
+            "unusedArtifactsCleanupPeriodHours": 0,
+            "socketTimeoutMillis": 15000,
+            "enableCookieManagement": false,
+            "allowAnyHostAuth": false,
+            "shareConfiguration": false,
+            "synchronizeProperties": false,
+            "listRemoteFolderItems": true,
+            "blockMismatchingMimeTypes": true,
+            "bypassHeadRequests": false,
+            "priorityResolution": false,
+            "handleReleases": true,
+            "handleSnapshots": true,
+            "maxUniqueSnapshots": 0,
+            "suppressPomConsistencyChecks": false
+          },
+          "packageTypeConfig": {},
+          "securityConfig": {
+            "hideUnauthorizedResources": false,
+            "signedUrlTtl": 90
+          },
+          "repoType": "REMOTE"
+        },
+        {
+          "type": "remote",
+          "key": "lightwell-remediated",
+          "packageType": "maven",
+          "baseConfig": {
+            "modelVersion": 2,
+            "description": "Proxy: Lightwell remediated Java packages",
+            "repoLayoutRef": "maven-2-default",
+            "includesPattern": "**/*",
+            "federationConfig": {
+              "federationOnGrid": false,
+              "members": [],
+              "modificationDate": 0,
+              "federated": false
+            }
+          },
+          "repoTypeConfig": {
+            "url": "https://packages.redhat.com/lightwell/public-lightwell-demo/java/remediated/",
+            "offline": false,
+            "blackedOut": false,
+            "archiveBrowsingEnabled": false,
+            "storeArtifactsLocally": true,
+            "hardFail": false,
+            "propertySetRefs": [],
+            "downloadRedirectConfig": {
+              "enabled": false
+            },
+            "checksumPolicyType": "generate-if-absent",
+            "retrievalCachePeriodSecs": 7200,
+            "assumedOfflinePeriodSecs": 300,
+            "missedRetrievalCachePeriodSecs": 1800,
+            "metadataRetrievalTimeoutSecs": 60,
+            "unusedArtifactsCleanupPeriodHours": 0,
+            "socketTimeoutMillis": 15000,
+            "enableCookieManagement": false,
+            "allowAnyHostAuth": false,
+            "shareConfiguration": false,
+            "synchronizeProperties": false,
+            "listRemoteFolderItems": true,
+            "blockMismatchingMimeTypes": true,
+            "bypassHeadRequests": false,
+            "priorityResolution": false,
+            "handleReleases": true,
+            "handleSnapshots": true,
+            "maxUniqueSnapshots": 0,
+            "suppressPomConsistencyChecks": false
+          },
+          "packageTypeConfig": {},
+          "securityConfig": {
+            "hideUnauthorizedResources": false,
+            "signedUrlTtl": 90
+          },
+          "repoType": "REMOTE"
+        },
+        {
+          "type": "remote",
+          "key": "maven-central",
+          "packageType": "maven",
+          "baseConfig": {
+            "modelVersion": 2,
+            "description": "Proxy: Maven Central (repo.maven.apache.org)",
+            "repoLayoutRef": "maven-2-default",
+            "includesPattern": "**/*",
+            "federationConfig": {
+              "federationOnGrid": false,
+              "members": [],
+              "modificationDate": 0,
+              "federated": false
+            }
+          },
+          "repoTypeConfig": {
+            "url": "https://repo.maven.apache.org/maven2/",
+            "offline": false,
+            "blackedOut": false,
+            "archiveBrowsingEnabled": false,
+            "storeArtifactsLocally": true,
+            "hardFail": false,
+            "propertySetRefs": [],
+            "downloadRedirectConfig": {
+              "enabled": false
+            },
+            "checksumPolicyType": "generate-if-absent",
+            "retrievalCachePeriodSecs": 7200,
+            "assumedOfflinePeriodSecs": 300,
+            "missedRetrievalCachePeriodSecs": 1800,
+            "metadataRetrievalTimeoutSecs": 60,
+            "unusedArtifactsCleanupPeriodHours": 0,
+            "socketTimeoutMillis": 15000,
+            "enableCookieManagement": false,
+            "allowAnyHostAuth": false,
+            "shareConfiguration": false,
+            "synchronizeProperties": false,
+            "listRemoteFolderItems": true,
+            "blockMismatchingMimeTypes": true,
+            "bypassHeadRequests": false,
+            "priorityResolution": false,
+            "handleReleases": true,
+            "handleSnapshots": false,
+            "maxUniqueSnapshots": 0,
+            "suppressPomConsistencyChecks": false
+          },
+          "packageTypeConfig": {},
+          "securityConfig": {
+            "hideUnauthorizedResources": false,
+            "signedUrlTtl": 90
+          },
+          "repoType": "REMOTE"
+        }
+      ],
+      "virtualRepoConfigs": [
+        {
+          "type": "virtual",
+          "key": "lightwell",
+          "packageType": "maven",
+          "baseConfig": {
+            "modelVersion": 2,
+            "description": "Aggregates the Lightwell validated + remediated proxies",
+            "repoLayoutRef": "maven-2-default",
+            "includesPattern": "**/*",
+            "federationConfig": {
+              "federationOnGrid": false,
+              "members": [],
+              "modificationDate": 0,
+              "federated": false
+            }
+          },
+          "repoTypeConfig": {
+            "repositoryRefs": [
+              "lightwell-validated",
+              "lightwell-remediated",
+              "maven-central"
+            ],
+            "artifactoryRequestsCanRetrieveRemoteArtifacts": false,
+            "virtualCacheConfig": {
+              "virtualRetrievalCachePeriodSecs": 7200
+            }
+          },
+          "packageTypeConfig": {},
+          "securityConfig": {
+            "hideUnauthorizedResources": false,
+            "signedUrlTtl": 90
+          },
+          "repoType": "VIRTUAL"
+        },
+        {
+          "type": "virtual",
+          "key": "maven",
+          "packageType": "maven",
+          "baseConfig": {
+            "modelVersion": 2,
+            "description": "Aggregates Lightwell validated + remediated + Maven Central",
+            "repoLayoutRef": "maven-2-default",
+            "includesPattern": "**/*",
+            "federationConfig": {
+              "federationOnGrid": false,
+              "members": [],
+              "modificationDate": 0,
+              "federated": false
+            }
+          },
+          "repoTypeConfig": {
+            "repositoryRefs": [
+              "lightwell-validated",
+              "lightwell-remediated",
+              "maven-central"
+            ],
+            "artifactoryRequestsCanRetrieveRemoteArtifacts": false,
+            "virtualCacheConfig": {
+              "virtualRetrievalCachePeriodSecs": 7200
+            }
+          },
+          "packageTypeConfig": {},
+          "securityConfig": {
+            "hideUnauthorizedResources": false,
+            "signedUrlTtl": 90
+          },
+          "repoType": "VIRTUAL"
+        }
+      ]
+    }

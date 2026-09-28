@@ -24,3 +24,20 @@ https://docs.redhat.com/en/documentation/red_hat_advanced_developer_suite_-_soft
 
 
 # Setup Guide  
+
+
+## OpenShift Gitops Operator
+
+
+
+## Helm Install of App-of-Apps
+
+```
+helm upgrade ssc-demo . --set deployer.apiURL=<OCP API endpoint> --set deployer.domain=<OCP apps domain>  
+```
+
+Example:
+```
+```
+
+
