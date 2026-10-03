@@ -56,7 +56,7 @@ spec:
           # ones disabled by default; osv-github and cve are enabled already.
           env:
             - name: IMPORTERS
-              value: "redhat-sboms redhat-csaf"
+              value: "redhat-csaf"
             # DEV/DEMO ONLY: set to "true" if the RHTPA/OIDC routes use a cert not
             # in the image trust store (self-signed workshop ingress). Leave unset
             # to verify TLS.

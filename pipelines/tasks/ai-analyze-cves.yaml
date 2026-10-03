@@ -124,7 +124,7 @@ spec:
           value: $(results.ISSUES_DIR.path)
       script: |
         #!/usr/bin/env python3
-        import json, os, re, sys
+        import json, os, random, re, sys, time
 
         provider = os.environ.get("AI_PROVIDER", "anthropic")
         model = os.environ.get("AI_MODEL", "claude-opus-5")
@@ -146,6 +146,15 @@ spec:
         # well within MAX_TOKENS and let a failed batch retry without losing the rest.
         MAX_TOKENS = int(os.environ.get("AI_ANALYZE_MAX_TOKENS", "8000"))
         BATCH_SIZE = int(os.environ.get("AI_ANALYZE_BATCH_SIZE", "12"))
+        # Retry/backoff for provider throttling. LiteLLM/Vertex-backed gateways
+        # (e.g. gpt-oss-120b) return HTTP 429 (RESOURCE_EXHAUSTED, "too many
+        # concurrent requests") under load; without backoff a single 429 crashes
+        # the whole task and discards every batch already analyzed. Retry each
+        # model call with exponential backoff, and pause between batches to stay
+        # under the throttle. Override via ai-agent-config.
+        MODEL_MAX_RETRIES = int(os.environ.get("AI_MODEL_MAX_RETRIES", "5"))
+        RETRY_BASE_SECS = float(os.environ.get("AI_RETRY_BASE_SECS", "5"))
+        BATCH_PAUSE_SECS = float(os.environ.get("AI_BATCH_PAUSE_SECS", "3"))
 
         def read_json(path, default):
             try:
@@ -265,14 +274,20 @@ spec:
         # ---- Build the provider-appropriate client ----
         family = "openai" if provider == "openai" else "anthropic"
         if family == "openai":
-            from openai import OpenAI
+            from openai import (OpenAI, RateLimitError, APIConnectionError,
+                                APITimeoutError, InternalServerError)
             oai = OpenAI(
                 base_url=(os.environ.get("AI_BASE_URL") or None),
                 api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
                 http_client=_http_client("openai"),
             )
+            # Transient errors worth backing off + retrying (vs. a hard 400).
+            RETRYABLE = (RateLimitError, APIConnectionError, APITimeoutError,
+                         InternalServerError)
         else:
             import anthropic
+            RETRYABLE = (anthropic.RateLimitError, anthropic.APIConnectionError,
+                         anthropic.APITimeoutError, anthropic.InternalServerError)
             if provider == "bedrock":
                 from anthropic import AnthropicBedrockMantle
                 client = AnthropicBedrockMantle(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
@@ -412,6 +427,24 @@ spec:
                       "or lower AI_ANALYZE_BATCH_SIZE." % MAX_TOKENS, file=sys.stderr)
             return "".join(b.text for b in resp.content if b.type == "text")
 
+        # Wrap every model call so a provider throttle (429 / RESOURCE_EXHAUSTED)
+        # or a dropped connection backs off and retries instead of crashing the
+        # task and losing the batches already analyzed.
+        def _call_with_backoff(user):
+            for attempt in range(1, MODEL_MAX_RETRIES + 1):
+                try:
+                    return call_model(user)
+                except RETRYABLE as e:
+                    if attempt == MODEL_MAX_RETRIES:
+                        print("model call failed after %d attempts: %s"
+                              % (attempt, e), file=sys.stderr)
+                        raise
+                    wait = RETRY_BASE_SECS * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    print("transient model error (%s); backing off %.1fs then "
+                          "retry %d/%d" % (type(e).__name__, wait, attempt + 1,
+                                           MODEL_MAX_RETRIES), file=sys.stderr)
+                    time.sleep(wait)
+
         # Accept {"decisions": [...]} OR a bare [...] (some backends drop the
         # wrapper). Always returns a list (possibly empty).
         def _extract_decisions(t):
@@ -462,7 +495,7 @@ spec:
                   % (tag, len(items), len(mf_b), len(vuln_b), len(report)), file=sys.stderr)
             last = ""
             for attempt in (1, 2):
-                last = call_model(user_b)
+                last = _call_with_backoff(user_b)
                 decs = _extract_decisions(last)
                 if decs:
                     return decs
@@ -478,11 +511,14 @@ spec:
             print("Analyzing %d must-fix CVEs in %d batch(es) of up to %d."
                   % (len(mustfix_arr), len(batches), BATCH_SIZE), file=sys.stderr)
             for i, b in enumerate(batches, 1):
+                # Pace requests so we don't trip the gateway's concurrency throttle.
+                if i > 1 and BATCH_PAUSE_SECS > 0:
+                    time.sleep(BATCH_PAUSE_SECS)
                 decisions_in += analyze_batch(b, "batch %d/%d" % (i, len(batches)))
         else:
             # Must-fix wasn't a JSON array we could split; try one whole-list call.
             vuln_all = _cap(_trim_vuln(vuln_raw, ids), VULN_CHAR_BUDGET)
-            decisions_in = _extract_decisions(call_model(build_user(mustfix, vuln_all)))
+            decisions_in = _extract_decisions(_call_with_backoff(build_user(mustfix, vuln_all)))
 
         if not decisions_in:
             print("No decisions returned by the model for any batch.", file=sys.stderr)
