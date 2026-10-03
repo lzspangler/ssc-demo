@@ -397,7 +397,7 @@ enable.
 | `gitlab-webhook-secret` (key `secretToken`) | Shared token the `gitlab` interceptor checks against GitLab's `X-Gitlab-Token`. |
 | `git-auth` (Secret) | **Private repos only** — clone credentials. Not bound by either template by default (see the note at the end of this section); a public app repo needs none. |
 | `scm-auth-secret` (Secret) | SCM token to open the MR (`api` scope on GitLab). |
-| `maven-settings` (ConfigMap) | Maven settings for the verify build. |
+| `maven-settings` (Secret) | Maven `settings.xml` for the build — mirrors all resolution through the Artifactory `maven` virtual repo. A **Secret** (not a ConfigMap) because Artifactory OSS has anonymous access off, so the settings.xml embeds a `<server>` credential. See `secrets/maven-settings-secret.example.yaml`. |
 | `ai-agent-config` + `ai-agent-secret` | AI backend config (as for the other pipelines). |
 
 **4. Apply the trigger stack** (one file — ServiceAccount, RBAC, TriggerBinding,
@@ -460,9 +460,14 @@ an `emptyDir` suffices and matches how the manual runs are launched. It is
 deliberately **not** a ConfigMap: a configMap-backed workspace whose ConfigMap
 doesn't exist leaves the `package`/`re-run-tests` pod stuck in `PodInitializing`
 forever (never an error, just hangs — the same trap as a missing `git-auth` Secret,
-below). For a private Maven mirror, create a `maven-settings` ConfigMap and swap the
-binding for `configMap: {name: maven-settings}` (a commented example sits in both
-templates). Neither binds `git-auth`: it's an
+below). To route the build through the **Artifactory `maven` virtual repo**, create
+the `maven-settings` **Secret** (`secrets/maven-settings-secret.example.yaml` — a
+`settings.xml` with a `<mirror>`/`<server>` pair) and bind it as
+`secret: {secretName: maven-settings}` (or, on a manual run,
+`-w name=maven-settings,secret=maven-settings`). It must be a Secret rather than a
+ConfigMap because Artifactory OSS has anonymous access off, so `settings.xml` carries
+credentials; the same missing-backing `PodInitializing` hang applies, so create the
+Secret before binding it. Neither binds `git-auth`: it's an
 optional pipeline workspace, and a secret-backed workspace whose Secret is missing
 leaves the clone pod stuck in `PodInitializing` forever (never an error, just
 hangs), which can't be bound conditionally in a TriggerTemplate. A public app repo

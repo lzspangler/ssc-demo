@@ -1,0 +1,144 @@
+# -----------------------------------------------------------------------------
+# Argo CD Application: JFrog Artifactory OSS via the official Helm chart.
+#
+# The Application's source is the JFrog Helm CHART REPO directly (no git vendoring
+# of the chart). Because a chart-repo source can't also carry our own manifests,
+# the OpenShift extras (custom SCC, admin/keys Secrets, Route) AND the repository
+# bootstrap ConfigMap live in a sibling file:
+#   - openshift-extras.yaml      (apply BEFORE this Application)
+#
+# The Lightwell remote/virtual Maven repos are preconfigured via the first-boot
+# bootstrap importer, NOT a REST Job: on OSS 7.161 every repo-management REST/UI
+# endpoint is Pro-gated, so a REST bootstrap Job cannot create repos here. See
+# README.md and the configMapName/copyOnEveryStartup wiring below.
+#
+# PREREQS:
+#   * OpenShift GitOps (openshift-gitops / Argo CD) installed.
+#   * `oc apply -f openshift-extras.yaml` first, so the Secrets, the custom SCC
+#     and the repo-bootstrap ConfigMap exist before the StatefulSet pods start.
+#
+# VERIFIED against chart 107.161.26 (app 7.161.26) on 2026-09-27:
+#   * artifactory-oss is an UMBRELLA chart: every value is nested under a
+#     top-level `artifactory:` key (hence the double `artifactory.artifactory`).
+#   * Artifactory 7.161 HARD-REJECTS embedded Derby (DbTypeNotAllowedException)
+#     regardless of allowNonPostgresql, so the bundled PostgreSQL subchart is
+#     REQUIRED (postgresql.enabled=true). For prod, use an external DB.
+#   * masterKey + joinKey are MANDATORY in this chart (new JFbus/Frontend
+#     services); sourced from Secret `artifactory-keys` (keys master-key,
+#     join-key) in openshift-extras.yaml.
+#   * admin.secret/dataKey mounts the secret VERBATIM as access/bootstrap.creds,
+#     so that key must be in bootstrap.creds format: `admin@*=<PASSWORD>`.
+#   * Rendered Service is `artifactory` on ports 8082 (router/REST+UI) + 8081.
+#   * StatefulSet runs uid 1030, frontend Deployment 1031, jfbus 1127 -- all
+#     fixed non-root uids that restricted-v2 rejects => anyuid is REQUIRED. The
+#     StatefulSet uses SA `artifactory`; frontend/jfbus use the `default` SA, so
+#     openshift-extras.yaml grants anyuid to BOTH.
+# -----------------------------------------------------------------------------
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: artifactory
+  namespace: openshift-gitops
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  project: default
+  source:
+    repoURL: https://charts.jfrog.io
+    chart: artifactory-oss
+    targetRevision: "107.161.26"   # latest as of 2026-09-27
+    helm:
+      releaseName: artifactory
+      # NOTE the umbrella nesting: everything sits under a top-level `artifactory:`.
+      valuesObject:
+        artifactory:
+          # Expose via an OpenShift Route (openshift-extras.yaml), not the chart's
+          # bundled nginx LoadBalancer.
+          nginx:
+            enabled: false
+          # Artifactory 7.161 HARD-REJECTS the embedded Derby DB
+          # (DbTypeNotAllowedException) regardless of allowNonPostgresql, so the
+          # bundled PostgreSQL subchart is required. It runs as SA
+          # `artifactory-postgresql` (uid 1001 + seccomp) -> also covered by the
+          # custom SCC in openshift-extras.yaml. For prod, use an external DB.
+          postgresql:
+            enabled: true
+            # PIN the DB credentials to a pre-created Secret (openshift-extras.yaml).
+            # CRITICAL: without this, the bundled bitnami PostgreSQL generates a
+            # RANDOM password into Secret `artifactory-postgresql` on every Helm
+            # render. An Argo CD re-sync then rewrites the Secret while the postgres
+            # data dir still holds the ORIGINAL password -> "password authentication
+            # failed for user artifactory" and a topology/artifactory crashloop.
+            # existingSecret makes both bitnami and Artifactory read stable creds
+            # (keys: postgres-password, password) that Argo CD never regenerates.
+            auth:
+              username: artifactory
+              database: artifactory
+              existingSecret: artifactory-postgresql
+          # Deterministic SA name so the anyuid RoleBinding can target it.
+          # (Only the StatefulSet uses it; frontend/jfbus use `default`.)
+          serviceAccount:
+            create: true
+            name: artifactory
+          artifactory:
+            # Mandatory unique keys, sourced from a Secret (openshift-extras.yaml).
+            masterKeySecretName: artifactory-keys   # expects key: master-key
+            joinKeySecretName: artifactory-keys     # expects key: join-key
+            # Seed the initial admin password. The secret's `password` key is
+            # mounted verbatim as access/bootstrap.creds, so it MUST be in
+            # bootstrap.creds format: `admin@*=<PASSWORD>`.
+            admin:
+              secret: artifactory-admin
+              dataKey: password
+            # Preconfigure the Lightwell repos via the FIRST-BOOT bootstrap
+            # importer. On OSS 7.161 every repo-management REST/UI endpoint is
+            # Pro-gated, and repos were moved out of the config descriptor, so the
+            # only unguarded path is dropping
+            #   etc/artifactory/artifactory.repository.config.import.json
+            # (an org.artifactory.model.AggregatedReposConfig) before startup; it
+            # is imported when only the default repos exist. The chart mounts our
+            # ConfigMap (openshift-extras.yaml) at /bootstrap, copies it to
+            # /artifactory_bootstrap, and copyOnEveryStartup then lands it in
+            # etc/artifactory (persistence.mountPath = /var/opt/jfrog/artifactory).
+            configMapName: artifactory-repo-bootstrap
+            copyOnEveryStartup:
+              - source: /artifactory_bootstrap/artifactory.repository.config.import.json
+                target: etc/artifactory/
+            persistence:
+              enabled: true
+              size: 20Gi
+              # Cluster default is ocs-external-storagecluster-ceph-rbd (RWO); set
+              # explicitly if you don't want the default:
+              # storageClassName: ocs-external-storagecluster-ceph-rbd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: artifactory
+  # The StatefulSet shows a PERMANENT (but harmless) OutOfSync: the pod never
+  # rolls (currentRevision stays put, 0 restarts across syncs). Two causes, both
+  # cosmetic under our required ServerSideApply=true:
+  #   1. `checksum/artifactory-unified-secret` pod-template annotation -- the
+  #      chart recomputes it at render time, and Argo CD's repo-server renders
+  #      with `helm template` (no cluster `lookup`), so it never matches live.
+  #   2. Kubernetes server-defaulted fields that the API adds to the live STS but
+  #      that the rendered manifest omits (volumeClaimTemplates status/volumeMode,
+  #      podManagementPolicy, revisionHistoryLimit, PVC retention policy). SSA
+  #      doesn't normalize these the way client-side apply does.
+  # Ignoring them makes the app report Synced without suppressing real drift; the
+  # actual runtime config still comes from the (Synced) unified secret.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      name: artifactory
+      jsonPointers:
+        - /spec/template/metadata/annotations/checksum~1artifactory-unified-secret
+        - /spec/volumeClaimTemplates
+        - /spec/podManagementPolicy
+        - /spec/revisionHistoryLimit
+        - /spec/persistentVolumeClaimRetentionPolicy
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true    # JFrog objects are large; SSA avoids annotation limits
