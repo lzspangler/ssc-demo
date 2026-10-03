@@ -1,0 +1,57 @@
+# Pre-warms the large (~1.8 GB) ai-agent image onto every node so Tekton steps
+# that run in it (open-cve-issues, open-pr-*, ai-remediate-*) never fetch it from
+# the external Quay CDN at task time. That matters because a single transient CDN
+# blob read (the "cdn01.quay.io ... EOF" error) puts the pod in ImagePullBackOff,
+# and Tekton fails the TaskRun on ImagePullBackOff WITHOUT waiting for kubelet's
+# successful retry. With the image already present (fixed tag => IfNotPresent),
+# the step's pull is a no-op and can't flake.
+#
+#   oc -n tssc-app-ci apply -f ai-agent-image-prewarm-daemonset.yaml
+#   oc -n tssc-app-ci rollout status ds/ai-agent-image-prewarm   # wait: all nodes Ready
+#
+# Keep it running to stay warm across node reboots/new nodes; delete it if you'd
+# rather not hold the image resident on every node. Bump the `image` tag whenever
+# the tasks' GIT_IMAGE / agent image tag changes.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ai-agent-image-prewarm
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+    app.kubernetes.io/component: image-prewarm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-agent-image-prewarm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai-agent-image-prewarm
+    spec:
+      # Warm ALL nodes, including control-plane (this cluster schedules workloads
+      # there — the failed pod ran on control-plane-cluster-6jnws-2).
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 1
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hold
+          image: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+          imagePullPolicy: IfNotPresent
+          # Just keep the image resident; do nothing.
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          resources:
+            requests:
+              cpu: 1m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
