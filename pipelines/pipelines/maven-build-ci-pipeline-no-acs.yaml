@@ -247,6 +247,10 @@ spec:
       params:
         - name: COMPONENT_NAME
           value: $(params.component-name)
+        # Scope the fix-version scan to the PURLs that actually have findings,
+        # rather than every component in the SBOM.
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(tasks.rhtpa-vulnerability-analysis.results.VULNERABILITY_REPORT)
         - name: SBOMS_DIR
           value: $(params.sboms-dir)
         - name: TRUSTIFICATION_SECRET_NAME

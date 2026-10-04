@@ -11,7 +11,8 @@ spec:
   description: >-
     Ask the AI to choose exactly ONE dependency vulnerability to remediate, given
     the RHTPA vulnerability-analysis report (authoritative CVE/severity/affected
-    PURL source), the RHTPA remediation (recommend) report (supplemental), the
+    PURL source), the RHTPA remediation report (authoritative fix versions,
+    backports first), the
     Conforma must-fix set (policy gate), and a user-defined policy (free-form
     context). Emits the decision as small Tekton results. Backend is pluggable via
     ai-agent-config / ai-agent-secret; runtime via AI_PYTHON_IMAGE.
@@ -26,8 +27,10 @@ spec:
     - name: REMEDIATION_REPORT_PATH
       type: string
       description: >-
-        Absolute path (on the workspace) to the RHTPA remediation (recommend)
-        JSON. Supplemental only; often empty for upstream-only Maven deps.
+        Absolute path (on the workspace) to the RHTPA remediation JSON. Its
+        `.fix_versions` is the authoritative per-(PURL, CVE) candidate list,
+        ordered backports first; `.recommendations` (the /purl/recommend
+        lookup) is supplemental and often empty for upstream-only Maven deps.
       default: ""
     - name: MUST_FIX_PATH
       type: string
@@ -38,9 +41,13 @@ spec:
       description: User-defined prioritization policy (natural language).
       default: >-
         Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
-        version. Avoid major-version bumps unless required to obtain the fix.
-        Never select a CVE without a concrete fixed version. Prefer changes that
-        touch a single dependency.
+        version. Never select a CVE without a concrete fixed version. Prefer
+        changes that touch a single dependency. When a BACKPORT is available --
+        a build that keeps the current base version and appends a vendor suffix,
+        such as 3.14.0 -> 3.14.0.rhlw-00001 -- prefer it over any version bump:
+        it carries the fix with no API change and so is the lowest-risk upgrade.
+        Otherwise take the lowest version that resolves the CVE, and avoid
+        major-version bumps unless they are required to obtain the fix.
     - name: AI_PYTHON_IMAGE
       type: string
       description: Image with the Anthropic Python SDK installed.
@@ -205,9 +212,38 @@ spec:
                 return s
             return s[:limit] + "\n...[truncated %d chars to fit the model context]..." % (len(s) - limit)
 
+        def _trim_report(raw, ids):
+            # The remediation report's '.fix_versions' is the authoritative
+            # candidate list (rhtpa-remediation-report resolved every known
+            # sibling version of each affected PURL against RHTPA). Keep only
+            # the must-fix CVEs so the char budget can never truncate it away,
+            # and drop '.recommendations' entirely when it is empty -- which it
+            # usually is, since /purl/recommend only covers Red Hat rebuilds.
+            try:
+                r = json.loads(raw)
+            except Exception:
+                return raw
+            if not isinstance(r, dict):
+                return raw
+            idset = set(ids)
+            toks = _cve_toks(ids)
+            def match(cid):
+                return isinstance(cid, str) and (cid in idset or cid.upper() in toks)
+            fixes = {}
+            for purl, by_cve in (r.get("fix_versions") or {}).items():
+                if not isinstance(by_cve, dict):
+                    continue
+                kept = {c: v for c, v in by_cve.items() if match(c)}
+                if kept:
+                    fixes[purl] = kept
+            out = {"fix_versions": fixes}
+            if r.get("recommendations"):
+                out["recommendations"] = r["recommendations"]
+            return json.dumps(out)
+
         ids = _mustfix_ids(mustfix)
         vuln = _cap(_trim_vuln(vuln, ids), VULN_CHAR_BUDGET)
-        report = _cap(report, REPORT_CHAR_BUDGET)
+        report = _cap(_trim_report(report, ids), REPORT_CHAR_BUDGET)
         print("prompt sizes (chars): mustfix=%d vuln=%d report=%d"
               % (len(mustfix), len(vuln), len(report)), file=sys.stderr)
 
@@ -292,7 +328,12 @@ spec:
                 "package": {"type": "string",
                             "description": "Maven groupId:artifactId to update"},
                 "current_version": {"type": "string"},
-                "fixed_version": {"type": "string"},
+                "fixed_version": {"type": "string",
+                                  "description": "The version to upgrade to: the "
+                                  "backport from .fix_versions if one exists (same "
+                                  "base version plus a vendor suffix, e.g. "
+                                  "3.14.0.rhlw-00001), otherwise the lowest version "
+                                  "on the same release line that resolves the CVE"},
                 "justification": {"type": "string"},
             },
         }
@@ -312,15 +353,26 @@ spec:
             "hints as candidates and read the title/description to pick the correct "
             "fixed version on the SAME release line as the current version:\n"
             + vuln + "\n\n"
-            "SUPPLEMENTAL -- RHTPA remediation (recommend) report. Recommended "
-            "fixed packages are PURLs; this is a Red Hat-rebuild catalog lookup and "
-            "is frequently empty for upstream-only Maven deps -- treat it as a "
-            "cross-check, not the source of truth:\n" + report + "\n\n"
+            "AUTHORITATIVE FIX VERSIONS -- RHTPA remediation report. Its "
+            "'.fix_versions' maps each affected PURL to each of its CVEs to the "
+            "versions RHTPA has confirmed resolve that CVE. These were resolved "
+            "against the live RHTPA instance (every known sibling version of the "
+            "affected PURL, re-analyzed), so PREFER THEM over anything scraped from "
+            "advisory prose. Each entry carries 'version', 'cleared_by' (advisories "
+            "explicitly marking it fixed/not_affected; empty means it simply falls "
+            "outside the vulnerable range) and 'backport' (true when it keeps the "
+            "current base version and only adds a vendor suffix, e.g. 6.0.3 -> "
+            "6.0.3.rhlw-00001). The list is already ordered backports first, and A "
+            "BACKPORT IS THE PREFERRED FIX: it carries the patch with no API change. "
+            "'.recommendations', if present, is a Red Hat-rebuild catalog lookup -- "
+            "a cross-check only:\n" + report + "\n\n"
             "Select exactly ONE CVE from the must-fix set that best satisfies the "
-            "policy. Determine PACKAGE and CURRENT_VERSION from its affected_purl "
-            "and the FIXED_VERSION from the analyze findings/details as described "
-            "above. You must supply a concrete fixed version; if you cannot "
-            "confidently determine one for any must-fix CVE, set selected=false.\n\n"
+            "policy. Determine PACKAGE and CURRENT_VERSION from its affected_purl. "
+            "For FIXED_VERSION, use '.fix_versions' for that PURL and CVE when it has "
+            "an entry (the backport if one is offered); fall back to the analyze "
+            "findings/details prose only when it does not. You must supply a concrete "
+            "fixed version; if you cannot confidently determine one for any must-fix "
+            "CVE, set selected=false.\n\n"
             "Every field must hold a REAL value taken from the data above -- e.g. "
             "package \"com.fasterxml.jackson.core:jackson-databind\", "
             "current_version \"2.13.2\", fixed_version \"2.13.4.2\", "

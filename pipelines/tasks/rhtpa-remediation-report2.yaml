@@ -5,7 +5,9 @@ metadata:
 spec:
   description: >-
     Query Red Hat Trusted Profile Analyzer for remediation recommendations
-    for the PURLs contained in a CycloneDX SBOM.
+    for the PURLs contained in a CycloneDX SBOM, then scan every KNOWN VERSION
+    of each still-vulnerable PURL to produce a concrete per-CVE list of fixed
+    versions (`.fix_versions`) that ai-analyze-cves can choose from.
 
   params:
     - name: COMPONENT_NAME
@@ -32,6 +34,25 @@ spec:
       type: string
       default: "128"
 
+    - name: VULNERABILITY_REPORT_PATH
+      type: string
+      default: ""
+      description: >-
+        Absolute path to rhtpa-vulnerability-analysis's report. When present,
+        the fix-version scan only visits PURLs that still have findings (so
+        already-remediated dependencies cost nothing). Defaults to
+        <workspace>/rhtpa/vulnerabilities.json; falls back to every SBOM PURL.
+
+    - name: MAX_FIX_SCAN_PURLS
+      type: string
+      default: "60"
+      description: Cap on how many vulnerable PURLs get a fix-version scan.
+
+    - name: MAX_VERSIONS_PER_PURL
+      type: string
+      default: "40"
+      description: Cap on how many sibling versions are checked per PURL.
+
   workspaces:
     - name: workspace
       description: Workspace containing the application and SBOM.
@@ -42,6 +63,9 @@ spec:
 
     - name: RECOMMENDATION_COUNT
       description: Number of remediation recommendations returned by RHTPA.
+
+    - name: FIX_VERSION_COUNT
+      description: Number of (PURL, CVE) pairs for which a concrete fixed version was found.
 
   volumes:
     - name: trustification-secret
@@ -71,6 +95,18 @@ spec:
 
         - name: BATCH_SIZE
           value: $(params.BATCH_SIZE)
+
+        - name: VULNERABILITY_REPORT_PATH
+          value: $(params.VULNERABILITY_REPORT_PATH)
+
+        - name: DEFAULT_VULNERABILITY_REPORT_PATH
+          value: $(workspaces.workspace.path)/rhtpa/vulnerabilities.json
+
+        - name: MAX_FIX_SCAN_PURLS
+          value: $(params.MAX_FIX_SCAN_PURLS)
+
+        - name: MAX_VERSIONS_PER_PURL
+          value: $(params.MAX_VERSIONS_PER_PURL)
 
       volumeMounts:
         - name: trustification-secret
@@ -139,7 +175,8 @@ spec:
             --arg component "${COMPONENT_NAME}" \
             '{
               component: $component,
-              recommendations: {}
+              recommendations: {},
+              fix_versions: {}
             }' > "${OUTPUT}"
 
           cat > "${MARKDOWN}" <<EOF
@@ -152,6 +189,7 @@ spec:
 
           printf '%s' "${OUTPUT}" > "$(results.REMEDIATION_REPORT.path)"
           printf '%s' "0" > "$(results.RECOMMENDATION_COUNT.path)"
+          printf '%s' "0" > "$(results.FIX_VERSION_COUNT.path)"
 
           exit 0
         fi
@@ -292,13 +330,240 @@ spec:
         fi
 
         #
-        # Combine the recommendations returned by each batch.
+        # FIX-VERSION SCAN
+        # ================
+        # /purl/recommend only offers candidates it can find in a vendor
+        # product catalog -- in practice a single Red Hat rebuild, often one
+        # that is still affected, and never a Lightwell `.rhlw-*` backport. It
+        # is not a reliable answer to "what should I upgrade to?".
         #
+        # So we answer that question directly. For each still-vulnerable PURL:
+        #
+        #   1. GET /api/v2/purl/{purl}             -> the CVEs affecting it
+        #   2. GET /api/v2/purl/base/{base purl}   -> every version RHTPA knows
+        #   3. GET /api/v2/purl/{base@version}     -> that version's statuses
+        #
+        # A sibling version FIXES a CVE when EITHER
+        #
+        #   * /vulnerability/analyze does not report that CVE for it -- a
+        #     straight upgrade such as 6.4.0.redhat-00003, which falls outside
+        #     the advisory's version range; or
+        #   * some advisory states `fixed` / `not_affected` for its exact PURL
+        #     -- a backport such as 6.0.3.rhlw-00001, cleared by its Lightwell
+        #     OSV record even though it still sorts inside the range.
+        #
+        # BOTH signals are needed, and the two endpoints are NOT interchangeable:
+        # analyze matches on VERSION RANGE and ignores purl qualifiers, while
+        # GET /api/v2/purl/{purl} returns statements about one EXACT qualified
+        # purl. Treating silence from the purl endpoint as "clean" is wrong --
+        # pkg:maven/com.fasterxml.woodstox/woodstox-core@6.0.3.redhat-00001 has
+        # no statuses under that unqualified spelling (the real ones hang off
+        # the ?repository_url=...&type=jar variant) yet analyze correctly reports
+        # all five CVE-2022-4015x against it. So analyze decides, and an explicit
+        # statement can override it.
+        #
+        # Candidates are ordered backports-first, so the lowest-risk option --
+        # same base version, fix backported onto it, no API change -- is the
+        # first thing ai-analyze-cves sees.
+        #
+        # NOTE a version is only knowable here if RHTPA has ingested a document
+        # containing it. For Lightwell builds that is the catalog SBOM loaded by
+        # ops/rhtpa-load-lightwell-data.sh; without it the backport is invisible.
+        #
+        VULN_REPORT="${VULNERABILITY_REPORT_PATH:-}"
+
+        if [[ -z "${VULN_REPORT}" ]]; then
+          VULN_REPORT="${DEFAULT_VULNERABILITY_REPORT_PATH}"
+        fi
+
+        if [[ -f "${VULN_REPORT}" ]]; then
+          echo "Scoping fix-version scan to PURLs with findings in ${VULN_REPORT}"
+          jq -r '[ .findings[]?.affected_purls[]? ] | unique | .[]' \
+            "${VULN_REPORT}" > /tmp/fix-scan-purls.txt
+        else
+          echo "No vulnerability report at ${VULN_REPORT}; scanning all SBOM PURLs."
+          jq -r '.[]' /tmp/purls.json > /tmp/fix-scan-purls.txt
+        fi
+
+        SCAN_TARGETS="$(grep -c . /tmp/fix-scan-purls.txt || true)"
+        echo "Fix-version scan targets: ${SCAN_TARGETS}"
+
+        # --- step 1: enumerate every known sibling version of each target ----
+        : > /tmp/scan-targets.jsonl
+        SCANNED=0
+
+        while IFS= read -r PURL; do
+          [[ -n "${PURL}" ]] || continue
+
+          SCANNED=$((SCANNED + 1))
+
+          if (( SCANNED > MAX_FIX_SCAN_PURLS )); then
+            echo "WARNING: hit MAX_FIX_SCAN_PURLS=${MAX_FIX_SCAN_PURLS}; stopping the scan."
+            break
+          fi
+
+          # pkg:maven/g/a@1.2.3?type=jar -> base pkg:maven/g/a, version 1.2.3
+          BASE_PURL="${PURL%%@*}"
+          CURRENT_VERSION="${PURL#*@}"
+          CURRENT_VERSION="${CURRENT_VERSION%%\?*}"
+
+          # /purl/base/{key} takes the url-encoded base PURL itself; the `q=`
+          # search does not match on a full purl string.
+          BASE_ENCODED="$(jq -rn --arg p "${BASE_PURL}" '$p | @uri')"
+
+          if ! curl "${CURL_OPTS[@]}" \
+                 --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
+                 "${RHTPA_URL%/}/api/v2/purl/base/${BASE_ENCODED}" \
+                 --output /tmp/base-purl.json 2>/dev/null; then
+            continue
+          fi
+
+          jq -c \
+            --arg purl "${PURL}" \
+            --arg base "${BASE_PURL}" \
+            --arg current "${CURRENT_VERSION}" \
+            --argjson max "${MAX_VERSIONS_PER_PURL}" '
+            { purl: $purl,
+              base: $base,
+              current: $current,
+              versions: ( [ .versions[]?.version
+                            | select(. != null and . != $current) ]
+                          | unique
+                          | .[0:$max] ) }
+            | select((.versions | length) > 0)
+          ' /tmp/base-purl.json >> /tmp/scan-targets.jsonl || true
+        done < /tmp/fix-scan-purls.txt
+
+        jq -s '.' /tmp/scan-targets.jsonl > /tmp/scan-targets.json
+
+        # --- step 2: one batched analyze over targets AND candidates ---------
+        jq -r '
+          [ ( .[] | .purl ), ( .[] | .base as $b | .versions[] | $b + "@" + . ) ]
+          | unique
+          | .[]
+        ' /tmp/scan-targets.json > /tmp/analyze-purls.txt
+
+        jq -R -s -c --argjson size "${BATCH_SIZE}" '
+          [ split("\n")[] | select(length > 0) ]
+          | [ range(0; length; $size) as $i | .[$i:($i + $size)] ]
+        ' /tmp/analyze-purls.txt > /tmp/analyze-batches.json
+
+        ANALYZE_BATCHES="$(jq 'length' /tmp/analyze-batches.json)"
+        echo "Fix-version scan: analyzing $(grep -c . /tmp/analyze-purls.txt || true)" \
+             "candidate PURL(s) in ${ANALYZE_BATCHES} batch(es)."
+
+        : > /tmp/cand-analyze.jsonl
+
+        for ((i=0; i<ANALYZE_BATCHES; i++)); do
+          BATCH="$(jq -c ".[$i]" /tmp/analyze-batches.json)"
+
+          curl "${CURL_OPTS[@]}" \
+            --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --data "{\"purls\": ${BATCH}}" \
+            "${RHTPA_URL%/}/api/v2/vulnerability/analyze" \
+            >> /tmp/cand-analyze.jsonl || true
+
+          echo >> /tmp/cand-analyze.jsonl
+        done
+
+        # purl -> [CVEs matched by version range]. A purl absent from the
+        # response is clean, which `// []` handles at lookup time.
         jq -s '
+          reduce (.[] | select(type == "object")) as $r ({}; . + $r)
+          | with_entries(.value = ([ .value.details[]?.identifier ] | unique))
+        ' /tmp/cand-analyze.jsonl > /tmp/cand-affected.json
+
+        # --- step 3: explicit statements, only where analyze says "affected" --
+        jq -r 'to_entries[] | select((.value | length) > 0) | .key' \
+          /tmp/cand-affected.json > /tmp/needs-clearing.txt
+
+        : > /tmp/cand-clears.jsonl
+
+        while IFS= read -r CANDIDATE; do
+          [[ -n "${CANDIDATE}" ]] || continue
+
+          CAND_ENCODED="$(jq -rn --arg p "${CANDIDATE}" '$p | @uri')"
+
+          if ! curl "${CURL_OPTS[@]}" \
+                 --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
+                 "${RHTPA_URL%/}/api/v2/purl/${CAND_ENCODED}" \
+                 --output /tmp/candidate.json 2>/dev/null; then
+            continue
+          fi
+
+          jq -c --arg purl "${CANDIDATE}" '
+            { purl: $purl,
+              clears:
+                ( [ .advisories[]? as $adv
+                    | $adv.status[]?
+                    | select(.status == "fixed" or .status == "not_affected")
+                    | { cve: (.vulnerability.identifier // "unknown"),
+                        advisory: ($adv.document_id // "unknown") }
+                  ]
+                  | group_by(.cve)
+                  | map({ key: .[0].cve, value: ([ .[].advisory ] | unique) })
+                  | from_entries ) }
+          ' /tmp/candidate.json >> /tmp/cand-clears.jsonl || true
+        done < /tmp/needs-clearing.txt
+
+        jq -s 'map({ key: .purl, value: .clears }) | from_entries' \
+          /tmp/cand-clears.jsonl > /tmp/cand-clears.json
+
+        # --- step 4: target CVE -> candidate versions that resolve it --------
+        jq -n \
+          --slurpfile targets /tmp/scan-targets.json \
+          --slurpfile affected /tmp/cand-affected.json \
+          --slurpfile clears /tmp/cand-clears.json '
+          ($affected[0] // {}) as $aff
+          | ($clears[0]   // {}) as $clr
+
+          # CVEs a purl is still exposed to: range-matched minus explicitly cleared.
+          | def openCves($p): ($aff[$p] // []) - (($clr[$p] // {}) | keys);
+
+          [ $targets[0][]
+              | .purl as $target
+              | .base as $base
+              | .current as $current
+              | openCves($target) as $targetCves
+              | select(($targetCves | length) > 0)
+              | { key: $target,
+                  value:
+                    ( [ .versions[]
+                        | . as $version
+                        | ($base + "@" + $version) as $candidate
+                        | $targetCves[]
+                        | . as $cve
+                        | select( (($aff[$candidate] // []) | index($cve) | not)
+                                  or (($clr[$candidate] // {}) | has($cve)) )
+                        | { cve: $cve,
+                            version: $version,
+                            purl: $candidate,
+                            cleared_by: (($clr[$candidate] // {})[$cve] // []),
+                            backport: ($version | startswith($current + ".")) }
+                      ]
+                      | group_by(.cve)
+                      | map({ key: .[0].cve,
+                              value: ( map({ version, purl, cleared_by, backport })
+                                       | sort_by((if .backport then 0 else 1 end), .version) ) })
+                      | from_entries ) }
+              | select((.value | length) > 0)
+            ]
+          | from_entries
+        ' > /tmp/fix-versions.json
+
+        #
+        # Combine the recommendations returned by each batch, then attach the
+        # fix-version scan.
+        #
+        jq -s \
+          --slurpfile fixes /tmp/fix-versions.json \
+          '
           reduce .[] as $response
             ({recommendations: {}};
              .recommendations += ($response.recommendations // {})
             )
+          | .fix_versions = ($fixes[0] // {})
         ' /tmp/recommendations.jsonl > "${OUTPUT}"
 
         #
@@ -315,6 +580,12 @@ spec:
           ' "${OUTPUT}"
         )"
 
+        FIX_VERSION_COUNT="$(
+          jq '[ .fix_versions | to_entries[] | .value | to_entries[] ] | length' "${OUTPUT}"
+        )"
+
+        echo "Fix-version scan found concrete fixes for ${FIX_VERSION_COUNT} (PURL, CVE) pair(s)."
+
         #
         # Generate human-readable report.
         #
@@ -327,6 +598,44 @@ spec:
           echo
           echo "**Recommendations:** ${RECOMMENDATION_COUNT}"
           echo
+          echo "**(PURL, CVE) pairs with a concrete fixed version:** ${FIX_VERSION_COUNT}"
+          echo
+
+          if [[ "${FIX_VERSION_COUNT}" != "0" ]]; then
+            echo "## Fixed versions"
+            echo
+            echo "Candidates are ordered backports-first: a version on the same"
+            echo "base line (\`backport: true\`) carries the fix without an API change."
+            echo
+
+            jq -r '
+              .fix_versions
+              | to_entries[]
+              | "### `\(.key)`\n" +
+                (
+                  # map (not to_entries[]) so every CVE of a PURL lands under
+                  # ONE heading instead of re-emitting the heading per CVE.
+                  [ .value
+                    | to_entries[]
+                    | "\n**\(.key)** — fixed in:\n\n" +
+                      (
+                        .value
+                        | map(
+                            "- `\(.version)`"
+                            + (if .backport then " _(backport — same base version)_" else "" end)
+                            + (if (.cleared_by | length) > 0
+                               then " — cleared by \(.cleared_by | join(", "))"
+                               else " — outside every advisory range" end)
+                          )
+                        | join("\n")
+                      ) + "\n"
+                  ]
+                  | join("")
+                )
+            ' "${OUTPUT}"
+
+            echo
+          fi
 
           if [[ "${RECOMMENDATION_COUNT}" == "0" ]]; then
             echo "No remediation recommendations were returned by RHTPA."
@@ -374,3 +683,6 @@ spec:
 
         printf '%s' "${RECOMMENDATION_COUNT}" \
           > "$(results.RECOMMENDATION_COUNT.path)"
+
+        printf '%s' "${FIX_VERSION_COUNT}" \
+          > "$(results.FIX_VERSION_COUNT.path)"

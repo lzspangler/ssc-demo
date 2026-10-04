@@ -12,8 +12,8 @@ spec:
     Ask the AI to produce a remediation decision for EVERY fixable dependency
     vulnerability in the Conforma must-fix set (not just one), given the RHTPA
     vulnerability-analysis report (authoritative CVE/severity/affected PURL),
-    the RHTPA remediation (recommend) report (supplemental), and a user-defined
-    policy. Writes the validated, fixable decisions to the workspace as a JSON
+    the RHTPA remediation report (authoritative fix versions, backports first),
+    and a user-defined policy. Writes the validated, fixable decisions to the workspace as a JSON
     array (each decision also carries the CVE severity and the list of available
     fixed versions) AND pre-renders one issue title/body/labels triple per CVE (so
     the downstream issue-opening task needs no JSON parser). Each rendered body
@@ -35,8 +35,10 @@ spec:
     - name: REMEDIATION_REPORT_PATH
       type: string
       description: >-
-        Absolute path (on the workspace) to the RHTPA remediation (recommend)
-        JSON. Supplemental only; often empty for upstream-only Maven deps.
+        Absolute path (on the workspace) to the RHTPA remediation JSON. Its
+        `.fix_versions` is the authoritative per-(PURL, CVE) candidate list,
+        ordered backports first; `.recommendations` (the /purl/recommend
+        lookup) is supplemental and often empty for upstream-only Maven deps.
       default: ""
     - name: MUST_FIX_PATH
       type: string
@@ -47,9 +49,13 @@ spec:
       description: User-defined prioritization policy (natural language).
       default: >-
         Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
-        version. Avoid major-version bumps unless required to obtain the fix.
-        Never propose a CVE without a concrete fixed version. Prefer changes that
-        touch a single dependency.
+        version. Never propose a CVE without a concrete fixed version. Prefer
+        changes that touch a single dependency. When a BACKPORT is available --
+        a build that keeps the current base version and appends a vendor suffix,
+        such as 3.14.0 -> 3.14.0.rhlw-00001 -- prefer it over any version bump:
+        it carries the fix with no API change and so is the lowest-risk upgrade.
+        Otherwise take the lowest version that resolves the CVE, and avoid
+        major-version bumps unless they are required to obtain the fix.
     - name: AI_PYTHON_IMAGE
       type: string
       description: Image with the Anthropic Python SDK installed.
@@ -124,7 +130,7 @@ spec:
           value: $(results.ISSUES_DIR.path)
       script: |
         #!/usr/bin/env python3
-        import json, os, re, sys
+        import json, os, random, re, sys, time
 
         provider = os.environ.get("AI_PROVIDER", "anthropic")
         model = os.environ.get("AI_MODEL", "claude-opus-5")
@@ -146,6 +152,15 @@ spec:
         # well within MAX_TOKENS and let a failed batch retry without losing the rest.
         MAX_TOKENS = int(os.environ.get("AI_ANALYZE_MAX_TOKENS", "8000"))
         BATCH_SIZE = int(os.environ.get("AI_ANALYZE_BATCH_SIZE", "12"))
+        # Retry/backoff for provider throttling. LiteLLM/Vertex-backed gateways
+        # (e.g. gpt-oss-120b) return HTTP 429 (RESOURCE_EXHAUSTED, "too many
+        # concurrent requests") under load; without backoff a single 429 crashes
+        # the whole task and discards every batch already analyzed. Retry each
+        # model call with exponential backoff, and pause between batches to stay
+        # under the throttle. Override via ai-agent-config.
+        MODEL_MAX_RETRIES = int(os.environ.get("AI_MODEL_MAX_RETRIES", "5"))
+        RETRY_BASE_SECS = float(os.environ.get("AI_RETRY_BASE_SECS", "5"))
+        BATCH_PAUSE_SECS = float(os.environ.get("AI_BATCH_PAUSE_SECS", "3"))
 
         def read_json(path, default):
             try:
@@ -232,10 +247,39 @@ spec:
                 return s
             return s[:limit] + "\n...[truncated %d chars to fit the model context]..." % (len(s) - limit)
 
+        def _trim_report(raw, ids):
+            # The remediation report's '.fix_versions' is the authoritative
+            # candidate list (rhtpa-remediation-report resolved every known
+            # sibling version of each affected PURL against RHTPA). Keep only
+            # the must-fix CVEs so the char budget can never truncate it away,
+            # and drop '.recommendations' entirely when it is empty -- which it
+            # usually is, since /purl/recommend only covers Red Hat rebuilds.
+            try:
+                r = json.loads(raw)
+            except Exception:
+                return raw
+            if not isinstance(r, dict):
+                return raw
+            idset = set(ids)
+            toks = _cve_toks(ids)
+            def match(cid):
+                return isinstance(cid, str) and (cid in idset or cid.upper() in toks)
+            fixes = {}
+            for purl, by_cve in (r.get("fix_versions") or {}).items():
+                if not isinstance(by_cve, dict):
+                    continue
+                kept = {c: v for c, v in by_cve.items() if match(c)}
+                if kept:
+                    fixes[purl] = kept
+            out = {"fix_versions": fixes}
+            if r.get("recommendations"):
+                out["recommendations"] = r["recommendations"]
+            return json.dumps(out)
+
         ids = _mustfix_ids(mustfix)
         toks = _cve_toks(ids)
         vuln_raw = vuln          # keep the untrimmed report; each batch trims per-CVE
-        report = _cap(report, REPORT_CHAR_BUDGET)
+        report = _cap(_trim_report(report, ids), REPORT_CHAR_BUDGET)
 
         # ---- TLS trust for self-hosted / internal endpoints (see ai-select-cve) ----
         def _tls_verify():
@@ -265,14 +309,20 @@ spec:
         # ---- Build the provider-appropriate client ----
         family = "openai" if provider == "openai" else "anthropic"
         if family == "openai":
-            from openai import OpenAI
+            from openai import (OpenAI, RateLimitError, APIConnectionError,
+                                APITimeoutError, InternalServerError)
             oai = OpenAI(
                 base_url=(os.environ.get("AI_BASE_URL") or None),
                 api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
                 http_client=_http_client("openai"),
             )
+            # Transient errors worth backing off + retrying (vs. a hard 400).
+            RETRYABLE = (RateLimitError, APIConnectionError, APITimeoutError,
+                         InternalServerError)
         else:
             import anthropic
+            RETRYABLE = (anthropic.RateLimitError, anthropic.APIConnectionError,
+                         anthropic.APITimeoutError, anthropic.InternalServerError)
             if provider == "bedrock":
                 from anthropic import AnthropicBedrockMantle
                 client = AnthropicBedrockMantle(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
@@ -306,11 +356,15 @@ spec:
                 "current_version": {"type": "string"},
                 "fixed_version": {"type": "string",
                                   "description": "The single RECOMMENDED version to "
-                                  "upgrade to (on the same release line as current)"},
+                                  "upgrade to: the backport from .fix_versions if one "
+                                  "exists (same base version plus a vendor suffix, e.g. "
+                                  "3.14.0.rhlw-00001), otherwise the lowest version on "
+                                  "the same release line that resolves the CVE"},
                 "available_fixed_versions": {
                     "type": "array", "items": {"type": "string"},
-                    "description": "ALL candidate fixed versions found for this CVE "
-                    "(fixed_version_hints plus versions named in the advisory prose); "
+                    "description": "ALL candidate fixed versions for this CVE, the "
+                    "remediation report's .fix_versions entries first and in order, "
+                    "then fixed_version_hints and versions named in the advisory prose; "
                     "the recommended fixed_version must be one of these"},
                 "severity": {"type": "string",
                              "description": "CVE severity from the finding, e.g. "
@@ -348,24 +402,36 @@ spec:
                 "hints as candidates and read the title/description to pick the correct "
                 "fixed version on the SAME release line as the current version:\n"
                 + vuln_str + "\n\n"
-                "SUPPLEMENTAL -- RHTPA remediation (recommend) report. Recommended "
-                "fixed packages are PURLs; this is a Red Hat-rebuild catalog lookup and "
-                "is frequently empty for upstream-only Maven deps -- treat it as a "
-                "cross-check, not the source of truth:\n" + report + "\n\n"
+                "AUTHORITATIVE FIX VERSIONS -- RHTPA remediation report. Its "
+                "'.fix_versions' maps each affected PURL to each of its CVEs to the "
+                "versions RHTPA has confirmed resolve that CVE. These were resolved "
+                "against the live RHTPA instance (every known sibling version of the "
+                "affected PURL, re-analyzed), so PREFER THEM over anything scraped from "
+                "advisory prose. Each entry carries: 'version', 'cleared_by' (the "
+                "advisories that explicitly mark it fixed/not_affected -- an empty list "
+                "means it simply falls outside the vulnerable range), and 'backport' "
+                "(true when the version keeps the current base version and only adds a "
+                "vendor suffix, e.g. 6.0.3 -> 6.0.3.rhlw-00001). The list is already "
+                "ordered backports first. A BACKPORT IS THE PREFERRED FIX: it carries "
+                "the patch with no API change, so pick it over a version bump whenever "
+                "one is offered. '.recommendations', if present, is a Red Hat-rebuild "
+                "catalog lookup -- a cross-check only:\n" + report + "\n\n"
                 "Return one decision object for EACH must-fix CVE listed above (even if "
                 "there is only one). Determine PACKAGE and CURRENT_VERSION from its "
-                "affected_purl and the FIXED_VERSION from the analyze findings/details "
-                "as described above. Set selected=true ONLY when you can supply a "
-                "concrete fixed version; if you cannot confidently determine one for a "
+                "affected_purl. For FIXED_VERSION, use '.fix_versions' for that PURL and "
+                "CVE when it has an entry; fall back to the analyze findings/details "
+                "prose only when it does not. Set selected=true ONLY when you can supply "
+                "a concrete fixed version; if you cannot confidently determine one for a "
                 "CVE, set selected=false for it (it will be skipped). Provide a concise "
-                "justification per CVE.\n\n"
+                "justification per CVE, and say so explicitly when you chose a backport.\n\n"
                 "Also populate, for each CVE: 'severity' -- the finding's severity "
                 "(critical / high / medium / low); and 'available_fixed_versions' -- a "
-                "list of ALL candidate fixed versions you can find (the "
-                "fixed_version_hints plus any versions named in the title/description "
-                "prose). 'fixed_version' stays the single RECOMMENDED version to bump "
-                "to (prefer the lowest version on the SAME release line as the current "
-                "version that resolves the CVE), and it MUST be one of the entries in "
+                "list of ALL candidate fixed versions, the '.fix_versions' entries FIRST "
+                "and in order, then any extra versions from fixed_version_hints or the "
+                "title/description prose. 'fixed_version' stays the single RECOMMENDED "
+                "version to bump to -- the backport if one exists, otherwise the lowest "
+                "version that resolves the CVE, preferring the SAME release line as the "
+                "current version -- and it MUST be one of the entries in "
                 "available_fixed_versions.\n\n"
                 "Every field must hold a REAL value taken from the data above -- e.g. "
                 "package \"com.fasterxml.jackson.core:jackson-databind\", "
@@ -411,6 +477,24 @@ spec:
                 print("WARNING: response hit max_tokens (%d) -- raise AI_ANALYZE_MAX_TOKENS "
                       "or lower AI_ANALYZE_BATCH_SIZE." % MAX_TOKENS, file=sys.stderr)
             return "".join(b.text for b in resp.content if b.type == "text")
+
+        # Wrap every model call so a provider throttle (429 / RESOURCE_EXHAUSTED)
+        # or a dropped connection backs off and retries instead of crashing the
+        # task and losing the batches already analyzed.
+        def _call_with_backoff(user):
+            for attempt in range(1, MODEL_MAX_RETRIES + 1):
+                try:
+                    return call_model(user)
+                except RETRYABLE as e:
+                    if attempt == MODEL_MAX_RETRIES:
+                        print("model call failed after %d attempts: %s"
+                              % (attempt, e), file=sys.stderr)
+                        raise
+                    wait = RETRY_BASE_SECS * (2 ** (attempt - 1)) + random.uniform(0, 1)
+                    print("transient model error (%s); backing off %.1fs then "
+                          "retry %d/%d" % (type(e).__name__, wait, attempt + 1,
+                                           MODEL_MAX_RETRIES), file=sys.stderr)
+                    time.sleep(wait)
 
         # Accept {"decisions": [...]} OR a bare [...] (some backends drop the
         # wrapper). Always returns a list (possibly empty).
@@ -462,7 +546,7 @@ spec:
                   % (tag, len(items), len(mf_b), len(vuln_b), len(report)), file=sys.stderr)
             last = ""
             for attempt in (1, 2):
-                last = call_model(user_b)
+                last = _call_with_backoff(user_b)
                 decs = _extract_decisions(last)
                 if decs:
                     return decs
@@ -478,11 +562,14 @@ spec:
             print("Analyzing %d must-fix CVEs in %d batch(es) of up to %d."
                   % (len(mustfix_arr), len(batches), BATCH_SIZE), file=sys.stderr)
             for i, b in enumerate(batches, 1):
+                # Pace requests so we don't trip the gateway's concurrency throttle.
+                if i > 1 and BATCH_PAUSE_SECS > 0:
+                    time.sleep(BATCH_PAUSE_SECS)
                 decisions_in += analyze_batch(b, "batch %d/%d" % (i, len(batches)))
         else:
             # Must-fix wasn't a JSON array we could split; try one whole-list call.
             vuln_all = _cap(_trim_vuln(vuln_raw, ids), VULN_CHAR_BUDGET)
-            decisions_in = _extract_decisions(call_model(build_user(mustfix, vuln_all)))
+            decisions_in = _extract_decisions(_call_with_backoff(build_user(mustfix, vuln_all)))
 
         if not decisions_in:
             print("No decisions returned by the model for any batch.", file=sys.stderr)
