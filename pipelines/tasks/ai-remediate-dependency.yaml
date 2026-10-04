@@ -39,6 +39,13 @@ spec:
       default: quay.io/REPLACE_ME/ai-agent-maven-claude:v1.0.0
   workspaces:
     - name: source
+    - name: maven-settings
+      optional: true
+      description: >-
+        Secret/ConfigMap holding a settings.xml that mirrors dependency
+        resolution through the internal artifact repository. Optional so the
+        task still runs without one, but a remediation that pins a Lightwell
+        backport cannot build without it -- see the note in the step script.
   results:
     - name: CHANGED
       description: "1 if the agent modified the build files, else 0."
@@ -81,6 +88,28 @@ spec:
         echo "Remediating ${CVE_ID}: ${PACKAGE} -> ${FIXED_VERSION} (agent=${AGENT} model=${MODEL})"
 
         WORKDIR="$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+
+        # --- Point Maven at the internal mirror ------------------------------
+        # EVERY mvn in this step has to resolve through the Artifactory virtual
+        # repo rather than Central: the verification build below, and the
+        # agent's own `Bash(mvn:*)` calls on the claude-code path. The whole
+        # point of the remediation is a Lightwell backport coordinate such as
+        # 6.0.3.rhlw-00001, which does NOT exist on Central -- with a default
+        # settings.xml the build fails to resolve the very version the agent
+        # just pinned ("Could not find artifact ... in central").
+        #
+        # Installed as ~/.m2/settings.xml rather than passed as `mvn -s` so that
+        # one mechanism covers both callers; the agent's mvn invocations are
+        # built by the agent and we cannot add flags to them.
+        if [ "$(workspaces.maven-settings.bound)" = "true" ] \
+           && [ -f "$(workspaces.maven-settings.path)/settings.xml" ]; then
+          mkdir -p "${HOME}/.m2"
+          cp "$(workspaces.maven-settings.path)/settings.xml" "${HOME}/.m2/settings.xml"
+          echo "Maven resolution: using settings.xml from the maven-settings workspace."
+        else
+          echo "WARNING: no maven-settings workspace bound. Maven will resolve from" \
+               "Central only, and a Lightwell .rhlw backport will NOT resolve."
+        fi
 
         # The workspace repo was cloned by a different uid; this pod runs as an
         # arbitrary OpenShift uid, so git aborts with "detected dubious ownership".
@@ -146,7 +175,30 @@ spec:
         set -e
         if [ "${rcs[0]}" -gt 1 ]; then echo "source tar failed (rc=${rcs[0]})"; exit 1; fi
         if [ "${rcs[1]}" -ne 0 ]; then echo "extract tar failed (rc=${rcs[1]})"; exit 1; fi
-        ( cd "${SCRATCH}" && mvn -B -q -Dstyle.color=never -DskipTests install )
+        # -e, not bare -q. `-q` prints the one-line "Plugin ... or one of its
+        # dependencies could not be resolved" summary and swallows the cause, so a
+        # resolution failure is undiagnosable from the TaskRun log -- one run died
+        # on "Failed to read artifact descriptor for
+        # org.eclipse.sisu:org.eclipse.sisu.plexus:jar:0.0.0.M5" with no reason
+        # attached. `-q -e` keeps a successful build quiet but prints the full
+        # exception chain when it fails.
+        #
+        # Retried once because this build resolves the whole plugin graph (~1500
+        # artifacts) in one burst and a single failed descriptor read anywhere in
+        # it fails everything. The retry adds -U to clear the *.lastUpdated markers
+        # Maven writes for a failed resolution -- without it the second attempt
+        # replays the cached failure instead of re-fetching.
+        set +e
+        ( cd "${SCRATCH}" && mvn -B -q -e -Dstyle.color=never -DskipTests install )
+        mvn_rc=$?
+        if [ "${mvn_rc}" -ne 0 ]; then
+          echo "Verification build failed (rc=${mvn_rc}); retrying once with -U in case" \
+               "the resolution failure was transient."
+          ( cd "${SCRATCH}" && mvn -B -q -e -U -Dstyle.color=never -DskipTests install )
+          mvn_rc=$?
+        fi
+        set -e
+        [ "${mvn_rc}" -eq 0 ] || exit "${mvn_rc}"
 
         CHANGED="$(git -C "${WORKDIR}" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | wc -l | tr -d ' ')"
         printf '%s' "$([ "${CHANGED:-0}" -gt 0 ] && echo 1 || echo 0)" > "$(results.CHANGED.path)"

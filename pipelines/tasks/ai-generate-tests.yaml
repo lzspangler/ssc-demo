@@ -50,6 +50,13 @@ spec:
   workspaces:
     - name: source
       description: Workspace containing the application source (shared PVC).
+    - name: maven-settings
+      optional: true
+      description: >-
+        Secret/ConfigMap holding a settings.xml that mirrors dependency
+        resolution through the internal artifact repository. Optional so the
+        task still runs without one, but a tree carrying a Lightwell backport
+        pin cannot build without it -- see the note in the step script.
   results:
     - name: TESTS_ADDED
       description: Number of new/changed test files staged by the agent.
@@ -87,6 +94,28 @@ spec:
         MODEL="${AI_MODEL:-claude-opus-5}"
         MAX_ATTEMPTS="$(params.MAX_ATTEMPTS)"
         echo "Generating tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL} (up to ${MAX_ATTEMPTS} attempts)"
+
+        # --- Point Maven at the internal mirror ------------------------------
+        # EVERY mvn in this step has to resolve through the Artifactory virtual
+        # repo rather than Central: the verification builds in the retry loop
+        # below, and the agent's own `mvn test` calls, which the prompt asks it
+        # to run. Once a remediation PR has merged, the tree carries a Lightwell
+        # backport pin such as 6.0.3.rhlw-00001 that does NOT exist on Central,
+        # and a default settings.xml fails the build before a single generated
+        # test runs.
+        #
+        # Installed as ~/.m2/settings.xml rather than passed as `mvn -s` so that
+        # one mechanism covers both callers; the agent's mvn invocations are
+        # built by the agent and we cannot add flags to them.
+        if [ "$(workspaces.maven-settings.bound)" = "true" ] \
+           && [ -f "$(workspaces.maven-settings.path)/settings.xml" ]; then
+          mkdir -p "${HOME}/.m2"
+          cp "$(workspaces.maven-settings.path)/settings.xml" "${HOME}/.m2/settings.xml"
+          echo "Maven resolution: using settings.xml from the maven-settings workspace."
+        else
+          echo "WARNING: no maven-settings workspace bound. Maven will resolve from" \
+               "Central only, and a Lightwell .rhlw backport will NOT resolve."
+        fi
 
         # This task forks off clone-repository and runs in parallel with the
         # build/scan chain's Maven build, which writes target/ in this same shared

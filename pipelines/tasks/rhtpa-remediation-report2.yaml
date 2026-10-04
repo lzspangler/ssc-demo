@@ -618,23 +618,57 @@ spec:
             continue
           fi
 
+          # Each version entry carries a `purls[]` of the CONCRETE purls RHTPA
+          # actually ingested for it, and they are usually qualified:
+          #
+          #   version 2.18.4.redhat-00002
+          #     purl  pkg:maven/.../jackson-core@2.18.4.redhat-00002
+          #     purls ...@2.18.4.redhat-00002?type=jar
+          #           ...@2.18.4.redhat-00002?repository_url=...ga/&type=jar
+          #
+          # The bare `base@version` form is a grouping node, not an ingested
+          # purl, so GET /purl/{that} answers 200 `null`. Keeping `purls[]`
+          # here is what lets step 3 ask about a Red Hat rebuild at all --
+          # see the comment there. `versions` stays the bare version list
+          # because step 2's analyze ignores qualifiers and is cheaper with
+          # one purl per version.
           jq -c \
             --arg purl "${PURL}" \
             --arg base "${BASE_PURL}" \
             --arg current "${CURRENT_VERSION}" \
             --argjson max "${MAX_VERSIONS_PER_PURL}" '
-            { purl: $purl,
-              base: $base,
-              current: $current,
-              versions: ( [ .versions[]?.version
-                            | select(. != null and . != $current) ]
-                          | unique
-                          | .[0:$max] ) }
+            . as $resp
+            | ( [ $resp.versions[]?.version
+                  | select(. != null and . != $current) ]
+                | unique
+                | .[0:$max] ) as $keep
+            | { purl: $purl,
+                base: $base,
+                current: $current,
+                versions: $keep,
+                concrete:
+                  ( [ $resp.versions[]?
+                      | select(.version != null)
+                      | select(.version as $v | $keep | index($v) != null)
+                      | . as $entry
+                      | { key: ($base + "@" + $entry.version),
+                          value:
+                            ( ( [ $entry.purls[]?.purl ]
+                                | map(select(. != null))
+                                | unique )
+                              | if length == 0
+                                then [ $base + "@" + $entry.version ]
+                                else . end ) } ]
+                    | from_entries ) }
             | select((.versions | length) > 0)
           ' /tmp/base-purl.json >> /tmp/scan-targets.jsonl || true
         done < /tmp/fix-scan-purls.txt
 
         jq -s '.' /tmp/scan-targets.jsonl > /tmp/scan-targets.json
+
+        # candidate (bare base@version) -> [concrete purls to ask about]
+        jq -s 'map(.concrete) | add // {}' /tmp/scan-targets.jsonl \
+          > /tmp/cand-lookups.json
 
         # --- step 2: one batched analyze over targets AND candidates ---------
         jq -r '
@@ -701,17 +735,42 @@ spec:
         while IFS= read -r CANDIDATE; do
           [[ -n "${CANDIDATE}" ]] || continue
 
-          CAND_ENCODED="$(jq -rn --arg p "${CANDIDATE}" '$p | @uri')"
+          # Ask about every concrete purl RHTPA holds for this version, not
+          # the bare base@version. A Red Hat rebuild only exists under its
+          # qualified forms, so the bare one answers 200 `null` and the
+          # backport can never be cleared -- which is the entire job of this
+          # step. The Lightwell dataset ingests its backports unqualified, so
+          # there `purls[]` is the bare purl and nothing changes.
+          #
+          # Statements are unioned across the variants: they are the same
+          # artifact published to different repositories, and Red Hat VEX
+          # attaches the same status to each.
+          mapfile -t CAND_LOOKUPS < <(
+            jq -r --arg c "${CANDIDATE}" '(.[$c] // [$c])[]' \
+              /tmp/cand-lookups.json
+          )
 
-          if ! fetch_json /tmp/candidate.json \
-                 "${RHTPA_URL%/}/api/v2/purl/${CAND_ENCODED}"; then
-            continue
-          fi
+          : > /tmp/cand-variants.jsonl
 
-          jq -c --arg purl "${CANDIDATE}" '
+          for LOOKUP in "${CAND_LOOKUPS[@]}"; do
+            [[ -n "${LOOKUP}" ]] || continue
+
+            LOOKUP_ENCODED="$(jq -rn --arg p "${LOOKUP}" '$p | @uri')"
+
+            if fetch_json /tmp/candidate.json \
+                 "${RHTPA_URL%/}/api/v2/purl/${LOOKUP_ENCODED}"; then
+              cat /tmp/candidate.json >> /tmp/cand-variants.jsonl
+              echo >> /tmp/cand-variants.jsonl
+            fi
+          done
+
+          # An empty file slurps to [] and yields clears {}, which is the
+          # same "nothing known" the old `continue` produced.
+          jq -s -c --arg purl "${CANDIDATE}" '
             { purl: $purl,
               clears:
-                ( [ .advisories[]? as $adv
+                ( [ .[] | objects
+                    | .advisories[]? as $adv
                     | $adv.status[]?
                     | select(.status == "fixed" or .status == "not_affected")
                     | { cve: (.vulnerability.identifier // "unknown"),
@@ -720,7 +779,7 @@ spec:
                   | group_by(.cve)
                   | map({ key: .[0].cve, value: ([ .[].advisory ] | unique) })
                   | from_entries ) }
-          ' /tmp/candidate.json >> /tmp/cand-clears.jsonl || true
+          ' /tmp/cand-variants.jsonl >> /tmp/cand-clears.jsonl || true
         done < /tmp/needs-clearing.txt
 
         jq -s 'map({ key: .purl, value: .clears }) | from_entries' \

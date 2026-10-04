@@ -142,6 +142,11 @@ spec:
       workspaces:
         - name: source
           workspace: workspace
+        # The agent runs `mvn test` itself and the task verifies in a scratch
+        # copy, so it needs the mirror just as much as re-run-tests below --
+        # a tree carrying a merged .rhlw pin will not resolve from Central.
+        - name: maven-settings
+          workspace: maven-settings
 
     # Stop here if the agent produced no new/changed tests: nothing to verify or
     # PR. Both re-run-tests and open-pr are guarded on TESTS_ADDED != "0" -- the

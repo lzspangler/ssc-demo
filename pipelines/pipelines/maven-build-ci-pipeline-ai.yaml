@@ -338,6 +338,10 @@ spec:
       workspaces:
         - name: source
           workspace: workspace
+        # See agentic-test-generation: the agent's own `mvn test` and the
+        # scratch verification build both need the mirror.
+        - name: maven-settings
+          workspace: maven-settings
 
     - name: conforma-policy-check
       runAfter:
@@ -415,6 +419,10 @@ spec:
       workspaces:
         - name: source
           workspace: workspace
+        # See agentic-cve-remediation: the pinned backport is not on Central,
+        # so this task's own verification build needs the mirror.
+        - name: maven-settings
+          workspace: maven-settings
 
     - name: re-run-tests
       runAfter:
