@@ -798,13 +798,131 @@ The relevant task knobs:
 | | `MAX_VEX_LOOKUPS` (`"300"`) | Cap on per-PURL status lookups; beyond it the rest are left unsuppressed. |
 | | `SUPPRESSED_COUNT` (result) | Number of (PURL, CVE) pairs suppressed. |
 | `rhtpa-remediation-report` | `VULNERABILITY_REPORT_PATH` (`""`) | Scope the fix-version scan to the PURLs that actually have findings; defaults to `<workspace>/rhtpa/vulnerabilities.json`. |
+| | `FIX_SCAN_EXCLUDE_PURL_TYPES` (`"rpm,deb,apk,oci"`) | Leave OS-level packages out of the fix-version scan. Set to `""` to scan every type. |
 | | `MAX_FIX_SCAN_PURLS` (`"60"`), `MAX_VERSIONS_PER_PURL` (`"40"`) | Bound the sibling-version fan-out. |
+| | `FIX_SCAN_BATCH_SIZE` (`"50"`) | PURLs per fix-scan `analyze` call. Smaller than `BATCH_SIZE` on purpose — see below. |
 | | `FIX_VERSION_COUNT` (result) | Number of (PURL, CVE) pairs a fix version was found for. |
+| both | `HTTP_RETRIES` (`"3"`), `HTTP_MAX_TIME` (`"300"` report / `"180"` analysis) | Retry budget and per-request timeout. The report needs the larger budget because `/purl/recommend` alone can take ~167 s. |
 
 `.fix_versions` from that report — ordered backports first, each entry carrying
 `version`, `purl`, `cleared_by` and `backport` — is what `ai-analyze-cves`
 consumes as its authoritative candidate list, and its default `POLICY_CONTEXT`
 tells the model to prefer a backport over any version bump.
+
+#### Keeping the analyze fan-out small, and never trusting a response blindly
+
+`analyze` returns the **full advisory detail for every (PURL, CVE) pair**, so its
+responses get large fast. Scanning every sibling version of every affected PURL
+on the reference app meant **791 candidates in 7 batches and 72 MB of response**,
+with single bodies of 25 MB and 30 s of server time — RHTPA logs
+`slow statement: execution time exceeded alert threshold` on the resulting
+`UNION ALL` queries. One of those transfers was cut off mid-body; because the
+loop appended curl's stdout straight onto an accumulator with `|| true`, the
+truncated fragment stayed in the file, the next batch was appended behind it,
+and `jq -s` died with a parse error (**exit 5**) that took the whole step down.
+
+Two changes keep that from recurring:
+
+- **`FIX_SCAN_EXCLUDE_PURL_TYPES`** drops `rpm`/`deb`/`apk`/`oci` from the scan.
+  Nothing in the application source pins an OS package, so they were never a
+  remediation the AI tasks could act on — but they were 698 of those 791
+  candidates. The same run is now **109 candidates in 3 batches and 1.2 MB**.
+- **Every RHTPA call goes through a `fetch_json` helper** that writes its output
+  file only when curl exited 0, the status was 2xx, *and* the body parses as
+  JSON and is not a bare `null` (see the `jq empty` note below). Anything else
+  warns and returns non-zero, so a caller that skips the
+  failure skips one PURL instead of corrupting its input. Note the deliberate
+  absence of `--fail-with-body`: that flag writes the server's error document to
+  stdout, which is the other way a `{"error": …}` body used to reach jq. Writing
+  through `--output` also means a retry *truncates* the file rather than
+  appending a second copy of the body behind a half-written one.
+
+`fetch_json` owns its retry loop rather than passing curl `--retry`, because
+without `--fail-with-body` curl treats a **504 as a perfectly successful
+transfer** and would never retry it. It retries transport failures, 408, 429 and
+any 5xx with linear backoff, and re-checks the token on each attempt; other 4xx
+are a settled answer and return immediately.
+
+> **Validate with `jq empty`, never `jq -e .`.** RHTPA answers
+> `GET /api/v2/purl/{purl}` for a PURL it has never ingested with **HTTP 200 and
+> a body of literal `null`** — four bytes, perfectly valid JSON, not a 404. But
+> `jq -e` sets **exit 1 when the output is null or false**, so an `-e`-based
+> validator reads that as a corrupt body. The fix scan enumerates speculative
+> `.redhat-000NN` versions, so *most* of its lookups are misses: every one of
+> them burned four attempts with backoff and was then dropped from the scan,
+> producing screens of `HTTP 200 with a body that is not valid JSON (4 bytes)`.
+>
+> | body | `jq -e .` | `jq empty` |
+> |---|---|---|
+> | `{"a":1}` | 0 | 0 |
+> | `null` | **1** | 0 |
+> | `{bad` | 5 | 5 |
+>
+> `fetch_json` now validates with `jq empty` and treats a top-level `null` as a
+> quiet miss: no retry, no warning, nothing counted against `FETCH_FAILURES` —
+> the same handling as a quiet 404. Callers already read "no answer" as "nothing
+> to say about this PURL", which is exactly what a `null` means.
+
+> **Infrastructure caveat — the 30 s route timeout.** The OpenShift route in
+> front of RHTPA has no `haproxy.router.openshift.io/timeout` annotation, so the
+> router's default `timeout server 30s` applies. When HAProxy fires first the
+> client gets a **504 even though RHTPA logs a 200** — runs have died on
+> `curl: (22) The requested URL returned error: 504` on the very first recommend
+> batch.
+>
+> For `/vulnerability/analyze` this is a tail problem that retries and smaller
+> batches make survivable. For `/purl/recommend` it is fatal and unconditional.
+> Measured against a *healthy* server, bypassing the router via
+> `https://server.trusted-profile-analyzer.svc.cluster.local`:
+>
+> | PURLs per recommend call | server time | via route |
+> |---|---|---|
+> | 25 | 106 s | 504 |
+> | 128 | 167 s | 504 |
+>
+> That is ~4 s per PURL with only mild economy of scale, so **shrinking
+> `BATCH_SIZE` makes the total worse, not better** — fewer PURLs per call, but
+> more calls, each still over 30 s. Recommend simply cannot complete through a
+> 30 s proxy at any batch size.
+>
+> The fix is to annotate the Ingress — not the Route. Route `server-k9h8n` is
+> generated by OpenShift's ingress-to-route controller with an `ownerReference`
+> to Ingress `trusted-profile-analyzer/server`; annotating the Route directly is
+> **silently stripped within seconds**. Annotate the Ingress and OpenShift
+> copies it down:
+>
+> ```sh
+> oc -n trusted-profile-analyzer annotate ingress server \
+>   haproxy.router.openshift.io/timeout=300s --overwrite
+> ```
+>
+> Both TPA Argo applications run `syncPolicy.automated.selfHeal: true`, so a
+> live `oc annotate` is a stopgap that Argo reverts on its next reconcile. The
+> durable change belongs in the GitOps repo, not here. Keep `HTTP_MAX_TIME` at
+> or below whatever this is set to — there is no point waiting longer than the
+> proxy will.
+>
+> **Related: the postgres CPU limit.** `tpa-postgresql` is capped at `250m` CPU
+> / `1Gi` memory by the `tpa-prerequisites` Helm chart, and sits pinned at
+> ~249m. When it saturates, its readiness probe (a `psql -c 'SELECT 1'` with
+> `timeoutSeconds: 1`) times out, the pod leaves the Service endpoints, the TPA
+> server's `/health/ready` starts returning 500, and the router answers **503 to
+> everything**. The node itself is at ~8 % CPU, so this is self-inflicted by the
+> limit. It is also the likeliest reason recommend costs 4 s per PURL; raising
+> the limit should pull the latencies above down with it.
+
+The two tasks then diverge on what a failed batch *means*. In
+`rhtpa-remediation-report` a dropped batch only shrinks the candidate list, so it
+warns and carries on — a fix version is only ever offered on a response that
+actually arrived. In `rhtpa-vulnerability-analysis` a dropped batch would report
+unchecked PURLs as clean, a silent false negative that would let a vulnerable
+build through the Conforma gate, so **it fails the TaskRun instead**.
+
+Tokens are re-minted on a timer, too. RHTPA issues client-credentials tokens with
+`expires_in: 300`, and the per-PURL loops run longer than that: one run's VEX pass
+lost its last **34 of 85** lookups to 401s that the skip-and-continue logic
+swallowed silently. Both tasks now refresh at 200 s, and the VEX pass reports how
+many lookups failed so a degraded run is visible rather than merely quieter.
 
 ## One-time setup
 

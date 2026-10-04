@@ -30,9 +30,32 @@ spec:
       type: string
       default: "3"
 
+    - name: HTTP_MAX_TIME
+      type: string
+      default: "300"
+      description: >-
+        Per-request timeout, in seconds. This has to be well above curl's usual
+        defaults: /purl/recommend is genuinely slow, measured at 106 s for 25
+        PURLs and 167 s for 128 against a healthy server, and a fix-scan analyze
+        call over a large batch takes a minute or more. It must still be
+        bounded, though, or a stalled connection hangs the step until the
+        TaskRun timeout. Keep this at or below the router's
+        haproxy.router.openshift.io/timeout -- there is no point waiting longer
+        than the proxy will.
+
     - name: BATCH_SIZE
       type: string
       default: "128"
+
+    - name: FIX_SCAN_BATCH_SIZE
+      type: string
+      default: "50"
+      description: >-
+        Batch size for the fix-version scan's /vulnerability/analyze calls.
+        Smaller than BATCH_SIZE on purpose: analyze returns the full advisory
+        detail for every (PURL, CVE) pair, so a 128-PURL batch can come back
+        as 25 MB and take 30 s of server time. Smaller batches keep each
+        response -- and each retry -- cheap.
 
     - name: VULNERABILITY_REPORT_PATH
       type: string
@@ -52,6 +75,16 @@ spec:
       type: string
       default: "40"
       description: Cap on how many sibling versions are checked per PURL.
+
+    - name: FIX_SCAN_EXCLUDE_PURL_TYPES
+      type: string
+      default: "rpm,deb,apk,oci"
+      description: >-
+        Comma-separated PURL types to leave out of the fix-version scan.
+        OS-level packages dominate the scan -- on the reference app they were
+        698 of 791 candidates -- but they are never a remediation the AI tasks
+        can act on, because nothing in the application source pins them. Set
+        to "" to scan every type.
 
   workspaces:
     - name: workspace
@@ -93,8 +126,17 @@ spec:
         - name: HTTP_RETRIES
           value: $(params.HTTP_RETRIES)
 
+        - name: HTTP_MAX_TIME
+          value: $(params.HTTP_MAX_TIME)
+
         - name: BATCH_SIZE
           value: $(params.BATCH_SIZE)
+
+        - name: FIX_SCAN_BATCH_SIZE
+          value: $(params.FIX_SCAN_BATCH_SIZE)
+
+        - name: FIX_SCAN_EXCLUDE_PURL_TYPES
+          value: $(params.FIX_SCAN_EXCLUDE_PURL_TYPES)
 
         - name: VULNERABILITY_REPORT_PATH
           value: $(params.VULNERABILITY_REPORT_PATH)
@@ -207,8 +249,16 @@ spec:
         CURL_OPTS=(
           --silent
           --show-error
-          --fail-with-body
-          --retry "${HTTP_RETRIES}"
+          # NO --fail-with-body here. It writes the server's error document to
+          # stdout on a non-2xx, which is exactly how a `{"error": ...}` body
+          # used to end up inside a JSON accumulator. fetch_json below checks
+          # the status code explicitly instead.
+          #
+          # NO --retry either: fetch_json owns the retry loop, so that a
+          # retried request also re-validates the body and refreshes a token
+          # that expired mid-backoff. Nesting curl's retries inside that would
+          # just multiply the attempt budget.
+          --max-time "${HTTP_MAX_TIME}"
         )
 
         #
@@ -217,7 +267,7 @@ spec:
         OIDC_DISCOVERY_URL="${OIDC_ISSUER_URL%/}/.well-known/openid-configuration"
 
         TOKEN_ENDPOINT="$(
-          curl "${CURL_OPTS[@]}" \
+          curl "${CURL_OPTS[@]}" --retry 2 \
             "${OIDC_DISCOVERY_URL}" |
             jq -r '.token_endpoint // empty'
         )"
@@ -228,27 +278,151 @@ spec:
         fi
 
         #
-        # Obtain OAuth2 client-credentials token.
+        # OAuth2 client-credentials tokens.
         #
-        TOKEN_RESPONSE="$(
-          curl "${CURL_OPTS[@]}" \
-            --user "${OIDC_CLIENT_ID}:${OIDC_CLIENT_SECRET}" \
-            --data "grant_type=client_credentials" \
-            "${TOKEN_ENDPOINT}"
-        )"
+        # RHTPA mints these with expires_in=300. The per-PURL loops below
+        # routinely run longer than that, and every call made after expiry
+        # comes back 401 -- silently, because the loops are written to skip a
+        # failed lookup and carry on. A single run lost the last 34 of 85 VEX
+        # lookups that way. So re-mint on a timer well short of the TTL.
+        #
+        ACCESS_TOKEN=""
+        TOKEN_TYPE="Bearer"
+        TOKEN_MINTED_AT=0
+        TOKEN_MAX_AGE=200
 
-        ACCESS_TOKEN="$(
-          jq -r '.access_token // empty' <<< "${TOKEN_RESPONSE}"
-        )"
+        mint_token() {
+          local response
 
-        TOKEN_TYPE="$(
-          jq -r '.token_type // "Bearer"' <<< "${TOKEN_RESPONSE}"
-        )"
+          response="$(
+            curl "${CURL_OPTS[@]}" --retry 2 \
+              --user "${OIDC_CLIENT_ID}:${OIDC_CLIENT_SECRET}" \
+              --data "grant_type=client_credentials" \
+              "${TOKEN_ENDPOINT}"
+          )"
 
-        if [[ -z "${ACCESS_TOKEN}" ]]; then
-          echo "ERROR: OIDC token response did not contain access_token."
-          exit 1
-        fi
+          ACCESS_TOKEN="$(jq -r '.access_token // empty' <<< "${response}")"
+          TOKEN_TYPE="$(jq -r '.token_type // "Bearer"' <<< "${response}")"
+
+          if [[ -z "${ACCESS_TOKEN}" ]]; then
+            echo "ERROR: OIDC token response did not contain access_token." >&2
+            exit 1
+          fi
+
+          TOKEN_MINTED_AT="$(date +%s)"
+        }
+
+        ensure_token() {
+          local now
+          now="$(date +%s)"
+
+          if [[ -n "${ACCESS_TOKEN}" ]] \
+             && (( now - TOKEN_MINTED_AT < TOKEN_MAX_AGE )); then
+            return 0
+          fi
+
+          mint_token
+        }
+
+        ensure_token
+
+        #
+        # fetch_json <outfile> <url> [extra curl args...]
+        #
+        # The ONLY way this task talks to RHTPA. It writes <outfile> if and
+        # only if the request genuinely succeeded: curl exited 0, the status
+        # was 2xx, and the body parses as JSON. On anything else it warns,
+        # removes the partial file, and returns non-zero -- so a caller that
+        # ignores the failure skips that PURL instead of poisoning its input.
+        #
+        # The previous code appended curl's stdout straight onto an
+        # accumulator with `|| true`. A truncated 25 MB analyze response left
+        # a JSON fragment in the file, the next batch was appended behind it,
+        # and `jq -s` died with a parse error (exit 5), taking the step down.
+        # Writing through --output also means a retry TRUNCATES the file
+        # rather than appending a second copy of the body.
+        #
+        # Retries are explicit here rather than left to curl's --retry. Since
+        # we no longer pass --fail-with-body, curl considers a 504 a perfectly
+        # successful transfer and will not retry it -- and 504 is exactly what
+        # the OpenShift route returns when HAProxy's default 30 s server
+        # timeout fires before RHTPA finishes a slow analyze query.
+        #
+        FETCH_QUIET_CODES=""
+        FETCH_FAILURES=0
+
+        fetch_json() {
+          local out="$1"; shift
+          local url="$1"; shift
+          local tmp="${out}.part"
+          local code attempt reason
+
+          rm -f "${out}" "${tmp}"
+
+          for (( attempt=1; attempt <= HTTP_RETRIES + 1; attempt++ )); do
+            ensure_token
+            rm -f "${tmp}"
+
+            if ! code="$(
+                   curl "${CURL_OPTS[@]}" \
+                     --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
+                     "$@" \
+                     --output "${tmp}" \
+                     --write-out '%{http_code}' \
+                     "${url}"
+                 )"; then
+              reason="transport failure"
+
+            elif [[ "${code}" == 2* ]]; then
+              # The validator is `jq empty`, deliberately NOT `jq -e .`.
+              # `-e` sets exit 1 when the output is null or false, and RHTPA
+              # answers "I have never heard of this PURL" with a literal
+              # `null` body under HTTP 200 -- not a 404. Validating with -e
+              # read that as corruption, burned four attempts on every
+              # unknown candidate, and dropped it from the scan.
+              if ! jq empty "${tmp}" > /dev/null 2>&1; then
+                reason="HTTP ${code} with a body that is not valid JSON"
+                reason="${reason} ($(wc -c < "${tmp}" 2>/dev/null || echo 0) bytes)"
+
+              elif [[ "$(jq -r type "${tmp}" 2>/dev/null)" == "null" ]]; then
+                # An ordinary miss. Same treatment as a quiet 404: no
+                # warning, no retry, nothing counted against FETCH_FAILURES.
+                # Callers already read "no answer" as "nothing to say about
+                # this PURL", which is exactly what a null means.
+                rm -f "${tmp}"
+                return 1
+
+              else
+                mv "${tmp}" "${out}"
+                return 0
+              fi
+
+            elif [[ "${code}" == 408 || "${code}" == 429 || "${code}" == 5* ]]; then
+              reason="HTTP ${code}"
+
+            else
+              # Any other 4xx is a settled answer; retrying cannot change it.
+              if [[ " ${FETCH_QUIET_CODES} " != *" ${code} "* ]]; then
+                echo "WARNING: HTTP ${code} from ${url}" >&2
+                FETCH_FAILURES=$((FETCH_FAILURES + 1))
+              fi
+
+              rm -f "${tmp}"
+              return 1
+            fi
+
+            if (( attempt <= HTTP_RETRIES )); then
+              echo "  retrying after ${reason} (attempt ${attempt}) ${url}" >&2
+              sleep $(( attempt * 5 ))
+            fi
+          done
+
+          echo "WARNING: giving up after $(( HTTP_RETRIES + 1 )) attempt(s):" \
+               "${reason} from ${url}" >&2
+          FETCH_FAILURES=$((FETCH_FAILURES + 1))
+          rm -f "${tmp}"
+          return 1
+        }
 
         #
         # Batch PURLs.
@@ -286,21 +460,23 @@ spec:
         #   }
         # }
         #
-        rm -f /tmp/recommendations.jsonl
+        : > /tmp/recommendations.jsonl
 
         for ((i=0; i<BATCH_COUNT; i++)); do
-          BATCH="$(jq -c ".[$i]" /tmp/batches.json)"
+          jq -c "{ purls: .[$i] }" /tmp/batches.json > /tmp/recommend-body.json
 
           echo "Processing batch $((i + 1))/${BATCH_COUNT}..."
 
-          curl "${CURL_OPTS[@]}" \
-            --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
-            --header "Content-Type: application/json" \
-            --data "{\"purls\": ${BATCH}}" \
-            "${RHTPA_URL%/}/api/v2/purl/recommend" \
-            >> /tmp/recommendations.jsonl
-
-          echo >> /tmp/recommendations.jsonl
+          if fetch_json /tmp/recommend-batch.json \
+               "${RHTPA_URL%/}/api/v2/purl/recommend" \
+               --header "Content-Type: application/json" \
+               --data @/tmp/recommend-body.json; then
+            cat /tmp/recommend-batch.json >> /tmp/recommendations.jsonl
+            echo >> /tmp/recommendations.jsonl
+          else
+            echo "WARNING: recommend batch $((i + 1))/${BATCH_COUNT} failed;" \
+                 "its PURLs will have no catalog recommendation."
+          fi
         done
 
         #
@@ -385,10 +561,36 @@ spec:
           jq -r '.[]' /tmp/purls.json > /tmp/fix-scan-purls.txt
         fi
 
+        # Drop PURL types the AI tasks cannot act on. On the reference app
+        # this is the difference between 791 and 93 analyze candidates -- and
+        # since analyze returns full advisory detail per (PURL, CVE) pair, it
+        # is also the difference between ~72 MB and a few MB of response.
+        if [[ -n "${FIX_SCAN_EXCLUDE_PURL_TYPES}" ]]; then
+          BEFORE_FILTER="$(grep -c . /tmp/fix-scan-purls.txt || true)"
+
+          EXCLUDE_RE="^pkg:($(echo "${FIX_SCAN_EXCLUDE_PURL_TYPES}" | tr ',' '|'))/"
+
+          grep -Ev "${EXCLUDE_RE}" /tmp/fix-scan-purls.txt \
+            > /tmp/fix-scan-purls.filtered.txt || true
+
+          mv /tmp/fix-scan-purls.filtered.txt /tmp/fix-scan-purls.txt
+
+          echo "Excluded PURL types [${FIX_SCAN_EXCLUDE_PURL_TYPES}]:" \
+               "${BEFORE_FILTER} -> $(grep -c . /tmp/fix-scan-purls.txt || true) target(s)."
+        fi
+
         SCAN_TARGETS="$(grep -c . /tmp/fix-scan-purls.txt || true)"
         echo "Fix-version scan targets: ${SCAN_TARGETS}"
 
         # --- step 1: enumerate every known sibling version of each target ----
+        #
+        # A PURL or base PURL RHTPA has never ingested comes back as HTTP 200
+        # with a body of literal `null` -- not a 404. fetch_json handles that
+        # case itself, silently. 404 is kept quiet here too, for the paths
+        # that do return one; either way the fix scan reads it as an ordinary
+        # "nothing to offer for this version", not a problem.
+        FETCH_QUIET_CODES="404"
+
         : > /tmp/scan-targets.jsonl
         SCANNED=0
 
@@ -411,10 +613,8 @@ spec:
           # search does not match on a full purl string.
           BASE_ENCODED="$(jq -rn --arg p "${BASE_PURL}" '$p | @uri')"
 
-          if ! curl "${CURL_OPTS[@]}" \
-                 --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
-                 "${RHTPA_URL%/}/api/v2/purl/base/${BASE_ENCODED}" \
-                 --output /tmp/base-purl.json 2>/dev/null; then
+          if ! fetch_json /tmp/base-purl.json \
+                 "${RHTPA_URL%/}/api/v2/purl/base/${BASE_ENCODED}"; then
             continue
           fi
 
@@ -443,7 +643,7 @@ spec:
           | .[]
         ' /tmp/scan-targets.json > /tmp/analyze-purls.txt
 
-        jq -R -s -c --argjson size "${BATCH_SIZE}" '
+        jq -R -s -c --argjson size "${FIX_SCAN_BATCH_SIZE}" '
           [ split("\n")[] | select(length > 0) ]
           | [ range(0; length; $size) as $i | .[$i:($i + $size)] ]
         ' /tmp/analyze-purls.txt > /tmp/analyze-batches.json
@@ -453,25 +653,43 @@ spec:
              "candidate PURL(s) in ${ANALYZE_BATCHES} batch(es)."
 
         : > /tmp/cand-analyze.jsonl
+        ANALYZE_FAILED=0
 
         for ((i=0; i<ANALYZE_BATCHES; i++)); do
-          BATCH="$(jq -c ".[$i]" /tmp/analyze-batches.json)"
+          jq -c "{ purls: .[$i] }" /tmp/analyze-batches.json \
+            > /tmp/analyze-body.json
 
-          curl "${CURL_OPTS[@]}" \
-            --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
-            --header "Content-Type: application/json" \
-            --data "{\"purls\": ${BATCH}}" \
-            "${RHTPA_URL%/}/api/v2/vulnerability/analyze" \
-            >> /tmp/cand-analyze.jsonl || true
-
-          echo >> /tmp/cand-analyze.jsonl
+          if fetch_json /tmp/analyze-batch.json \
+               "${RHTPA_URL%/}/api/v2/vulnerability/analyze" \
+               --header "Content-Type: application/json" \
+               --data @/tmp/analyze-body.json; then
+            cat /tmp/analyze-batch.json >> /tmp/cand-analyze.jsonl
+            echo >> /tmp/cand-analyze.jsonl
+          else
+            ANALYZE_FAILED=$((ANALYZE_FAILED + 1))
+            echo "WARNING: analyze batch $((i + 1))/${ANALYZE_BATCHES} failed;" \
+                 "its candidates will be treated as unverified and dropped."
+          fi
         done
+
+        if (( ANALYZE_FAILED > 0 )); then
+          echo "WARNING: ${ANALYZE_FAILED}/${ANALYZE_BATCHES} analyze batch(es)" \
+               "failed. The fix-version list below is incomplete but sound:" \
+               "a candidate is only ever offered on a response we actually got."
+        fi
 
         # purl -> [CVEs matched by version range]. A purl absent from the
         # response is clean, which `// []` handles at lookup time.
+        #
+        # `select(type == "object")` is no longer load-bearing -- fetch_json
+        # guarantees every line is a parsed 2xx body -- but the per-entry
+        # `objects` guard stays, so an unexpected response shape downgrades
+        # one PURL instead of aborting the step.
         jq -s '
           reduce (.[] | select(type == "object")) as $r ({}; . + $r)
-          | with_entries(.value = ([ .value.details[]?.identifier ] | unique))
+          | with_entries(
+              .value = ([ (.value | objects | .details[]?.identifier) ] | unique)
+            )
         ' /tmp/cand-analyze.jsonl > /tmp/cand-affected.json
 
         # --- step 3: explicit statements, only where analyze says "affected" --
@@ -485,10 +703,8 @@ spec:
 
           CAND_ENCODED="$(jq -rn --arg p "${CANDIDATE}" '$p | @uri')"
 
-          if ! curl "${CURL_OPTS[@]}" \
-                 --header "Authorization: ${TOKEN_TYPE} ${ACCESS_TOKEN}" \
-                 "${RHTPA_URL%/}/api/v2/purl/${CAND_ENCODED}" \
-                 --output /tmp/candidate.json 2>/dev/null; then
+          if ! fetch_json /tmp/candidate.json \
+                 "${RHTPA_URL%/}/api/v2/purl/${CAND_ENCODED}"; then
             continue
           fi
 
