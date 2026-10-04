@@ -404,7 +404,7 @@ enable.
 | `gitlab-webhook-secret` (key `secretToken`) | Shared token the `gitlab` interceptor checks against GitLab's `X-Gitlab-Token`. |
 | `git-auth` (Secret) | **Private repos only** — clone credentials. Not bound by either template by default (see the note at the end of this section); a public app repo needs none. |
 | `scm-auth-secret` (Secret) | SCM token to open the MR (`api` scope on GitLab). |
-| `maven-settings` (Secret) | Maven `settings.xml` for the build — mirrors all resolution through the Artifactory `maven` virtual repo. A **Secret** (not a ConfigMap) because Artifactory OSS has anonymous access off, so the settings.xml embeds a `<server>` credential. See `secrets/maven-settings-secret.example.yaml`. |
+| `maven-settings` (Secret) | Maven `settings.xml` for the build — mirrors all resolution through the Artifactory `maven` virtual repo. A **Secret** (not a ConfigMap) because Artifactory OSS has anonymous access off, so the settings.xml embeds a `<server>` credential. The mirror URL is the in-cluster **Service** (`http://artifactory.artifactory.svc.cluster.local:8082/artifactory/maven`), not the public Route — see the route-timeout caveat below. See `secrets/maven-settings-secret.example.yaml`. |
 | `ai-agent-config` + `ai-agent-secret` | AI backend config (as for the other pipelines). |
 
 **4. Apply the trigger stack** (one file — ServiceAccount, RBAC, TriggerBinding,
@@ -932,6 +932,41 @@ are a settled answer and return immediately.
 > everything**. The node itself is at ~8 % CPU, so this is self-inflicted by the
 > limit. It is also the likeliest reason recommend costs 4 s per PURL; raising
 > the limit should pull the latencies above down with it.
+
+> **The same 30 s timeout bites Artifactory — with a different signature.** The
+> `artifactory` route also ships with no `haproxy.router.openshift.io/timeout`,
+> and a cold build is more exposed than it looks: the scratch copy starts from an
+> empty local repo and pulls hundreds of artifacts, and every one Artifactory has
+> not cached it fetches from Maven Central *while holding the client connection
+> open*. Measured through the route, a cold fetch scales with artifact size — 1 MB
+> in 1.9 s, 5 MB in 9.4 s, 16 MB in **21.3 s**, already 70 % of the budget. A
+> burst crosses 30 s, HAProxy kills the connection, and Maven reports it not as a
+> 504 but as
+>
+> ```
+> Could not transfer artifact org.codehaus.plexus:plexus-utils:jar:3.0.24
+>   from/to artifactory (https://artifactory-artifactory.apps.<domain>/artifactory/maven):
+>   artifactory-artifactory.apps.<domain>:443 failed to respond
+> ```
+>
+> — named after whichever request happened to be in flight, typically some
+> innocent 247 KB transitive rather than the slow artifact that actually consumed
+> the budget. Re-running "fixes" it only because the first attempt warmed the
+> cache, which is what makes this look intermittent.
+>
+> The fix is to skip the router entirely: `maven-settings` points the mirror at
+> the in-cluster Service,
+> `http://artifactory.artifactory.svc.cluster.local:8082/artifactory/maven`. No
+> proxy in the path, no 30 s cap, no TLS handshake, and no cluster hostname baked
+> into the Secret. Use the route only from outside the cluster (a manual run from
+> a laptop, the workshop UI), and annotate it first — unlike RHTPA's, this Route
+> has **no `ownerReferences`**, so it is not controller-generated and a direct
+> annotation sticks:
+>
+> ```sh
+> oc -n artifactory annotate route artifactory \
+>   haproxy.router.openshift.io/timeout=300s --overwrite
+> ```
 
 The two tasks then diverge on what a failed batch *means*. In
 `rhtpa-remediation-report` a dropped batch only shrinks the candidate list, so it
