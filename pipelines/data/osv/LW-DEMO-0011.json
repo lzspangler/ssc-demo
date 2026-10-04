@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.6.0",
+  "id": "LW-DEMO-0011",
+  "aliases": [
+    "CVE-2025-48924"
+  ],
+  "modified": "2026-10-04T00:00:00Z",
+  "published": "2026-10-04T00:00:00Z",
+  "summary": "Lightwell backport remediation for CVE-2025-48924 (org.apache.commons:commons-lang3)",
+  "details": "Uncontrolled recursion in ClassUtils.getAbbreviatedName(). Upstream fixes this in 3.18.0; Lightwell backports the fix onto the 3.14.0 line so the dependency can be remediated without a minor-version bump.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.apache.commons:commons-lang3",
+        "purl": "pkg:maven/org.apache.commons/commons-lang3@3.14.0"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.14.0.rhlw-00001"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "3.14.0"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://packages.redhat.com/lightwell/osv/java/remediated"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2025-48924"
+    }
+  ],
+  "database_specific": {
+    "lightwell_tier": "remediated",
+    "lightwell_base_version": "3.14.0",
+    "lightwell_remediated_version": "3.14.0.rhlw-00001",
+    "osv_path": "osv/java/remediated/LW-DEMO-0011.json"
+  }
+}

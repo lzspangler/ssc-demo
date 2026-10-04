@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.6.0",
+  "id": "LW-DEMO-0012",
+  "aliases": [
+    "CVE-2022-40152"
+  ],
+  "modified": "2026-10-04T00:00:00Z",
+  "published": "2026-10-04T00:00:00Z",
+  "summary": "Lightwell backport remediation for CVE-2022-40152 (com.fasterxml.woodstox:woodstox-core)",
+  "details": "Stack buffer overflow parsing deeply nested DTD content. Upstream fixes this in 6.4.0; Lightwell backports the fix onto the 6.0.3 line.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "com.fasterxml.woodstox:woodstox-core",
+        "purl": "pkg:maven/com.fasterxml.woodstox/woodstox-core@6.0.3"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "6.0.3.rhlw-00001"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "6.0.3"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://packages.redhat.com/lightwell/osv/java/remediated"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2022-40152"
+    }
+  ],
+  "database_specific": {
+    "lightwell_tier": "remediated",
+    "lightwell_base_version": "6.0.3",
+    "lightwell_remediated_version": "6.0.3.rhlw-00001",
+    "osv_path": "osv/java/remediated/LW-DEMO-0012.json"
+  }
+}

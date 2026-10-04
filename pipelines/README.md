@@ -60,8 +60,8 @@ tasks) with description and the **external systems** it talks to.
 | `package` (`maven`) | always | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
 | `build-container` (`buildah-rhtap`) | always | Builds the container image from `dockerfile`/`path-context` and pushes it; emits `IMAGE_URL`/`IMAGE_DIGEST` and the SBOM. | **Image registry** — pushes the built image (`output-image`). |
 | `upload-sbom-to-rhtpa` (`upload-sbom-to-rhtpa`) | always | Uploads the generated SBOM(s) to RHTPA/Trustify for the component. | **RHTPA / Trustify** — SBOM ingest (auth via `tpa-secret` OIDC). |
-| `rhtpa-vulnerability-analysis` (`rhtpa-vulnerability-analysis`) | always | Analyzes the uploaded SBOM against RHTPA's vuln data; writes the authoritative `VULNERABILITY_REPORT` (CVE + severity + affected PURL). | **RHTPA / Trustify** — `POST /vulnerability/analyze`. |
-| `rhtpa-remediation-report` (`rhtpa-remediation-report`) | always | Looks up vendor fixed-version recommendations; writes the supplemental `REMEDIATION_REPORT` (usually empty for upstream-only Maven deps). | **RHTPA / Trustify** — `POST /purl/recommend`. |
+| `rhtpa-vulnerability-analysis` (`rhtpa-vulnerability-analysis`) | always | Analyzes the uploaded SBOM against RHTPA's vuln data, then suppresses findings an advisory explicitly marks fixed/not_affected for the exact PURL; writes the authoritative `VULNERABILITY_REPORT` (CVE + severity + affected PURL, plus `.suppressed`). See [why the suppression pass exists](#why-the-pipeline-needs-a-vex-suppression-pass). | **RHTPA / Trustify** — `POST /vulnerability/analyze`, `GET /purl/{purl}`. |
+| `rhtpa-remediation-report` (`rhtpa-remediation-report`) | always | Resolves a concrete fix version per (PURL, CVE) by re-analyzing every known sibling version of each affected PURL, backports first; writes `REMEDIATION_REPORT` with `.fix_versions` (authoritative) and `.recommendations` (the catalog lookup, usually empty for upstream-only Maven deps). | **RHTPA / Trustify** — `GET /purl/base/{purl}`, `POST /vulnerability/analyze`, `GET /purl/{purl}`, `POST /purl/recommend`. |
 | `conforma-policy-check` (`conforma-policy-check`) | always | Turns the vuln report into a policy **must-fix** CVE set (Conforma/EC gate, severity-based fallback); writes `MUST_FIX_PATH`. | **Conforma / EC** — optional policy source fetch (`conforma-policy-configuration`); empty uses the local severity fallback. |
 | `ai-select-cve` (`ai-select-cve`) | always | AI selects **exactly one** CVE from the must-fix set, steered by `ai-remediation-policy`; emits structured results (`SELECTED`, `CVE_ID`, `PACKAGE`, `CURRENT_VERSION`, `FIXED_VERSION`, `JUSTIFICATION`) that become this pipeline's results. | **AI model server** — CVE-selection reasoning call (`ai-python-image`). |
 | `show-sbom` (`show-sbom-rhdh`) | `finally` | Displays the SBOM for the built image in the PipelineRun output. | **Image registry** — reads the image/SBOM referenced by `IMAGE_URL`. |
@@ -120,10 +120,17 @@ image build, SBOM upload, or RHTPA scan.
 | `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation` (one EventListener + interceptors + a binding/template pair per command + RBAC + Route) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
+| `ops/rhtpa-upload-advisory.sh` | Script — uploads/verifies/deletes a **single** advisory document (OSV/CSAF/…) in RHTPA, for records no importer covers |
+| `ops/rhtpa-load-lightwell-data.sh` | Script — loads **the whole Lightwell remediation dataset** (`data/osv/` + `data/sbom/`) into RHTPA and verifies it; `--verify` / `--purge` |
+| `ops/ai-agent-image-prewarm-daemonset.yaml` | DaemonSet — pre-pulls the large agent image onto every node so steps can't flake on ImagePullBackOff |
+| `data/osv/LW-DEMO-001*.json` | OSV advisories — one per CVE, each declaring the Lightwell `.rhlw-00001` backport as the `fixed` version (see [Lightwell remediation data](#lightwell-remediation-data)) |
+| `data/sbom/*.cdx.json` | One-component CycloneDX catalog SBOMs — their only job is to make each `.rhlw-00001` build a *known version* of its base PURL, so the fix-version scan can offer it |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
 | `secrets/scm-auth-secret.example.yaml` | Example Secret — Git token for opening the PR/MR |
 | `secrets/gitlab-webhook-secret.example.yaml` | Example Secret — shared token validating the GitLab issue webhook |
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
+| `tasks/rhtpa-vulnerability-analysis1.yaml` | Scans the SBOM's PURLs against RHTPA, then suppresses findings explicitly marked fixed/not_affected |
+| `tasks/rhtpa-remediation-report2.yaml` | Resolves a concrete fix version per (PURL, CVE) — `.fix_versions`, backports first |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
 | `tasks/ai-select-cve.yaml` | AI selects one CVE (structured output) |
 | `tasks/ai-analyze-cves.yaml` | AI decides per fixable CVE (with severity + available fixed versions); renders one issue title/body/labels triple each |
@@ -670,6 +677,134 @@ Treat it as done only when the importer shows a non-null `lastSuccess` (a non-nu
 network/pod-restart during the large fetch; re-run the Job). Once `redhat-sboms`
 succeeds, re-test `/purl/recommend` for a Red Hat-shipped component to confirm the
 catalog is populated.
+
+### Loading a single advisory into RHTPA (no importer)
+
+The importers above are bulk feeds bound to remote **sources** — `osv-github`
+clones a git repository, `cve` the CVE List repo. None of them will pick up one
+hand-written demo record, and a flat HTTP directory of OSV JSON (an Artifactory
+generic repo, say) is **not** a valid importer source. For one-off documents use
+the ad-hoc upload endpoint instead, via `ops/rhtpa-upload-advisory.sh`:
+
+```sh
+ops/rhtpa-upload-advisory.sh -l source=lightwell data/osv/LW-DEMO-0012.json
+ops/rhtpa-upload-advisory.sh --verify LW-DEMO-0012     # what's ingested, all versions
+ops/rhtpa-upload-advisory.sh --delete <uuid>           # delete + wait for it to land
+```
+
+(To load the whole Lightwell dataset rather than one record, use
+`ops/rhtpa-load-lightwell-data.sh` — see
+[Lightwell remediation data](#lightwell-remediation-data) below.)
+
+It reads `tpa-secret` from `-n/--namespace` (default `tssc-app-ci`), mints the
+same client-credentials token the `upload-sbom-to-rhtpa` task uses, and
+`POST`s to `/api/v2/advisory?format=osv&labels.<k>=<v>` (`format` also accepts
+`csaf`, `cve`, `spdx`, `cyclonedx`, …).
+
+Three RHTPA behaviours the script exists to guard against — all verified against
+RHTPA 2.2.6 on cluster-6jnws:
+
+- **An OSV record with no `aliases` ingests but stays inert.** Trustify takes the
+  linked vulnerability from the `aliases` (the CVE), *not* from the document's own
+  `id`. Without one you get HTTP 201, a downloadable document, and
+  `"vulnerabilities": []` — it never appears in `/api/v2/vulnerability/analyze`, so
+  `rhtpa-vulnerability-analysis` ignores it. The script refuses such a file unless
+  you pass `--allow-inert`. It also warns when a Maven `package.purl` disagrees
+  with `package.name` (a mismatched purl matches nothing in any SBOM).
+- **Re-uploading the same document id versions, it does not replace.** The copy
+  with the latest `modified` is current; older ones are deprecated, and
+  `GET /api/v2/advisory` defaults to `deprecated=Ignore`. A corrected re-upload
+  that forgets to bump `modified` is therefore invisible to search while still
+  fetchable by uuid — "it uploaded but I can't find it". The script warns when the
+  version it just pushed did not become current; `--verify` lists every version.
+- **`DELETE /api/v2/advisory/{uuid}` returns HTTP 504 but succeeds
+  asynchronously** (~1–2 min), because the OpenShift router times out before
+  Trustify finishes. Don't retry on the 504 — poll `GET .../{uuid}` for a 404,
+  which is what `--delete` does.
+
+### Lightwell remediation data
+
+The demo ships two **backport** builds — dependencies that keep their base
+version and add a vendor suffix carrying the patch:
+
+| Vulnerable GAV | Backport | CVEs |
+|----------------|----------|------|
+| `org.apache.commons:commons-lang3:3.14.0` | `3.14.0.rhlw-00001` | CVE-2025-48924 |
+| `com.fasterxml.woodstox:woodstox-core:6.0.3` | `6.0.3.rhlw-00001` | CVE-2022-40152 … -40156 |
+
+For a backport to be *supported* end to end it has to do two separate things,
+and each needs its own piece of data:
+
+1. **Be recommended** as the fix for its CVEs. `rhtpa-remediation-report`'s
+   fix-version scan walks every *known version* of an affected base PURL, so the
+   backport must be a known version — which it only becomes once some ingested
+   document mentions it. That is what the one-component CycloneDX files in
+   `data/sbom/` are for.
+2. **Scan clear** once applied. The OSV records in `data/osv/` each alias one
+   real CVE and declare `ranges[].events[].fixed = <X.Y.Z.rhlw-00001>`; Trustify
+   turns that event into `status: fixed` for the remediated PURL.
+
+Load and verify both halves with one command:
+
+```sh
+ops/rhtpa-load-lightwell-data.sh            # load, then verify
+ops/rhtpa-load-lightwell-data.sh --verify   # verify only, change nothing
+ops/rhtpa-load-lightwell-data.sh --purge    # delete what a previous load created
+```
+
+`--verify` prints, per remediated PURL, the base PURL's known versions (goal 1)
+and every CVE that still range-matches it along with the advisory that clears it
+(goal 2). It exits non-zero on any `[FAIL]`.
+
+To add another backport: drop an OSV record and a catalog SBOM into `data/`, add
+the `"<base purl>|<remediated purl>"` pair to `PAIRS` in the script, and re-run
+it. Keep the `LW-DEMO-001x` id range clear of the synthetic workshop seeds in
+`automation/gitops/components/lightwell-repo/files/seed/`, which already use
+`LW-DEMO-0001` and `-0002`.
+
+#### Why the pipeline needs a VEX suppression pass
+
+`POST /api/v2/vulnerability/analyze` is **pure version-range matching, and it
+only ever returns the `affected` bucket** — `fixed` and `not_affected` never
+appear in its response, and it ignores purl qualifiers. That is fine for a
+straight upgrade (`woodstox-core@6.4.0.redhat-00003` falls outside the upstream
+`< 6.4.0` range, so analyze returns `{}` for it) but it is *wrong* for a
+backport: `6.0.3.rhlw-00001` still sorts inside `[0, 6.4.0)`, so analyze keeps
+reporting all five CVEs against it no matter what remediation data is loaded.
+No amount of VEX or CSAF changes this.
+
+`GET /api/v2/purl/<url-encoded purl>` is the only endpoint that exposes
+fixed/not_affected. `rhtpa-vulnerability-analysis` therefore makes a second pass
+over it for each affected PURL and drops the pairs an advisory explicitly
+clears, keeping them in `.suppressed` so the report names *which* advisory
+cleared *what* instead of silently losing findings.
+
+The two endpoints are **not** interchangeable, and the trap runs the other way
+too: `/purl/{purl}` is scoped to the *exact* purl string, so
+`woodstox-core@6.0.3.redhat-00001` unqualified carries no statuses at all (the
+real ones hang off its `?repository_url=…&type=jar` variant) and naively reading
+"no statuses" as "clean" will recommend a still-vulnerable rebuild. The
+fix-version scan in `rhtpa-remediation-report` guards against this by using
+batched `analyze` as the authoritative range signal and explicit purl statuses
+only as an override. `/purl/recommend` is not relied on at all — its candidate
+selection is opaque and it offered neither the backport nor the genuinely clean
+`6.4.0.redhat-00003`.
+
+The relevant task knobs:
+
+| Task | Param / result | Purpose |
+|------|----------------|---------|
+| `rhtpa-vulnerability-analysis` | `SUPPRESS_VEXED` (`"true"`) | Honour fixed/not_affected. Set `"false"` to see raw analyze output. |
+| | `MAX_VEX_LOOKUPS` (`"300"`) | Cap on per-PURL status lookups; beyond it the rest are left unsuppressed. |
+| | `SUPPRESSED_COUNT` (result) | Number of (PURL, CVE) pairs suppressed. |
+| `rhtpa-remediation-report` | `VULNERABILITY_REPORT_PATH` (`""`) | Scope the fix-version scan to the PURLs that actually have findings; defaults to `<workspace>/rhtpa/vulnerabilities.json`. |
+| | `MAX_FIX_SCAN_PURLS` (`"60"`), `MAX_VERSIONS_PER_PURL` (`"40"`) | Bound the sibling-version fan-out. |
+| | `FIX_VERSION_COUNT` (result) | Number of (PURL, CVE) pairs a fix version was found for. |
+
+`.fix_versions` from that report — ordered backports first, each entry carrying
+`version`, `purl`, `cleared_by` and `backport` — is what `ai-analyze-cves`
+consumes as its authoritative candidate list, and its default `POLICY_CONTEXT`
+tells the model to prefer a backport over any version bump.
 
 ## One-time setup
 

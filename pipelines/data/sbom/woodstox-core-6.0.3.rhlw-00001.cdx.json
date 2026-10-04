@@ -1,0 +1,43 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:5f2b1c90-0b1a-4c6a-9a2e-6c2d1f0a1102",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-10-04T00:00:00Z",
+    "tools": [
+      {
+        "vendor": "Lightwell",
+        "name": "lightwell-remediation-catalog",
+        "version": "1.0.0"
+      }
+    ],
+    "component": {
+      "type": "library",
+      "bom-ref": "pkg:maven/com.fasterxml.woodstox/woodstox-core@6.0.3.rhlw-00001",
+      "group": "com.fasterxml.woodstox",
+      "name": "woodstox-core",
+      "version": "6.0.3.rhlw-00001",
+      "purl": "pkg:maven/com.fasterxml.woodstox/woodstox-core@6.0.3.rhlw-00001",
+      "properties": [
+        {
+          "name": "lightwell:tier",
+          "value": "remediated"
+        },
+        {
+          "name": "lightwell:baseVersion",
+          "value": "6.0.3"
+        },
+        {
+          "name": "lightwell:remediatedVersion",
+          "value": "6.0.3.rhlw-00001"
+        },
+        {
+          "name": "lightwell:osvId",
+          "value": "LW-DEMO-0012"
+        }
+      ]
+    }
+  },
+  "components": []
+}
