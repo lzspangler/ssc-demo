@@ -91,7 +91,7 @@ selection — those live in `agentic-cve-selection`.
 |------------------|-----------|-------------|------------------------------|
 | `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
 | `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
-| `ai-remediate-dependency` (`ai-remediate-dependency`) | if `SELECTED="1"` | AI edits `pom.xml` to bump only the vulnerable dependency (`PACKAGE`) to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for the verify-compile). |
+| `ai-remediate-dependency` (`ai-remediate-dependency`) | if `SELECTED="1"` | AI edits `pom.xml` to bump only the vulnerable dependency (`PACKAGE`) to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** — Maven repo/mirror (`maven-settings`), installed as `~/.m2/settings.xml` so both the verify-compile and the agent's own `mvn` calls resolve through it. A pinned Lightwell `.rhlw` backport does not exist on Central, so without this workspace the verify-compile fails on the version the agent just pinned. |
 | `re-run-tests` (`maven`) | if `SELECTED="1"` | Runs `mvn verify` against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
 | `open-pr` (`open-pr`) | if `SELECTED="1"` | Commits the remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR (carries the CVE/fix context; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger). Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
@@ -105,7 +105,7 @@ image build, SBOM upload, or RHTPA scan.
 | `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
 | `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
 | `package` (`maven`) | always | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
-| `ai-generate-tests` (`ai-generate-tests`) | always | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** (Maven deps for compiling/running tests). |
+| `ai-generate-tests` (`ai-generate-tests`) | always | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** — Maven repo/mirror (`maven-settings`), installed as `~/.m2/settings.xml` so both the scratch verification build and the agent's own `mvn test` calls resolve through it. Once a remediation PR has merged, the tree carries a Lightwell `.rhlw` pin that does not exist on Central. |
 | `re-run-tests` (`maven`) | always | Runs `mvn verify` (existing + generated tests) against the tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
 | `open-pr` (`open-pr-tests`) | always | Commits **only** the generated tests (`src/test`) to an `ai-tests/*` branch and opens a tests-only PR/MR (no CVE/fix wording; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger); no-ops if nothing changed. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
@@ -460,21 +460,43 @@ didn't start with `/remediate`, or it was on an MR rather than an issue.
 >   `expression` and the `TriggerBinding` refs *do* use the `extensions.` prefix.
 
 Both `TriggerTemplate`s bind a fresh `workspace` PVC per run and back
-`maven-settings` with an **`emptyDir`** (override `workspace-size` / `scm-secret-name`
-if your names differ). `maven-settings` is an *optional* workspace on the `maven`
-task — its generate step writes a default `settings.xml` when none is supplied — so
-an `emptyDir` suffices and matches how the manual runs are launched. It is
-deliberately **not** a ConfigMap: a configMap-backed workspace whose ConfigMap
-doesn't exist leaves the `package`/`re-run-tests` pod stuck in `PodInitializing`
-forever (never an error, just hangs — the same trap as a missing `git-auth` Secret,
-below). To route the build through the **Artifactory `maven` virtual repo**, create
-the `maven-settings` **Secret** (`secrets/maven-settings-secret.example.yaml` — a
-`settings.xml` with a `<mirror>`/`<server>` pair) and bind it as
-`secret: {secretName: maven-settings}` (or, on a manual run,
-`-w name=maven-settings,secret=maven-settings`). It must be a Secret rather than a
-ConfigMap because Artifactory OSS has anonymous access off, so `settings.xml` carries
-credentials; the same missing-backing `PodInitializing` hang applies, so create the
-Secret before binding it. Neither binds `git-auth`: it's an
+`maven-settings` with the **`maven-settings` Secret** (override `workspace-size` /
+`scm-secret-name` if your names differ):
+
+```yaml
+- name: maven-settings
+  secret:
+    secretName: maven-settings
+```
+
+This routes every Maven invocation in the run through the **Artifactory `maven`
+virtual repo**, which aggregates the `lightwell-remediated` / `lightwell-validated`
+proxies alongside `maven-central`. That is not optional for these two pipelines:
+both agentic flows end up building a tree that pins a Lightwell backport such as
+`6.0.3.rhlw-00001`, and that coordinate does **not** exist on Maven Central — an
+`emptyDir` lets the `maven` task generate a default `settings.xml` and the build
+then fails with `Could not find artifact … in central` on the very version the
+remediation just pinned.
+
+It must be a **Secret**, not a ConfigMap, because Artifactory OSS has anonymous
+access off, so `settings.xml` carries a `<server>` credential — see
+`secrets/maven-settings-secret.example.yaml`. Create it *before* the first trigger
+fires: a secret-backed workspace whose Secret is missing leaves the pod stuck in
+`PodInitializing` forever (never an error, just hangs — the same trap as a missing
+`git-auth` Secret, below).
+
+```
+oc -n tssc-app-ci create secret generic maven-settings \
+  --from-file=settings.xml=./settings.xml
+```
+
+Note that the four AI tasks reach the mirror by a different route than the `maven`
+task does. `ai-remediate-dependency` and `ai-generate-tests` copy the workspace's
+`settings.xml` to `~/.m2/settings.xml` at the top of their step, because the coding
+agent composes its own `mvn` command lines and there is no way to add `-s` to them;
+one file covers both the agent's calls and the task's own scratch verification
+build. Both declare `maven-settings` *optional*, so a run without it still starts —
+it logs a warning and then fails at resolution. Neither template binds `git-auth`: it's an
 optional pipeline workspace, and a secret-backed workspace whose Secret is missing
 leaves the clone pod stuck in `PodInitializing` forever (never an error, just
 hangs), which can't be bound conditionally in a TriggerTemplate. A public app repo

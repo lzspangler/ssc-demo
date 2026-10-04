@@ -199,17 +199,29 @@ spec:
                 resources:
                   requests:
                     storage: $(tt.params.workspace-size)
-          # maven-settings is OPTIONAL on the maven task: its generate step writes a
-          # default settings.xml when none is supplied, so an emptyDir is enough. Do
-          # NOT back this with a configMap unless that configMap actually exists --
-          # a configMap-backed workspace whose configMap is missing leaves the
-          # package pod stuck in PodInitializing forever (never errors, just hangs),
-          # the same trap as a missing git-auth secret. For a private Maven mirror,
-          # create the configMap first, then swap this for:
-          #   configMap:
-          #     name: maven-settings
+          # maven-settings carries the settings.xml that routes ALL dependency
+          # resolution through the Artifactory `maven` virtual repo. re-run-tests
+          # runs `mvn verify` against the remediated tree, and the whole point of
+          # the remediation is a backported coordinate that is NOT on Maven
+          # Central -- so the build has to resolve through the mirror or it fails
+          # to find the very version the agent just pinned. An emptyDir would let
+          # the maven task generate a default settings.xml pointed at Central.
+          #
+          # A Secret, not a ConfigMap: Artifactory OSS has anonymous access off,
+          # so the settings.xml embeds a <server> credential. The maven task's
+          # generate step copies `<workspace>/settings.xml` verbatim when it is
+          # present, which is exactly the Secret's single data key.
+          #
+          # The Secret MUST exist in this namespace before a trigger fires -- a
+          # secret-backed workspace whose Secret is missing leaves the pod stuck
+          # in PodInitializing forever (never errors, just hangs), the same trap
+          # as a missing git-auth secret. Create it from
+          # secrets/maven-settings-secret.example.yaml:
+          #   oc -n tssc-app-ci create secret generic maven-settings \
+          #     --from-file=settings.xml=./settings.xml
           - name: maven-settings
-            emptyDir: {}
+            secret:
+              secretName: maven-settings
           # NOTE: git-auth (clone credentials) is intentionally NOT bound here.
           # It is optional on the pipeline, and a secret-backed workspace whose
           # secret is missing leaves the clone pod stuck in PodInitializing
@@ -303,12 +315,17 @@ spec:
                 resources:
                   requests:
                     storage: $(tt.params.workspace-size)
-          # maven-settings backed by an emptyDir (optional workspace; maven generates
-          # a default settings.xml). See the remediation template above for why this
-          # is NOT a configMap. For a private Maven mirror, create a `maven-settings`
-          # configMap and swap this for `configMap: {name: maven-settings}`.
+          # maven-settings carries the settings.xml that routes ALL dependency
+          # resolution through the Artifactory `maven` virtual repo. Both
+          # ai-generate-tests (the agent's own `mvn test` plus its scratch
+          # verification build) and re-run-tests need it: once a remediation PR
+          # has merged, the tree carries a Lightwell backport pin that does not
+          # exist on Maven Central. See the remediation template above for the
+          # full reasoning and the `oc create secret` command. The Secret MUST
+          # exist in this namespace or the pod hangs in PodInitializing.
           - name: maven-settings
-            emptyDir: {}
+            secret:
+              secretName: maven-settings
           # git-auth intentionally NOT bound -- same reasoning as the remediation
           # template above (optional workspace; a missing secret hangs the clone
           # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
