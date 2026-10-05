@@ -1,0 +1,129 @@
+# -----------------------------------------------------------------------------
+# Prerequisites for Red Hat Trusted Profile Analyzer: the PostgreSQL instance
+# RHTPA stores its graph in, the OIDC client secret it authenticates with, and
+# (for S3 storage) the ObjectBucketClaim its documents live in.
+#
+# Vendored from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2
+# (`trusted-profile-analyzer/charts/tpa-prerequisites`), which is what the
+# reference cluster runs. RHTPA itself is NOT vendored -- it is the Red Hat
+# chart `redhat-trusted-profile-analyzer` from https://charts.openshift.io/,
+# referenced directly by its Argo Application.
+# -----------------------------------------------------------------------------
+
+nameOverride: "tpa-postgresql"
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: registry.redhat.io/rhel9/postgresql-16
+  pullPolicy: IfNotPresent
+  tag: "1"
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+
+# Raised well above the upstream 250m/1Gi. RHTPA's importers replay the whole
+# CVE List, the GitHub advisory database and the Red Hat CSAF feed into this
+# database; at the upstream limit the ingest saturates the CPU quota, queries
+# from the server time out, and the readiness probe below starts failing --
+# which restarts Postgres mid-ingest and leaves the analysis endpoints
+# answering with partial data. These are the values the reference cluster
+# converged on.
+resources:
+  limits:
+    cpu: '2'
+    memory: 4Gi
+  requests:
+    cpu: 500m
+    memory: 2Gi
+
+livenessProbe:
+  timeoutSeconds: 1
+  initialDelaySeconds: 5
+  tcpSocket:
+    port: 5432
+
+readinessProbe:
+  # 1 s (upstream) is not enough under importer load: a `SELECT 1` that is
+  # merely queued behind the ingest counts as a failed probe, Postgres is
+  # marked NotReady, and the server loses its database for as long as the
+  # import runs.
+  timeoutSeconds: 5
+  initialDelaySeconds: 5
+  exec:
+    command:
+    - "/bin/sh"
+    - "-i"
+    - "-c"
+    - psql -h 127.0.0.1 -U $POSTGRESQL_USER -q -d $POSTGRESQL_DATABASE -c 'SELECT 1'
+
+service:
+  portName: postgresql
+  port: 5432
+  containerPort: 5432
+  type: ClusterIP
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+pgsql:
+  user: trustify
+  database: trustify
+  # DO NOT commit a real password. The same value must be given to the RHTPA
+  # chart as `database.password`.
+  password: REPLACE_ME
+
+persistence:
+  mode: persistent
+  capacity: 20Gi
+
+storage:
+  # s3 | filesystem -- must match the RHTPA chart's own `storage.type`.
+  #
+  # s3 creates the ObjectBucketClaim below and REQUIRES OpenShift Data
+  # Foundation (the `openshift-storage.noobaa.io` provisioner). This is what
+  # the reference cluster uses.
+  #
+  # filesystem needs no bucket at all, so this chart creates nothing and RHTPA
+  # provisions its own PVC. Cheaper, but the server and importer Deployments
+  # mount that one PVC simultaneously and the RHTPA chart hardcodes
+  # ReadWriteOnce on it with no override -- an RWX storage class does not help,
+  # the two pods simply have to co-schedule. Prefer s3.
+  type: s3
+  bucketName: trustify
+  storageClassName: openshift-storage.noobaa.io
+
+oidc:
+  # Keycloak realm issuer, e.g.
+  # https://sso.apps.<subdomain>/realms/backstage. Leave empty to derive it
+  # from global.cluster.subdomain.
+  issuerUrl: ""
+  ssoHostPrefix: sso
+  realm: backstage
+  tpaCli:
+    # Written to the `oidc-tpa-cli` Secret that RHTPA reads. MUST equal the
+    # keycloak component's `client.tpaCli.secret` and the pipeline's
+    # `tpa-secret`; a mismatch shows up only as 401s from RHTPA.
+    secret: REPLACE_ME
+
+global:
+  cluster:
+    # Apps subdomain of the target cluster, e.g. apps.cluster-abcde.example.com.
+    subdomain: ""
+
+argocd:
+  enabled: true
+  syncwave: "-1"

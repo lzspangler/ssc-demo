@@ -1,0 +1,39 @@
+{{- if .Values.pipeline.namespace }}
+# The seeding job mints a GitLab project access token and a webhook token and
+# writes both into the PIPELINE namespace as `scm-auth-secret` /
+# `gitlab-webhook-secret`, which is what removes the last hand-wiring step from
+# the demo setup. That is a cross-namespace write, so the gitlab ServiceAccount
+# needs rights on Secrets there -- and only on Secrets. Upstream bound `edit`
+# into the Vault namespace for the equivalent job; this is the narrow version.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-pipeline-secrets
+  namespace: {{ .Values.pipeline.namespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    app: gitlab
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-pipeline-secrets
+  namespace: {{ .Values.pipeline.namespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    app: gitlab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-pipeline-secrets
+subjects:
+  - kind: ServiceAccount
+    name: gitlab
+    namespace: {{ .Release.Namespace }}
+{{- end }}

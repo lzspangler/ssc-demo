@@ -1,63 +1,134 @@
-# Minimal workshop Keycloak — issuer https://sso.<deployer.domain>/realms/tpa
-# Matches automation/gitops/components/rhtpa oidc.* defaults (frontend + cli clients).
+# -----------------------------------------------------------------------------
+# Red Hat build of Keycloak for ssc-demo.
+#
+# Vendored from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2 (`keycloak`),
+# which is what the reference cluster runs. Four subcharts, in sync-wave order:
+# the operator (-3/-2), Postgres (-3), the Keycloak CR + Route (-1), and the
+# realm import (-1).
+#
+# ssc-demo only needs two of the realm's clients:
+#
+#   tpa-frontend  - browser login to the RHTPA console
+#   tpa-cli       - the client-credentials grant the Tekton tasks and the RHTPA
+#                   importers authenticate with
+#
+# The realm also ships backstage, backstage-plugin, openshift and
+# trusted-artifact-signer clients. Only the signer one is used (RHTAS validates
+# cosign identities against this issuer); the other three are left in place
+# because the realm is a single 2200-line import document and surgically
+# removing clients from it buys nothing but risk. They are harmless when
+# nothing redirects to them.
+#
+# SET BEFORE INSTALLING: global.cluster.subdomain, and every REPLACE_ME below.
+# -----------------------------------------------------------------------------
 
-argocd:
-  namespace: openshift-gitops
+global:
+  cluster:
+    # Apps subdomain of the target cluster, e.g. apps.cluster-abcde.example.com.
+    # No leading dot. Every hostname in this chart derives from it.
+    #
+    # Upstream looked this up from the default IngressController. Argo CD
+    # renders with `helm template` and no cluster connection, so that lookup
+    # comes back empty and the hostnames collapse; setting it explicitly is the
+    # only thing that behaves identically everywhere.
+    subdomain: ""
+
+keycloak-operator:
+  keycloak:
+    subscription:
+      channel: stable-v24
+      installPlanApproval: Automatic
+      name: rhbk-operator
+      # The reference cluster pins `redhat-operators-snapshot`, a catalog
+      # specific to the Red Hat workshop environment. A stock cluster has only
+      # `redhat-operators`.
+      source: redhat-operators
+      sourceNamespace: openshift-marketplace
+
+keycloak-db:
+  pgsql:
+    user: keycloak
+    password: REPLACE_ME
+    database: keycloak
 
 keycloak:
-  enabled: true
-  namespace: sso
-  name: keycloak
-  # Route host prefix → sso.<deployer.domain> (required by rhtpa.oidcIssuer helper)
-  routeHostPrefix: sso
-  image: quay.io/keycloak/keycloak:26.0.2
-  replicas: 1
-  # anyuid SCC — Keycloak image UID expectations under restricted OpenShift SCCs
-  anyuidScc: true
-  syncWaves:
-    namespace: "0"
-    rbac: "1"
-    config: "1"
-    deploy: "2"
-    route: "3"
-    userinfo: "4"
-  resources:
-    requests:
-      cpu: 250m
-      memory: 768Mi
-    limits:
-      cpu: "1"
-      memory: 1536Mi
-  # Workshop-only admin — override via values / RHDP secrets in shared envs
-  admin:
-    username: admin
-    password: "workshop-keycloak-admin-changeme"
-    secretName: keycloak-admin
+  nameOverride: keycloak
+  # The Route is created by this chart, so the operator's own Ingress stays off.
+  ingress:
+    enabled: false
+  route:
+    enabled: true
+    # Leave empty to derive `sso.<global.cluster.subdomain>`, which is the
+    # issuer hostname RHTAS and RHTPA are configured against below.
+    host: ""
+    localName: sso
+    tlsEnabled: true
+    tls:
+      termination: edge
+      insecureEdgeTerminationPolicy: Redirect
+  database:
+    vendor: postgres
+    host: keycloak-db
+    secret: keycloak-db
 
-# Realm + clients aligned with automation/gitops/components/rhtpa/values.yaml oidc.*
-oidc:
-  realm: tpa
-  frontendClientId: frontend
-  cliClientId: cli
-  # Must match rhtpa oidc.cliClientSecret (Secret tpa-realm-cli-clients key cli)
-  cliClientSecret: "workshop-tpa-cli-changeme"
-  # Workshop browser user for Module 4 TPA UI sign-in
-  workshopUser:
-    username: tpa-user
-    password: "workshop-tpa-user-changeme"
-    email: tpa-user@workshop.local
+keycloak-realm-import:
+  keycloak:
+    name: keycloak
+  # Kept as `backstage` to match the reference cluster: it is baked into the
+  # issuer URL (`https://sso.<subdomain>/realms/backstage`) that the RHTAS
+  # SecureSign CR, the RHTPA chart and the pipeline's `oidc-issuer` parameter
+  # all carry. Renaming it means changing all three in lockstep.
+  realm:
+    name: backstage
 
-userInfo:
-  enabled: true
-  title: "Lightwell TSSC Workshop — Keycloak (TPA SSO)"
-  instructions: >-
-    Workshop IdP for RHTPA / Trustify. Issuer https://sso.<cluster-domain>/realms/tpa.
-    Sign in to TPA UI as tpa-user (password in this userinfo / chart values oidc.workshopUser).
-    Realm import includes chicken-user|manager|admin roles and read|create|delete:document
-    client scopes so Module 4 SBOM upload/browse is authorized without manual Keycloak admin steps.
-    CLI client id "cli" secret matches RHTPA oidc.cliClientSecret (same chart values / RHDP injection).
-    Admin console: /admin/ (workshop-only credentials — replace in shared envs).
+  users:
+    # ssc-demo authenticates as the tpa-cli service account, not as a human, so
+    # the sample users are off by default. Re-enable them (see the subchart's
+    # values.yaml for the upstream list) if you want console logins.
+    users: []
+    password: REPLACE_ME
 
-deployer:
-  domain: "apps.cluster-mv9t4.dyn.redhatworkshops.io"
-  apiUrl: "https://api.cluster-mv9t4.dyn.redhatworkshops.io:6443"
+  client:
+    # Browser login to the RHTPA console. redirectUri defaults to the RHTPA
+    # server Route derived from the subdomain.
+    tpaFrontend:
+      name: tpa-frontend
+      redirectUri: []
+
+    # Client-credentials grant. THIS SECRET IS SHARED: the same value must be
+    # set as `oidc.tpaCli.secret` on the rhtpa prerequisites chart (which
+    # writes it into the `oidc-tpa-cli` Secret that RHTPA reads) and in the
+    # pipeline's `tpa-secret`. If they drift, every RHTPA call from the
+    # pipeline fails with 401 and nothing else looks wrong.
+    tpaCli:
+      name: tpa-cli
+      secret: REPLACE_ME
+
+    # Consumed by the RHTAS SecureSign CR as the OIDC client for keyless
+    # signing. Public client; no secret.
+    trustedartifactsigner:
+      name: trusted-artifact-signer
+      redirectUri:
+        - urn:ietf:wg:oauth:2.0:oob
+        - "*"
+
+    # Unused by ssc-demo; present so the realm document stays valid. Secrets
+    # default to a fresh randAlphaNum on every render, which is why the Argo
+    # Application ignores differences on `.secret`.
+    backstage:
+      name: backstage
+      redirectUri: ""
+      webOrigin: ""
+      secret: ""
+    backstagePlugin:
+      name: backstage-plugin
+      secret: ""
+    openshift:
+      name: openshift
+      redirectUri: ""
+      secret: ""
+
+  groups:
+    - name: developers
+    - name: platformengineers
+    - name: infrastructure

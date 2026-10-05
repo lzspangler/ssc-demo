@@ -1,0 +1,30 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    # HAProxy defaults to `timeout server 30s`, which is not enough here. The
+    # seeding job's repository import is a server-side `git clone` from GitHub
+    # that GitLab performs while holding the API connection open, and the
+    # pipeline's own `git push` of a remediation branch goes through this same
+    # Route. Both routinely run past 30 s on a cold cluster and surface as an
+    # opaque "failed to respond" rather than a 504.
+    #
+    # This Route is created directly (not generated from an Ingress by the
+    # ingress-to-route controller, as RHTPA's is), so the annotation belongs
+    # here and will not be reconciled away.
+    haproxy.router.openshift.io/timeout: "300s"
+  labels:
+    app: gitlab
+  name: gitlab
+spec:
+  host: {{ include "gitlab.host" . }}
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  to:
+    kind: Service
+    name: gitlab
+    weight: 100

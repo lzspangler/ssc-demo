@@ -1,0 +1,18 @@
+{{- if eq .Values.storage.type "s3" }}
+# Provisions the bucket RHTPA stores SBOMs and advisories in, and -- more
+# importantly -- the Secret of the same name holding AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY, which the RHTPA chart's `storage.accessKey` /
+# `storage.secretKey` reference. Needs OpenShift Data Foundation; see the
+# storage note in values.yaml for the filesystem alternative.
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: {{ .Values.storage.bucketName }}
+  labels:
+    {{- include "tpa-prerequisites.labels" . | nindent 4 }}
+  annotations:
+    {{- include "tpa-prerequisites.argocd-syncwave" . | nindent 4 }}
+spec:
+  bucketName: {{ .Values.storage.bucketName }}
+  storageClassName: {{ .Values.storage.storageClassName }}
+{{- end }}

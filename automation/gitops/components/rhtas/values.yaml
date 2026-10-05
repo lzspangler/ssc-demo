@@ -1,108 +1,45 @@
-# Red Hat Trusted Artifact Signer — Lightwell TSSC workshop
-# Patterns adapted from Trusted Software Factory / RHADS Securesign installs.
-# Root App-of-Apps injects rhtas.* and deployer.* (see automation/bootstrap-infra).
+# -----------------------------------------------------------------------------
+# Red Hat Trusted Artifact Signer for ssc-demo.
+#
+# Vendored from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2 (`rhtas`):
+# the operator Subscription (sync-wave 1) and a Securesign CR (sync-wave 2)
+# that brings up Fulcio, Rekor, CTlog, Trillian, TSA and TUF.
+#
+# Removed from upstream: the `cosign-keygen` Job and its RBAC. That Job
+# generated a cosign key pair and wrote it into Vault; ssc-demo has no Vault
+# and signs keylessly against the Fulcio/Rekor instances below, so the key pair
+# had no consumer.
+#
+# SET BEFORE INSTALLING: global.cluster.subdomain.
+# -----------------------------------------------------------------------------
 
-argocd:
-  namespace: openshift-gitops
+nameOverride: ""
 
-rhtas:
-  # Chart-level gate (root-app Application only exists when components.rhtas.enabled)
-  enabled: true
-  # Instance namespace (Securesign CR + supporting resources)
-  namespace: trusted-artifact-signer
-  # Securesign CR name
-  name: trusted-artifact-signer
-  apiVersion: rhtas.redhat.com/v1alpha1
-  # Sync waves inside this chart (operator → instance → userinfo)
-  syncWaves:
-    namespace: "0"
-    operator: "1"
-    instance: "2"
-    userinfo: "3"
+global:
+  cluster:
+    # Apps subdomain of the target cluster, e.g. apps.cluster-abcde.example.com.
+    # Used to derive the OIDC issuer; must match the keycloak component.
+    subdomain: ""
 
-# OLM install of the RHTAS Operator (AllNamespaces into openshift-operators)
-operator:
-  enabled: true
-  # Subscription metadata.name
+rhtas-operator:
   name: rhtas-operator
-  # OLM package name
-  packageName: rhtas-operator
   namespace: openshift-operators
-  # Prefer stable; pin stable-v1.3 when z-stream-only is required
-  channel: stable
-  source: redhat-operators
-  sourceNamespace: openshift-marketplace
-  installPlanApproval: Automatic
-  # openshift-operators already has an OperatorGroup — do not create another
-  createOperatorGroup: false
+  subscription:
+    channel: stable
+    installPlanApproval: Automatic
+    name: rhtas-operator
+    # The reference cluster pins `redhat-operators-snapshot`, a workshop-only
+    # catalog. A stock cluster has `redhat-operators`.
+    source: redhat-operators
+    sourceNamespace: openshift-marketplace
 
-# Securesign stack — Fulcio / Rekor / TUF / Trillian / CTlog (+ optional TSA)
-securesign:
-  fulcio:
-    externalAccess: true
-    organizationName: Lightwell TSSC Workshop
-    organizationEmail: lightwell-tssc-workshop@demo.redhat.com
-    # When empty, derived as fulcio.<deployer.domain>
-    commonName: ""
-    monitoring: false
-    ctlog:
-      port: 80
-      prefix: trusted-artifact-signer
-  rekor:
-    externalAccess: true
-    monitoring: false
-    rekorSearchUI: true
-    pvcSize: 5Gi
-    backFillRedis:
-      enabled: true
-      schedule: "0 0 * * *"
-  tuf:
-    externalAccess: true
-    port: 80
-    pvcSize: 100Mi
-    keys:
-      - name: rekor.pub
-      - name: ctfe.pub
-      - name: fulcio_v1.crt.pem
-  trillian:
-    createDatabase: true
-    pvcSize: 5Gi
-    monitoring: false
-    port: 8091
-  ctlog:
-    monitoring: false
-    trillianPort: 8091
-  # Timestamp Authority — optional; disabled by default for lighter workshops
-  tsa:
-    enabled: false
-    externalAccess: false
-
-# OIDC issuers for Fulcio (at least one required by CRD)
-oidc:
-  # Always include Kubernetes SA issuer for keyless Tekton/pipeline signing
-  kubernetes:
-    enabled: true
-    clientID: trusted-artifact-signer
-    issuer: "https://kubernetes.default.svc"
-    issuerURL: "https://kubernetes.default.svc"
-  # Optional Keycloak / RHBK issuer (RHADS-style). Disabled until SSO is provisioned.
-  keycloak:
-    enabled: false
-    clientID: trusted-artifact-signer
-    # When empty and enabled, derived as https://sso.<deployer.domain>/realms/<realm>
-    issuerURL: ""
-    realm: trusted-artifact-signer
-
-# RHDP userinfo ConfigMap
-userInfo:
-  enabled: true
-  title: "Lightwell TSSC Workshop — Trusted Artifact Signer"
-  instructions: >-
-    RHTAS provides keyless signing (Fulcio certificates, Rekor transparency log,
-    TUF trust root). After the Securesign instance is Ready, use cosign with the
-    Fulcio/Rekor/TUF URLs from `oc get securesign -n trusted-artifact-signer`.
-
-# Injected by root-app / field content workload
-deployer:
-  domain: "apps.cluster-mv9t4.dyn.redhatworkshops.io"
-  apiUrl: "https://api.cluster-mv9t4.dyn.redhatworkshops.io:6443"
+trusted-artifact-signer:
+  namespace: trusted-artifact-signer
+  instance: securesign
+  email: admin@rhdemo.com
+  org: Parasol
+  # Derived from global.cluster.subdomain as sso.<subdomain>/realms/backstage.
+  # Set explicitly only if Keycloak lives somewhere else.
+  oidc: ""
+  realm: backstage
+  oidcClientId: trusted-artifact-signer

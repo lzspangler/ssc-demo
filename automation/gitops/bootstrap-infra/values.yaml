@@ -1,60 +1,149 @@
-# Lightwell SSC demo — Bootstrap Infra
-# AgnosticV gitops_path: automation/gitops/bootstrap-infra
+# =============================================================================
+# ssc-demo platform app-of-apps.
 #
-# Sync wave ordering (IdP → pipelines → operators → student git → config → apps → validate):
-#    5  — Workshop Keycloak (SSO for RHTPA): keycloak
-#    8  — OpenShift Pipelines (Tekton CRDs): pipelines
-#   10  — TSSC operators / platform: rhtas, rhtpa
-#   20  — Artifact manager / LWN pattern: lightwell-repo
+# Installs the demo platform on a cluster that already has OpenShift GitOps
+# running. Everything below is reproduced from the reference cluster
+# (cluster-6jnws), which is built from redhat-ads-tech/ocp-app-platform-demo-helm
+# v1.4.2 plus the Red Hat RHTPA chart -- see each component's README for what
+# was changed and why.
 #
-# Child charts live under automation/gitops/components/<name>/.
+# NOT managed here: Artifactory. It lives in automation/gitops/artifactory as a
+# standalone Application with its own runbook, and it is already working.
+#
+# Sync-wave order (an Application's wave only advances once the previous wave is
+# Healthy, so this is a real dependency chain):
+#
+#    0  pipelines                OpenShift Pipelines operator -- CRDs everything else's
+#                                tasks need; nothing depends on it at install time, so
+#                                it goes first and gets out of the way.
+#    5  keycloak                 The IdP. RHTAS and RHTPA both authenticate against its
+#                                `backstage` realm, so it must be serving
+#                                /.well-known/openid-configuration before either starts.
+#    8  gitlab                   Independent of Keycloak (root auth, not OIDC), but slow:
+#                                the seeding job imports a repository from GitHub. Started
+#                                early so it overlaps the operator installs.
+#   10  rhtas                    Securesign. Needs the realm's trusted-artifact-signer client.
+#   10  rhtpa-prerequisites      Postgres + oidc-tpa-cli Secret + the S3 bucket. Its PreSync
+#                                hook blocks on the Keycloak issuer, which is the real
+#                                reason keycloak is a lower wave.
+#   15  rhtpa                    The analyzer itself, from charts.openshift.io.
+#
+# BEFORE INSTALLING: set deployer.domain and replace every REPLACE_ME in
+# `credentials` below. Do that in a LOCAL values override that you do not
+# commit (`helm template ... -f private.yaml`), not in this file.
+# =============================================================================
 
-# ============================================================
-# GitOps Configuration
-# ============================================================
-deployer: 
-  apiUrl: ""
+deployer:
+  # Apps subdomain of the target cluster, WITHOUT a leading dot, e.g.
+  # apps.cluster-abcde.dyn.redhatworkshops.io. Every hostname the platform
+  # publishes derives from this.
+  #
+  #   oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'
   domain: ""
+  apiUrl: ""
 
 gitops:
   repoUrl: "https://github.com/lzspangler/ssc-demo.git"
   revision: "ssc-demo"
   basePath: "automation/gitops"
 
-# ArgoCD settings
 argocd:
   namespace: openshift-gitops
   project: default
 
-# ============================================================
-# Components — enable/disable and configure each child chart
-# ============================================================
+# Namespace the Tekton pipelines are installed into. The GitLab seeding job
+# writes `scm-auth-secret` and `gitlab-webhook-secret` here and derives the
+# issue-comment webhook URL from it.
+pipelineNamespace: tssc-app-ci
+
+# -----------------------------------------------------------------------------
+# Credentials. All REPLACE_ME; supply real values at install time from an
+# uncommitted override file. Generate them with e.g. `openssl rand -hex 16`.
+# -----------------------------------------------------------------------------
+credentials:
+  # Keycloak's own Postgres.
+  keycloakDbPassword: REPLACE_ME
+
+  # GitLab root. The seeding job authenticates as root to create the group,
+  # import the repository and mint the pipeline's project access token.
+  gitlabRootPassword: REPLACE_ME
+
+  # RHTPA's Postgres. Used by BOTH the prerequisites chart (which creates the
+  # database) and the RHTPA chart (which connects to it) -- one value, two
+  # consumers, so it is set once here.
+  tpaDbPassword: REPLACE_ME
+
+  # The `tpa-cli` OIDC client secret, and the single most load-bearing value in
+  # this file. It is written into the Keycloak realm, into the `oidc-tpa-cli`
+  # Secret RHTPA reads, and -- by hand, see step 5 of README.md -- into the
+  # pipeline's `tpa-secret` as `oidc_client_secret`. If any of the three drift,
+  # every RHTPA call returns 401 and nothing else looks wrong.
+  tpaCliClientSecret: REPLACE_ME
+
+# =============================================================================
+# Components
+# =============================================================================
 components:
 
-  # --- Wave 5: Workshop IdP (required before RHTPA) ---
-  # Chart: automation/gitops/components/keycloak. Route host sso.<deployer.domain>/realms/tpa.
-  keycloak:
-    enabled: true
-    namespace: sso
-    syncWave: "5"
-
-  # --- Wave 8: OpenShift Pipelines (Tekton) — enable before rhacs Module 5 Tasks ---
-  # Chart: automation/gitops/components/pipelines. OLM Subscription into openshift-operators.
   pipelines:
     enabled: true
     namespace: openshift-operators
+    syncWave: "0"
+
+  keycloak:
+    enabled: true
+    namespace: keycloak
+    syncWave: "5"
+    # Baked into the OIDC issuer URL that RHTAS, RHTPA and the pipeline's
+    # `oidc-issuer` parameter all carry. Renaming means changing all of them.
+    realm: backstage
+
+  gitlab:
+    enabled: true
+    namespace: gitlab
     syncWave: "8"
 
-  # --- Wave 10: TSSC operators / platform ---
-  # Chart: automation/gitops/components/rhtas (#4). Enable when cluster is ready to sync.
   rhtas:
     enabled: true
     namespace: trusted-artifact-signer
     syncWave: "10"
 
-  # Chart: automation/gitops/components/rhtpa (#5). Enable when SSO + cluster capacity are ready.
-  rhtpa:
+  rhtpaPrerequisites:
     enabled: true
     namespace: trusted-profile-analyzer
     syncWave: "10"
 
+  rhtpa:
+    enabled: true
+    namespace: trusted-profile-analyzer
+    syncWave: "15"
+    # Red Hat chart from https://charts.openshift.io/, not vendored into this
+    # repo. Pinned to what the reference cluster runs.
+    chartVersion: "1.2.6"
+    storage:
+      # s3 (needs OpenShift Data Foundation) or filesystem. Must match
+      # rhtpaPrerequisites' storage.type -- the prerequisites chart only
+      # creates the ObjectBucketClaim in s3 mode.
+      type: s3
+      bucket: trustify
+      # NooBaa's S3 endpoint; `https://s3-openshift-storage.<domain>:443`.
+      # Override only if your object gateway is published elsewhere.
+      regionEndpoint: ""
+      # filesystem mode only: size of the PVC RHTPA provisions, and the class
+      # to provision it from. Leave storageClassName empty for the cluster
+      # default.
+      #
+      # Caveat: the chart mounts this one PVC into both the server and the
+      # importer Deployment and hardcodes accessModes: [ReadWriteOnce] with no
+      # override. An RWX class does not fix that -- the claim still asks for
+      # RWO, so the two pods must co-schedule and the importer stays Pending
+      # when it cannot. Prefer s3.
+      size: 50Gi
+      storageClassName: ""
+    # HAProxy's `timeout server` for the RHTPA Route. The default 30 s is not
+    # survivable for this demo: /purl/recommend cannot complete inside it at
+    # any batch size, and because the Route is GENERATED from an Ingress by the
+    # ingress-to-route controller, annotating the Route by hand is reverted.
+    # The annotation therefore goes on the Ingress, via the chart's own
+    # ingress.additionalAnnotations, and the controller copies it down.
+    routeTimeout: 300s

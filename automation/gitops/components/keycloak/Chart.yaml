@@ -1,9 +1,20 @@
 apiVersion: v2
 name: keycloak
-description: Minimal workshop Keycloak IdP for RHTPA (realm tpa at sso.<domain>)
+description: >-
+  Red Hat build of Keycloak for ssc-demo: operator, Postgres, a Keycloak instance and the backstage realm that RHTAS and RHTPA authenticate against.
 type: application
 version: 0.1.0
-appVersion: "26.0"
-maintainers:
-  - name: NA-FSI-Services
-    url: https://github.com/rhpds/lightwell-tssc-workshop
+
+dependencies:
+  - name: keycloak-operator
+    version: 0.1.0
+    repository: file://keycloak-operator
+  - name: keycloak-db
+    version: 0.1.0
+    repository: file://keycloak-db
+  - name: keycloak
+    version: 0.1.0
+    repository: file://keycloak
+  - name: keycloak-realm-import
+    version: 0.1.0
+    repository: file://keycloak-realm-import

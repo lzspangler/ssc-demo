@@ -1,0 +1,11 @@
+apiVersion: v2
+name: gitlab
+description: >-
+  Self-contained GitLab for the ssc-demo supply-chain demo: a single-pod GitLab
+  CE with Postgres and Redis, seeded by an Ansible job with the demo group,
+  application repository, CVE severity labels, a pipeline access token and the
+  issue-comment webhook that drives agentic-cve-remediation.
+type: application
+
+version: 0.1.0
+appVersion: 17.4.1

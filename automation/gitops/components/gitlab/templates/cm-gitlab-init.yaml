@@ -1,0 +1,557 @@
+{{- $root := . }}
+{{- $host := include "gitlab.host" . }}
+{{- $pipelineNs := .Values.pipeline.namespace }}
+# -----------------------------------------------------------------------------
+# GitLab seeding playbook, run once by job-gitlab-init.
+#
+# Adapted from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2. Removed:
+# the Vault writes, the doorkeeper token-expiry patch and the DevSpaces OAuth
+# application -- none of which ssc-demo has. Added: per-repository labels,
+# the issue-comment webhook, and a project access token written into the
+# pipeline namespace. Those three are the hand-wiring the reference cluster
+# still had, and they are the whole reason this chart exists.
+#
+# Everything is written to be re-runnable: the Job has backoffLimit 100 and
+# Argo CD will re-sync it, so every call either tolerates the "already exists"
+# status or checks first.
+# -----------------------------------------------------------------------------
+kind: ConfigMap
+metadata:
+  name:  cm-init-gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+apiVersion: v1
+data:
+  playbook.yaml: |
+    ---
+    - name: Configure GitLab
+      hosts: localhost
+      vars:
+        gitlab_namespace: {{ $.Release.Namespace }}
+        pipeline_namespace: {{ $pipelineNs }}
+        gitlab_host: {{ $host }}
+        root_password: {{ $.Values.gitlab.rootPassword }}
+        user_create: true
+      tasks:
+        - name: Wait for GitLab pod to be ready
+          kubernetes.core.k8s_info:
+            kind: Pod
+            namespace: '{{ "{{" }} gitlab_namespace {{ "}}" }}'
+            label_selectors:
+              - app=gitlab
+          register: r_gitlab_pod
+          retries: 120
+          delay: 10
+          until:
+            - r_gitlab_pod.resources is defined
+            - r_gitlab_pod.resources | length > 0
+            - r_gitlab_pod.resources[0].status is defined
+            - r_gitlab_pod.resources[0].status.phase is defined
+            - r_gitlab_pod.resources[0].status.phase == 'Running'
+            - r_gitlab_pod.resources[0].status.containerStatuses is defined
+            - r_gitlab_pod.resources[0].status.containerStatuses | selectattr('ready', 'equalto', true) | list | length == r_gitlab_pod.resources[0].status.containerStatuses | length
+
+        - name: Wait for GitLab API to be available
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects
+            method: GET
+            validate_certs: false
+          register: r_liveness
+          retries: 60
+          delay: 10
+          until: r_liveness.status == 200
+
+        - name: Generate root user personal token
+          shell: |
+            POD=$(oc get pod -l app=gitlab -n {{ $.Release.Namespace }} --no-headers | awk '{print $1}')
+            oc exec $POD -n {{ $.Release.Namespace }} -- /bin/sh -c /scripts/create-root-pat.sh
+            ROOT_PAT=$(oc exec $POD -n {{ $.Release.Namespace }} -- /bin/sh -c "cat /tmp/root.pat")
+            oc delete secret root-user-personal-token -n {{ $.Release.Namespace }} --ignore-not-found
+            oc create secret generic root-user-personal-token --from-literal=token=$ROOT_PAT -n {{ $.Release.Namespace }}
+
+        - name: Retrieve root token
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Secret
+            name: root-user-personal-token
+            namespace: '{{ "{{" }} gitlab_namespace {{ "}}" }}'
+          register: r_root_token
+          failed_when: r_root_token.resources[0].data.token | length == 0
+
+        - name: Decode root token
+          set_fact:
+            root_token: '{{ "{{" }} r_root_token.resources[0].data.token | b64decode {{ "}}" }}'
+
+        - name: Update application settings
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/application/settings
+            method: PUT
+            body_format: form-urlencoded
+            body:
+              # `git` + `github` are what the repository imports below rely on;
+              # without them POST /projects silently ignores import_url.
+              import_sources: "git,github,gitea"
+              version_check_enabled: "false"
+              # The issue-comment webhook targets a Route served by this same
+              # cluster, which GitLab treats as a local request and blocks by
+              # default.
+              allow_local_requests_from_web_hooks_and_services: "true"
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          retries: 10
+          delay: 5
+          register: r_application_settings
+          until: r_application_settings.status == 200
+
+{{- range $item := .Values.gitlab.users.users }}
+
+        - name: Create user {{ $item.id }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/users
+            method: POST
+            body_format: form-urlencoded
+            body:
+              admin: false
+              email: {{ $item.id }}@rhdemo.com
+              public_email: {{ $item.id }}@rhdemo.com
+              skip_confirmation: true
+              username: {{ $item.id }}
+              password: {{ include "gitlab-user.password" $root }}
+              name: {{ $item.name | default (printf "%s GitLab" $item.id) }}
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+              - 409
+          register: r_user
+          retries: 10
+          delay: 5
+          until: r_user.status in [201, 409]
+{{- end }}
+
+        - name: List users
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/users?per_page=100
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_users
+
+{{- range $group := .Values.gitlab.groups }}
+
+        - name: Create group {{ $group.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/groups
+            method: POST
+            body_format: form-urlencoded
+            body:
+              name: {{ $group.name }}
+              path: {{ $group.name }}
+              visibility: public
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+              - 400
+              - 409
+          register: r_group_create
+          retries: 10
+          delay: 5
+          until: r_group_create.status in [201, 400, 409]
+          failed_when:
+            - r_group_create.status == 400
+            - "'has already been taken' not in (r_group_create.json | default({}) | string)"
+
+        - name: Look up group {{ $group.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/groups/{{ $group.name }}
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_group
+
+{{- range $repo := $group.repo }}
+{{- $slug := printf "%s%%2F%s" $group.name $repo.name }}
+
+        - name: Import repository {{ $repo.name }} into {{ $group.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects
+            method: POST
+            body_format: form-urlencoded
+            body:
+              name: {{ $repo.name }}
+              import_url: {{ $repo.url }}
+              visibility: public
+              issues_access_level: enabled
+              builds_access_level: enabled
+              auto_devops_enabled: false
+              remove_source_branch_after_merge: false
+              only_allow_merge_if_pipeline_succeeds: {{ include "gitlab.repo.check-pipeline" $repo }}
+              namespace_id: '{{ "{{" }} r_group.json.id {{ "}}" }}'
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            # The import is a server-side clone of a GitHub repository; on a
+            # cold cluster it can sit well past the default 30 s.
+            timeout: 300
+            status_code:
+              - 201
+              - 400
+              - 409
+          retries: 10
+          delay: 5
+          register: r_import
+          until: r_import.status in [201, 400, 409]
+          failed_when:
+            - r_import.status == 400
+            - "'has already been taken' not in (r_import.json | default({}) | string)"
+
+{{- if ne ($repo.defaultBranch | default "main") "main" }}
+
+        - name: Set default branch for {{ $repo.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ $slug }}
+            method: PUT
+            body_format: form-urlencoded
+            body:
+              default_branch: {{ $repo.defaultBranch }}
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          retries: 10
+          delay: 5
+          register: r_default_branch
+          until: r_default_branch.status == 200
+{{- end }}
+
+        # The import runs asynchronously: POST /projects returns 201 as soon as
+        # the project row exists, long before the clone lands. Labels and the
+        # webhook can be attached immediately, but waiting here means the demo
+        # is actually usable the moment the Job reports success.
+        - name: Wait for the {{ $repo.name }} import to finish
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ $slug }}
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_project_{{ $repo.name | replace "-" "_" }}
+          retries: 60
+          delay: 10
+          until: >-
+            r_project_{{ $repo.name | replace "-" "_" }}.json.import_status | default('none')
+            in ['finished', 'none']
+
+        - name: Remember the {{ $repo.name }} project id
+          set_fact:
+            project_id: '{{ "{{" }} r_project_{{ $repo.name | replace "-" "_" }}.json.id {{ "}}" }}'
+
+{{- if $repo.labels }}
+
+        - name: Create labels in {{ $repo.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/labels
+            method: POST
+            body_format: form-urlencoded
+            body:
+              name: '{{ "{{" }} item.name {{ "}}" }}'
+              color: '{{ "{{" }} item.color {{ "}}" }}'
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+              - 409
+          retries: 10
+          delay: 5
+          register: r_create_label
+          until: r_create_label.status in [201, 409]
+          loop:
+{{- range $label := $repo.labels }}
+            - name: {{ $label.name }}
+              color: "{{ $label.color }}"
+{{- end }}
+{{- end }}
+
+{{- if and $repo.webhooks $pipelineNs }}
+
+        # ---- issue-comment webhook -----------------------------------------
+        # The token is never templated into git. Reuse the one the pipeline
+        # namespace already holds if it is there (so re-running this job does
+        # not invalidate a webhook the EventListener is already validating
+        # against), otherwise mint one and store it.
+        - name: Look for an existing webhook secret
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Secret
+            name: gitlab-webhook-secret
+            namespace: '{{ "{{" }} pipeline_namespace {{ "}}" }}'
+          register: r_webhook_secret
+
+        - name: Decide the webhook token
+          set_fact:
+            webhook_token: >-
+              {{ "{{" }} (r_webhook_secret.resources[0].data.secretToken | b64decode)
+                 if (r_webhook_secret.resources | length > 0
+                     and r_webhook_secret.resources[0].data.secretToken | default('') | length > 0)
+                 else lookup('ansible.builtin.password', '/dev/null', chars=['hexdigits'], length=40) | lower {{ "}}" }}
+
+        - name: Store the webhook token for the Tekton GitLab interceptor
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: gitlab-webhook-secret
+                namespace: '{{ "{{" }} pipeline_namespace {{ "}}" }}'
+                labels:
+                  app.kubernetes.io/part-of: maven-build-ci
+              type: Opaque
+              stringData:
+                secretToken: '{{ "{{" }} webhook_token {{ "}}" }}'
+
+        - name: List existing hooks on {{ $repo.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/hooks
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_hooks
+
+{{- range $hook := $repo.webhooks }}
+{{- $hookUrl := $hook.url | default (printf "https://agentic-issue-commands-%s.%s" $pipelineNs (required "Set cluster.subdomain" $root.Values.cluster.subdomain)) }}
+
+        # `/remediate` in an issue comment is a note event and nothing else.
+        # Leaving push_events on (the API default) would fire the EventListener
+        # on every commit, including the ones the remediation pipeline itself
+        # pushes -- a feedback loop, not just noise.
+        - name: Create hook {{ $hook.name | default "webhook" }} on {{ $repo.name }}
+          when: >-
+            r_hooks.json | selectattr('url', 'equalto', '{{ $hookUrl }}') | list | length == 0
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/hooks
+            method: POST
+            body_format: json
+            body:
+              url: {{ $hookUrl }}
+              token: '{{ "{{" }} webhook_token {{ "}}" }}'
+              push_events: false
+              merge_requests_events: false
+              issues_events: false
+              note_events: {{ $hook.noteEvents | default true }}
+              enable_ssl_verification: false
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+          retries: 10
+          delay: 5
+          register: r_hook
+          until: r_hook.status == 201 or r_hook is skipped
+{{- end }}
+{{- end }}
+
+{{- if and $repo.accessToken ($repo.accessToken.enabled | default false) $pipelineNs }}
+{{- $tok := $repo.accessToken }}
+
+        # ---- pipeline SCM credential ---------------------------------------
+        # open-pr and open-cve-issues authenticate with `scm-auth-secret` in the
+        # pipeline namespace. Minting it here is what lets the demo come up
+        # without anyone pasting a PAT; a project access token (not the root
+        # PAT) keeps the blast radius to this one repository.
+        #
+        # The token value is only ever returned once, at creation. So: if the
+        # Secret already holds one, leave everything alone. Otherwise revoke any
+        # stale token of the same name -- its value is unrecoverable and it
+        # would just accumulate -- and issue a fresh one.
+        - name: Look for an existing SCM secret
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Secret
+            name: scm-auth-secret
+            namespace: '{{ "{{" }} pipeline_namespace {{ "}}" }}'
+          register: r_scm_secret
+
+        - name: Decide whether an SCM token is needed
+          set_fact:
+            scm_token_needed: >-
+              {{ "{{" }} not (r_scm_secret.resources | length > 0
+                 and r_scm_secret.resources[0].data.token | default('') | length > 0
+                 and (r_scm_secret.resources[0].data.token | b64decode) != 'REPLACE_ME') {{ "}}" }}
+
+        - name: List project access tokens on {{ $repo.name }}
+          when: scm_token_needed | bool
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/access_tokens
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_pats
+
+        - name: Revoke stale {{ $tok.name }} tokens
+          when: scm_token_needed | bool
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/access_tokens/{{ "{{" }} item.id {{ "}}" }}
+            method: DELETE
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 204
+              - 404
+          loop: >-
+            {{ "{{" }} (r_pats.json | default([]))
+               | selectattr('name', 'equalto', '{{ $tok.name }}')
+               | selectattr('active', 'equalto', true) | list {{ "}}" }}
+
+        - name: Create project access token {{ $tok.name }}
+          when: scm_token_needed | bool
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/access_tokens
+            method: POST
+            body_format: json
+            body:
+              name: {{ $tok.name }}
+              scopes: {{ $tok.scopes | default (list "api" "write_repository") | toJson }}
+              # GitLab 16+ requires an expiry and rejects anything more than a
+              # year out, so expiresInDays stays just inside the cap.
+              expires_at: '{{ "{{" }} "%Y-%m-%d" | strftime(ansible_date_time.epoch | int + {{ mul (int ($tok.expiresInDays | default 364)) 86400 }}) {{ "}}" }}'
+              access_level: {{ $tok.accessLevel | default 40 }}
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+          retries: 10
+          delay: 5
+          register: r_pat
+          until: r_pat.status == 201 or r_pat is skipped
+
+        - name: Store the SCM credential for the pipelines
+          when: scm_token_needed | bool
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: scm-auth-secret
+                namespace: '{{ "{{" }} pipeline_namespace {{ "}}" }}'
+                labels:
+                  app.kubernetes.io/part-of: maven-build-ci
+              type: Opaque
+              stringData:
+                # glab and `git push https://<user>:<token>@...` both expect
+                # oauth2 as the username for a GitLab token.
+                username: oauth2
+                token: '{{ "{{" }} r_pat.json.token {{ "}}" }}'
+{{- end }}
+{{- end }}
+
+{{- range $project := $group.project }}
+
+        - name: Create project {{ $project.name }} in {{ $group.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects
+            method: POST
+            body_format: form-urlencoded
+            body:
+              name: {{ $project.name }}
+              visibility: public
+              issues_access_level: enabled
+              auto_devops_enabled: false
+              remove_source_branch_after_merge: false
+              namespace_id: '{{ "{{" }} r_group.json.id {{ "}}" }}'
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+              - 400
+              - 409
+          retries: 10
+          delay: 5
+          register: r_create_project_result
+          until: r_create_project_result.status in [201, 400, 409]
+          failed_when:
+            - r_create_project_result.status == 400
+            - "'has already been taken' not in (r_create_project_result.json | default({}) | string)"
+
+        - name: Look up project {{ $project.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ $group.name }}%2F{{ $project.name }}
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_create_project
+
+{{- if $project.labels }}
+
+        - name: Create labels in {{ $project.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} r_create_project.json.id {{ "}}" }}/labels
+            method: POST
+            body_format: form-urlencoded
+            body:
+              name: '{{ "{{" }} item.name {{ "}}" }}'
+              color: '{{ "{{" }} item.color {{ "}}" }}'
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+              - 409
+          retries: 10
+          delay: 5
+          register: r_create_label
+          until: r_create_label.status in [201, 409]
+          loop:
+{{- range $label := $project.labels }}
+            - name: {{ $label.name }}
+              color: "{{ $label.color }}"
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- range $member := $group.users }}
+
+        - name: Add user {{ $member.id }} to {{ $group.name }}
+          when: item.username == '{{ $member.id }}'
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/groups/{{ "{{" }} r_group.json.id {{ "}}" }}/members
+            method: POST
+            body_format: form-urlencoded
+            body:
+              user_id: '{{ "{{" }} item.id {{ "}}" }}'
+              access_level: 50
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code:
+              - 201
+              - 409
+          register: r_group_user
+          retries: 10
+          delay: 5
+          until: r_group_user.status in [201, 409] or r_group_user is skipped
+          loop: '{{ "{{" }} r_users.json {{ "}}" }}'
+{{- end }}
+{{- end }}

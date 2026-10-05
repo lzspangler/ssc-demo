@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: initialize-gitlab
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    # A Job's pod template is immutable, so once this has run, any edit to the
+    # playbook makes the next Argo sync fail with "field is immutable" and the
+    # cluster quietly keeps the old seeding. Replace deletes and recreates it,
+    # which is also how you re-seed: bump anything in the ConfigMap and sync.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 100
+  template:
+    spec:
+      containers:
+      - name: initialize-gitlab
+        command:
+          - /bin/bash
+          - '-c'
+          - |
+            set -x
+            ansible-playbook -i localhost /scripts/playbook.yaml
+        image: quay.io/agnosticd/ee-multicloud:latest
+        volumeMounts:
+          - mountPath: /scripts
+            name: init-gitlab-vol
+      restartPolicy: Never
+      serviceAccount: gitlab
+      volumes:
+      - name: init-gitlab-vol
+        configMap:
+          name: cm-init-gitlab
