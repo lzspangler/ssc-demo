@@ -1,9 +1,15 @@
 {{- if and .Values.pipelines.enabled .Values.operator.enabled }}
-{{- $existingSub := lookup "operators.coreos.com/v1alpha1" "Subscription" .Values.operator.namespace .Values.operator.name }}
-{{- if not $existingSub.metadata }}
 ---
-# OpenShift Pipelines Operator via OLM — Module 5 / RHACS Tekton prerequisite.
-# Installs into openshift-operators (AllNamespaces). Skipped if Subscription exists.
+# OpenShift Pipelines Operator via OLM. Installs into openshift-operators
+# (AllNamespaces), which already has an OperatorGroup.
+#
+# This used to be wrapped in `if not (lookup ... Subscription).metadata` to skip
+# itself when one already existed. That guard was removed deliberately. Argo CD
+# renders with `helm template` and no cluster connection, so the lookup always
+# came back empty and the guard never fired -- but anywhere it DID fire the
+# Subscription would vanish from the manifest set, and `prune: true` would then
+# delete it and take the operator, its CRDs and every running pipeline with it.
+# Re-applying an identical Subscription is a no-op, so the guard bought nothing.
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
 metadata:
@@ -19,5 +25,4 @@ spec:
   name: {{ .Values.operator.packageName }}
   source: {{ .Values.operator.source }}
   sourceNamespace: {{ .Values.operator.sourceNamespace }}
-{{- end }}
 {{- end }}

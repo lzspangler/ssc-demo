@@ -1,75 +1,72 @@
-# charts/components/pipelines
+# pipelines
 
-OLM **Subscription** for Red Hat OpenShift Pipelines (`openshift-pipelines-operator-rh`).
+The OLM **Subscription** for Red Hat OpenShift Pipelines
+(`openshift-pipelines-operator-rh`), plus an informational ConfigMap.
 
-## Why
+This chart installs the *operator* only. The demo's own Tasks, Pipelines and
+Triggers are plain YAML at the repo root under `pipelines/`, synced by four
+separate Applications — see *The Tekton layer* in
+`automation/gitops/README.md`.
 
-Module 5 student `.tekton/` overlays and RHACS chart Tasks/Pipelines need Tekton CRDs
-(`pipelines.tekton.dev`, `tasks.tekton.dev`, …). Bare OCP claims do not ship Pipelines;
-catalog / AgnosticV should enable this component with the Module 4–5 stack.
+## Why it is wave 0
 
-## Sync order
+Everything Tekton in this platform depends on the CRDs this operator installs
+(`pipelines.tekton.dev`, `tasks.tekton.dev`, `triggers.tekton.dev`), and
+nothing depends on it, so it goes first and gets out of the way. The Tekton
+resource Applications sit at waves 3–5 and retry until the CRDs land.
 
-Root-app places this Application at **wave 8** (after Keycloak wave 5, before
-`rhtas` / `rhtpa` / `rhacs` wave 10) so CRDs exist before RHACS Tekton resources sync.
+The operator also supplies the `cel` and `gitlab` **ClusterInterceptors** the
+issue-comment EventListener calls, and it auto-creates the `pipeline`
+ServiceAccount in every namespace — including `tssc-app-ci`, which the Tekton
+Applications create with `CreateNamespace=true`.
 
-## Enable
-
-```bash
-# Via root-app values / Argo Application valuesObject:
-components.pipelines.enabled=true
+```sh
+oc get crd pipelines.tekton.dev
+oc get clusterinterceptors        # expect at least: cel, gitlab
 ```
 
-## V2-14 verify-base-image
+## Contents
 
-Task `verify-base-image` in namespace `lightwell-tasks` checks cosign signature,
-attestation, and SBOM **before** BuildConfig. It is **not** referenced from the
-seeded learner Pipeline (`spring-boot-lw-poc-build-sign`). Wire it in Gitea
-`.tekton/pipeline.yaml`. Identity/issuer stay `REPLACE_ME_*` until the learner
-passes Red Hat's published Hummingbird signer (do not invent; do not paste
-`example-pipeline-snippet.yaml` from ConfigMap `verify-base-image-docs`).
+| Template | Notes |
+|---|---|
+| `subscription.yaml` | the Subscription, into `openshift-operators` |
+| `namespace.yaml` | the `lightwell-tasks` namespace, gated on the three flags below — renders nothing here |
+| `userinfo.yaml` | `demo-userinfo-pipelines` ConfigMap — orientation text for workshop UIs, no runtime effect |
 
-Image build stays **OpenShift BuildConfig**.
+No OperatorGroup: `openshift-operators` ships with one, and a second in the
+same namespace puts every operator in it into an error state.
 
-Cluster resolver for this Task is the same pattern as RHACS Tasks in `stackrox`
-(`kind=task`, `namespace=lightwell-tasks`).
+## Two fixes worth knowing about
 
-## V2-15 conforma-policy
+**The `lookup` guard on the Subscription was removed.** It read
+`if not (lookup ... "Subscription" ...).metadata`, intending to skip itself
+when a Subscription already existed. Under Argo CD that never fired — the repo
+server renders with `helm template` and no cluster connection, so `lookup`
+returns an empty dict. But anywhere it *did* fire, the Subscription would drop
+out of the manifest set and `prune: true` would delete it, uninstalling the
+operator along with its CRDs and every running pipeline. Re-applying an
+identical Subscription is a no-op, so the guard protected nothing.
 
-Task `conforma-policy` in namespace `lightwell-tasks` runs `ec validate image`
-against a **local** policy file from a ConfigMap. It is **not** referenced from
-the seeded learner Pipeline. Wire it in Gitea `.tekton/pipeline.yaml` so it
-runs **after** `cosign-sign-keyless`.
+**`userinfo.yaml` referenced three values that did not exist.** It reads
+`.Values.verifyBaseImage.enabled`, `.Values.conformaPolicy.enabled` and
+`.Values.prefetchDependencies.enabled` unconditionally, and none were in
+`values.yaml` — the chart failed to render at all with `nil pointer evaluating
+interface {}.enabled`. Because this is wave 0, that failed the first
+Application and blocked the entire install behind it. The three keys are now
+present and `false`.
 
-ConfigMap `conforma-policy` is the too-permissive seed (`skip-image-sig-check=true`,
-CVE threshold `999`, identity `.*`, all workshop rules excluded). Argo reverts
-edits to that object — copy it to `lw-poc-build`, tighten the copy, and pass
-`policy-namespace` / `policy-configmap`. Fail path: unsigned `FROM`. Pass path:
-learner-signed app image. Do not copy `example-pipeline-snippet.yaml` from
-ConfigMap `conforma-policy-docs`. Do not fetch policy from quay.io or GitHub.
+Their content, and most of `userInfo.instructions`, describes Lightwell
+workshop tasks (`verify-base-image`, `conforma-policy`,
+`prefetch-dependencies` in a `lightwell-tasks` namespace) that ssc-demo does
+not ship. The text is left as-is rather than rewritten, since nothing reads
+it; delete the ConfigMap with `userInfo.enabled: false` if it is just noise
+on your cluster.
 
-Image build stays **OpenShift BuildConfig**.
+## Values
 
-## V2-23 prefetch-dependencies
-
-Task `prefetch-dependencies` in namespace `lightwell-tasks` is the Track 4.2
-**Hermeto analogue**: Maven `go-offline` against in-cluster Nexus, then
-`mvn -o dependency:resolve`. It is **not** `quay.io/konflux-ci/hermeto` and is
-**not** a `ClusterTask`. Mapping appendix: Konflux Hermeto → this Task.
-
-It is **not** referenced from the seeded learner Pipeline. Wire it in Gitea
-`.tekton/pipeline.yaml` after `lightwell-dep-gate` and before `openshift-build`.
-The seed `settings.xml` still lists `repo.maven.apache.org` and has no
-`mirrorOf *` — the Task fails until the learner points settings at Nexus only.
-Prefetch writes `.m2-offline` into the source workspace (Binary BuildConfig
-`--from-dir`). Dockerfile `mvn -o` is Track 4 content (V2-34). Do not copy
-`example-pipeline-snippet.yaml` from ConfigMap `prefetch-dependencies-docs`.
-
-Image build stays **OpenShift BuildConfig**.
-
-## Notes
-
-- Installs into `openshift-operators` (shared OperatorGroup — do not create another).
-- Subscription is skipped at render time if one with the same name already exists (`lookup`).
-- Operator provisions the `openshift-pipelines` namespace and webhooks; wait for
-  `oc get crd pipelines.tekton.dev` before expecting RHACS Task sync to stick.
+| Value | Notes |
+|---|---|
+| `operator.channel` | `latest` |
+| `operator.source` | `redhat-operators` |
+| `deployer.domain` / `apiUrl` | cosmetic, into the ConfigMap; set by `bootstrap-infra` |
+| `userInfo.enabled` | set `false` to skip the ConfigMap entirely |
