@@ -1,0 +1,66 @@
+# -----------------------------------------------------------------------------
+# Red Hat Quay for ssc-demo.
+#
+# Vendored from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2 (`quay`),
+# which is what the reference cluster runs. Two subcharts: the operator
+# Subscription (sync wave -2) and a managed QuayRegistry with its seeding jobs
+# (-2 through 1).
+#
+# This is the registry the demo's application images are published to. The
+# pipelines' `output-image` is
+# `quay.<subdomain>/tssc/<component>:<revision>`, and `buildah-rhtap` pushes it
+# with the robot account this chart creates.
+#
+# Changed from upstream:
+#
+#   * Vault is gone. Upstream's config job wrote the admin credentials into a
+#     Vault pod and bound `edit` into the Vault namespace; ssc-demo has no
+#     Vault, so the tasks, the RoleBinding and the `vault` values are removed.
+#   * The catalog source is `redhat-operators` rather than the workshop-only
+#     `redhat-operators-snapshot`.
+#   * The organization is `tssc`, not `parasol`, and the sample dev1/dev2 users
+#     are not created.
+#   * ADDED: the pipeline robot account, its organization permissions, the
+#     `quay-push` dockerconfigjson Secret in the pipeline namespace and the
+#     link from that Secret to the `pipeline` ServiceAccount. All four were
+#     hand-wired on the reference cluster.
+#   * Every API call in the seeding job now tolerates the "already exists"
+#     answer. Upstream pinned exact status codes, so the job failed on its
+#     second run -- which, with Replace=true, is every sync after a chart edit.
+#
+# REQUIRES ODF. `component.objectstorage.managed: true` makes the operator
+# raise an ObjectBucketClaim against NooBaa in openshift-storage. This is the
+# same dependency RHTPA's default s3 storage has. See the README before
+# installing on a cluster without it.
+#
+# SET BEFORE INSTALLING: global.cluster.subdomain and
+# quay-registry.quay.adminUserPassword.
+# -----------------------------------------------------------------------------
+
+global:
+  cluster:
+    # Apps subdomain of the target cluster, e.g. apps.cluster-abcde.example.com.
+    # No leading dot. The registry is published at quay.<subdomain>.
+    subdomain: ""
+
+quay-operator:
+  subscription:
+    channel: stable-3.13
+    source: redhat-operators
+
+quay-registry:
+  quay:
+    adminUser: quayadmin
+    adminUserPassword: REPLACE_ME
+    organizations:
+      - tssc
+    users: []
+    pipeline:
+      enabled: true
+      # Set by bootstrap-infra from pipelineNamespace.
+      namespace: ""
+      organization: tssc
+      robotName: remediation
+  noobaa:
+    enabled: true
+    namespace: openshift-storage

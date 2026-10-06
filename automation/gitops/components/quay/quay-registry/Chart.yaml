@@ -1,0 +1,8 @@
+apiVersion: v2
+name: quay-registry
+description: >-
+  A managed QuayRegistry plus the Ansible seeding that creates the demo
+  organization, the pipeline robot account and the push Secret in the pipeline
+  namespace.
+type: application
+version: 0.1.0

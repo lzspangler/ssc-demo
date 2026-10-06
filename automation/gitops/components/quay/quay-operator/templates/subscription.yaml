@@ -1,0 +1,21 @@
+---
+# Red Hat Quay operator via OLM, into openshift-operators (AllNamespaces).
+#
+# The QuayRegistry CR in the sibling subchart is applied at a later sync wave
+# and carries SkipDryRunOnMissingResource, because on a first install the
+# quayregistries.quay.redhat.com CRD does not exist yet when Argo renders it.
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ include "quay-operator.name" . }}-operator
+  namespace: {{ include "quay-operator.namespace" . }}
+  labels:
+    {{- include "quay-operator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWave | quote }}
+spec:
+  channel: {{ .Values.subscription.channel }}
+  installPlanApproval: {{ .Values.subscription.installPlanApproval }}
+  name: {{ .Values.subscription.name }}
+  source: {{ .Values.subscription.source }}
+  sourceNamespace: {{ .Values.subscription.sourceNamespace }}

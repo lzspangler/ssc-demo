@@ -46,6 +46,138 @@ spec:
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
+{{- if .Values.components.tekton.enabled }}
+{{- $tk := .Values.components.tekton }}
+{{- $ns := .Values.pipelineNamespace }}
+{{- $mavenVariants := list "maven-build-ci-pipeline.yaml" "maven-build-ci-pipeline-ai.yaml" "maven-build-ci-pipeline-no-acs.yaml" }}
+{{- if not (has $tk.mavenBuildPipeline $mavenVariants) }}
+{{- fail (printf "components.tekton.mavenBuildPipeline must be one of %v, got %q" $mavenVariants $tk.mavenBuildPipeline) }}
+{{- end }}
+# -----------------------------------------------------------------------------
+# The Tekton layer. These four Applications replace the `oc apply -f tasks/`,
+# `oc apply -f pipelines/...` and `oc apply -f triggers/...` steps in
+# pipelines/README.md.
+#
+# What stays manual, and why: every Secret the runs mount. `ai-agent-secret`
+# and `maven-settings` hold real credentials and are created with
+# `oc create secret`; `tpa-secret` is step 5 of the gitops README. The two the
+# demo used to need by hand -- `scm-auth-secret` and `gitlab-webhook-secret` --
+# are now minted by the GitLab seeding job into this namespace.
+#
+# Note that `pipelines/secrets/*.example.yaml` is never synced: those files are
+# REPLACE_ME templates, and applying them would overwrite a real credential
+# with a placeholder.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-tasks
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.tasks | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/tasks
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-config
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.config | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/config
+    directory:
+      recurse: false
+      {{- if not $tk.enableImportersJob }}
+      # See values.yaml: redundant once the RHTPA Application declares the
+      # importer, and it needs the hand-made tpa-secret to run at all.
+      exclude: rhtpa-enable-importers-job.yaml
+      {{- end }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-pipelines
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.pipelines | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/pipelines
+    directory:
+      recurse: false
+      # Drop the maven-build-ci variants that were not selected. All three
+      # declare the same metadata.name, and syncing more than one makes the
+      # whole Application fail to render, not just that resource.
+      exclude: {{ printf "{%s}" (join "," (without $mavenVariants $tk.mavenBuildPipeline)) | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-triggers
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.triggers | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/triggers
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- if ne $ns "tssc-app-ci" }}
+{{- fail (printf "pipelineNamespace is %q, but pipelines/triggers/agentic-issue-triggers.yaml hardcodes the ClusterRoleBinding subject namespace as tssc-app-ci. Edit that file to match before changing pipelineNamespace, or the EventListener cannot reach the cel/gitlab ClusterInterceptors." $ns) }}
+{{- end }}
+{{- end }}
+
 {{- if .Values.components.keycloak.enabled }}
 ---
 apiVersion: argoproj.io/v1alpha1
@@ -125,6 +257,62 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.gitlab.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.quay.enabled }}
+{{- $q := .Values.components.quay }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-quay
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $q.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/quay
+    helm:
+      valuesObject:
+        global:
+          cluster:
+            subdomain: {{ $domain | quote }}
+        quay-registry:
+          quay:
+            adminUserPassword: {{ .Values.credentials.quayAdminPassword | quote }}
+            organizations:
+              - {{ $q.organization | quote }}
+            component:
+              objectstorage:
+                managed: {{ $q.objectStorageManaged }}
+            pipeline:
+              enabled: true
+              namespace: {{ .Values.pipelineNamespace | quote }}
+              organization: {{ $q.organization | quote }}
+              robotName: {{ $q.robotName | quote }}
+              secretName: {{ $q.pushSecretName | quote }}
+          noobaa:
+            # The pre-flight BackingStore patch only makes sense when the
+            # operator is actually provisioning a NooBaa bucket.
+            enabled: {{ $q.objectStorageManaged }}
+            namespace: {{ $q.noobaaNamespace | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $q.namespace }}
+  # No ignoreDifferences needed. The three Secrets that matter here --
+  # quay-admin-token, the push Secret and the operator's own generated config
+  # -- are written by Ansible and by the Quay operator, not rendered from this
+  # chart, so they carry no Argo tracking ID and selfHeal/prune leave them
+  # alone. That is load-bearing for quay-admin-token in particular: it is the
+  # only copy of a token that /api/v1/user/initialize will not reissue.
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 

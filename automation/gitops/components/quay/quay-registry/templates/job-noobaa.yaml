@@ -1,0 +1,41 @@
+{{- if .Values.noobaa.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "quay-registry.name" . }}-noobaa
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.noobaa | quote }}
+    # A Job's pod template is immutable, so editing the playbook would
+    # otherwise fail the sync with "field is immutable" and leave the old
+    # seeding in place. Replace is also how you re-run it.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # Deliberately not the upstream 100. If ODF is absent, every attempt burns
+  # 20 minutes of retries before failing; a bounded limit turns that into a
+  # visible failed Job instead of an Application that hangs Progressing for
+  # the rest of the day.
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccount: {{ include "quay-registry.name" . }}-noobaa
+      containers:
+        - name: noobaa-status
+          image: {{ .Values.jobImage }}
+          command:
+            - /bin/bash
+            - '-c'
+            - |
+              set -x
+              ansible-playbook -i localhost /scripts/playbook.yaml
+          volumeMounts:
+            - mountPath: /scripts
+              name: playbook
+      volumes:
+        - name: playbook
+          configMap:
+            name: {{ include "quay-registry.name" . }}-noobaa
+{{- end }}

@@ -22,6 +22,10 @@
 #    8  gitlab                   Independent of Keycloak (root auth, not OIDC), but slow:
 #                                the seeding job imports a repository from GitHub. Started
 #                                early so it overlaps the operator installs.
+#   10  quay                     The application image registry. Needs the pipeline
+#                                namespace and its `pipeline` ServiceAccount (wave 3-5) to
+#                                exist before it can write the push Secret, and NooBaa in
+#                                openshift-storage for its object storage.
 #   10  rhtas                    Securesign. Needs the realm's trusted-artifact-signer client.
 #   10  rhtpa-prerequisites      Postgres + oidc-tpa-cli Secret + the S3 bucket. Its PreSync
 #                                hook blocks on the Keycloak issuer, which is the real
@@ -46,6 +50,10 @@ gitops:
   repoUrl: "https://github.com/lzspangler/ssc-demo.git"
   revision: "ssc-demo"
   basePath: "automation/gitops"
+  # The Tekton resources are NOT under basePath -- they live at the repo root,
+  # where pipelines/README.md documents them. Argo applies them from there
+  # rather than from a copy, so the two cannot drift.
+  tektonPath: "pipelines"
 
 argocd:
   namespace: openshift-gitops
@@ -73,6 +81,11 @@ credentials:
   # consumers, so it is set once here.
   tpaDbPassword: REPLACE_ME
 
+  # The Quay superuser. The seeding job creates this account through
+  # /api/v1/user/initialize and then logs in as it to make the organization and
+  # the pipeline robot, so it is also how you sign in to the Quay console.
+  quayAdminPassword: REPLACE_ME
+
   # The `tpa-cli` OIDC client secret, and the single most load-bearing value in
   # this file. It is written into the Keycloak realm, into the `oidc-tpa-cli`
   # Secret RHTPA reads, and -- by hand, see step 5 of README.md -- into the
@@ -90,6 +103,45 @@ components:
     namespace: openshift-operators
     syncWave: "0"
 
+  # The Tekton layer itself: the Tasks, Pipelines, Triggers and ConfigMap that
+  # pipelines/README.md otherwise has you `oc apply` by hand. Four Applications
+  # rather than one, because each points at a single directory with
+  # `recurse: false` -- that keeps every include/exclude pattern a bare
+  # filename, which Argo matches the same way regardless of version, and it
+  # makes a failure in (say) the triggers visible on its own.
+  tekton:
+    enabled: true
+    syncWaves:
+      # Operator CRDs come from wave 0. Tasks and the AI config have no
+      # intra-layer dependencies; Pipelines reference Tasks; Triggers reference
+      # Pipelines.
+      tasks: "3"
+      config: "3"
+      pipelines: "4"
+      triggers: "5"
+
+    # pipelines/pipelines/ holds THREE files that all declare
+    # `metadata.name: maven-build-ci`, and Argo CD refuses to sync a directory
+    # containing two resources with the same identity ("appeared 2 times among
+    # application resources"). Exactly one is installed; the other two are
+    # excluded by filename.
+    #
+    #   maven-build-ci-pipeline-ai.yaml      build + sign + SBOM + AI scan chain
+    #   maven-build-ci-pipeline.yaml         build + sign + SBOM + ACS gates
+    #   maven-build-ci-pipeline-no-acs.yaml  as above, ACS gates removed
+    #
+    # The AI variant is the default because it is what the reference cluster
+    # has applied and what the demo narrative exercises.
+    mavenBuildPipeline: maven-build-ci-pipeline-ai.yaml
+
+    # pipelines/config/rhtpa-enable-importers-job.yaml flips RHTPA's
+    # `redhat-csaf` importer on through the REST API. The RHTPA Application
+    # below already declares that importer with `disabled: false`, so on a
+    # GitOps install the Job is redundant -- and it reads the hand-made
+    # `tpa-secret`, so syncing it before step 5 of README.md just leaves a
+    # failed Job. Turn it on only if you install RHTPA some other way.
+    enableImportersJob: false
+
   keycloak:
     enabled: true
     namespace: keycloak
@@ -102,6 +154,36 @@ components:
     enabled: true
     namespace: gitlab
     syncWave: "8"
+
+  # The registry the demo's application images are published to. The pipelines
+  # push `quay.<domain>/<organization>/<component>:<revision>`.
+  #
+  # Wave 10, alongside rhtas and rhtpa-prerequisites, so the three install in
+  # parallel rather than adding their install times together. It cannot go
+  # earlier: the seeding job writes the push Secret into the pipeline namespace
+  # and links it to the `pipeline` ServiceAccount, and neither exists until the
+  # Tekton Applications have run (waves 3-5).
+  #
+  # NEEDS ODF. `objectstorage` is a managed component, so the Quay operator
+  # raises an ObjectBucketClaim against NooBaa in openshift-storage -- the same
+  # dependency rhtpa's default s3 storage has. On a cluster without ODF, set
+  # enabled: false here; the pipelines then need an `output-image` on some
+  # other registry and a push secret you create yourself.
+  quay:
+    enabled: true
+    namespace: quay-registry
+    syncWave: "10"
+    # Organization the images land in, and the robot account that pushes them.
+    # Together they produce `quay.<domain>/tssc/<component>` and the Quay
+    # account `tssc+remediation`, which is what the reference cluster uses.
+    organization: tssc
+    robotName: remediation
+    # Name of the dockerconfigjson Secret written into pipelineNamespace and
+    # linked to the `pipeline` ServiceAccount.
+    pushSecretName: quay-push
+    # NooBaa's namespace. Only read when objectStorageManaged is true.
+    objectStorageManaged: true
+    noobaaNamespace: openshift-storage
 
   rhtas:
     enabled: true
