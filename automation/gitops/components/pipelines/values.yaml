@@ -45,6 +45,21 @@ userInfo:
     before openshift-build after stripping public Central from settings.xml.
     Do not copy example-pipeline-snippet.yaml.
 
+# Optional sections of the userinfo ConfigMap above. templates/userinfo.yaml
+# reads these unconditionally, so they must exist even when switched off --
+# without them the render dies with "nil pointer evaluating interface {}.enabled"
+# and, because this is sync wave 0, nothing else in the platform ever starts.
+#
+# All three describe Lightwell workshop tasks that ssc-demo does not ship.
+verifyBaseImage:
+  enabled: false
+conformaPolicy:
+  enabled: false
+prefetchDependencies:
+  enabled: false
+
 deployer:
-  domain: "apps.cluster-mv9t4.dyn.redhatworkshops.io"
-  apiUrl: "https://api.cluster-mv9t4.dyn.redhatworkshops.io:6443"
+  # Set by bootstrap-infra from deployer.domain. Left empty here so a stale
+  # hostname cannot quietly end up in the ConfigMap.
+  domain: ""
+  apiUrl: ""

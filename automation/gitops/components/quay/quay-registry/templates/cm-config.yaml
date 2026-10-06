@@ -1,0 +1,396 @@
+{{- $name := include "quay-registry.name" . }}
+{{- $host := include "quay-registry.host" . }}
+{{- $p := .Values.quay.pipeline }}
+{{- $robot := include "quay-registry.robotAccount" . }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.config | quote }}
+data:
+  playbook.yaml: |
+    ---
+    # Seeds the registry once it is serving: superuser, demo organizations, and
+    # the robot account the Tekton pipelines push with.
+    #
+    # Every step is written to survive a re-run. The Job carries Replace=true,
+    # so Argo recreates it whenever this ConfigMap changes, and on the second
+    # run most of these API calls answer 400 "already exists" rather than
+    # succeeding. Treating those as success is the difference between a chart
+    # you can edit and one that fails every sync after the first.
+    - name: Configure the Quay registry
+      hosts: localhost
+      gather_facts: false
+      vars:
+        quay_namespace: {{ .Release.Namespace }}
+        quay_registry_name: {{ $name }}
+        quay_host: {{ $host }}
+        admin_user: {{ .Values.quay.adminUser }}
+        admin_password: {{ .Values.quay.adminUserPassword | quote }}
+        admin_email: {{ .Values.quay.adminEmail }}
+        token_secret_name: {{ $name }}-admin-token
+      tasks:
+        - name: Wait for the QuayRegistry to report a deployed version
+          kubernetes.core.k8s_info:
+            api_version: quay.redhat.com/v1
+            kind: QuayRegistry
+            name: '{{ "{{" }} quay_registry_name {{ "}}" }}'
+            namespace: '{{ "{{" }} quay_namespace {{ "}}" }}'
+          register: r_quay_registry
+          until:
+            - r_quay_registry.resources | length > 0
+            - r_quay_registry.resources[0].status is defined
+            - r_quay_registry.resources[0].status.currentVersion is defined
+            - r_quay_registry.resources[0].status.currentVersion | length > 0
+          retries: 120
+          delay: 10
+
+        - name: Record the registry API endpoint
+          ansible.builtin.set_fact:
+            quay_api: '{{ "{{" }} r_quay_registry.resources[0].status.registryEndpoint {{ "}}" }}'
+
+        - name: Wait for the Quay API to answer
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/discovery'
+            method: GET
+            validate_certs: false
+            status_code: [200, 403]
+          register: r_quayapi
+          until: r_quayapi.status in [200, 403]
+          retries: 120
+          delay: 10
+
+        # -------------------------------------------------------------------
+        # Superuser and API token
+        # -------------------------------------------------------------------
+        - name: Look for an admin token from a previous run
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: Secret
+            name: '{{ "{{" }} token_secret_name {{ "}}" }}'
+            namespace: '{{ "{{" }} quay_namespace {{ "}}" }}'
+          register: r_token_secret
+
+        # /api/v1/user/initialize only works while the user table is empty --
+        # it is Quay's bootstrap hatch, not an idempotent API. Once the
+        # superuser exists it answers 400, which here means "already done".
+        - name: Initialize the Quay superuser
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/user/initialize'
+            method: POST
+            body:
+              username: '{{ "{{" }} admin_user {{ "}}" }}'
+              password: '{{ "{{" }} admin_password {{ "}}" }}'
+              email: '{{ "{{" }} admin_email {{ "}}" }}'
+              access_token: true
+            body_format: json
+            validate_certs: false
+            status_code: [200, 400]
+          register: r_initialize
+          no_log: true
+
+        - name: Decide which API token to use
+          ansible.builtin.set_fact:
+            quay_initialized: '{{ "{{" }} r_initialize.status == 200 {{ "}}" }}'
+            quay_token: >-
+              {{ "{{" }} r_initialize.json.access_token
+                 if (r_initialize.status == 200 and r_initialize.json is defined
+                     and r_initialize.json.access_token is defined)
+                 else ((r_token_secret.resources[0].data.token | b64decode)
+                       if (r_token_secret.resources | length > 0)
+                       else '') {{ "}}" }}
+          no_log: true
+
+        - name: Fail clearly when no usable token exists
+          ansible.builtin.fail:
+            msg: >-
+              Quay is already initialized but {{ "{{" }} token_secret_name {{ "}}" }} does not
+              exist, so this job has no API token to work with. That happens when
+              the registry was bootstrapped by hand. Create an OAuth token for
+              {{ "{{" }} admin_user {{ "}}" }} in the Quay UI and store it as
+              `oc -n {{ "{{" }} quay_namespace {{ "}}" }} create secret generic
+              {{ "{{" }} token_secret_name {{ "}}" }} --from-literal=token=<token>`, then
+              re-sync.
+          when: quay_token | length == 0
+
+        - name: Store the admin token
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: '{{ "{{" }} token_secret_name {{ "}}" }}'
+                namespace: '{{ "{{" }} quay_namespace {{ "}}" }}'
+              type: Opaque
+              stringData:
+                token: '{{ "{{" }} quay_token {{ "}}" }}'
+          when: quay_initialized | bool
+          no_log: true
+
+        # The token minted by /user/initialize expires, and a demo cluster that
+        # lives for weeks will outlast it -- at which point every API call here
+        # starts returning 401 for no visible reason. Push the expiry out.
+        # Only needed on the run that created the token.
+        - name: Extend the admin token expiry
+          when: quay_initialized | bool
+          block:
+            - name: Wait for the Quay database to be redeployed
+              kubernetes.core.k8s_info:
+                api_version: apps/v1
+                kind: Deployment
+                name: '{{ "{{" }} quay_registry_name {{ "}}" }}-quay-database'
+                namespace: '{{ "{{" }} quay_namespace {{ "}}" }}'
+              register: r_db_deploy
+              retries: 10
+              delay: 5
+              ignore_errors: true
+              until:
+                - r_db_deploy.resources | length == 1
+                - r_db_deploy.resources[0].status is defined
+                - r_db_deploy.resources[0].status.observedGeneration is defined
+                - r_db_deploy.resources[0].status.observedGeneration | int == 2
+
+            - name: Find the running Quay database pod
+              kubernetes.core.k8s_info:
+                api_version: v1
+                kind: Pod
+                namespace: '{{ "{{" }} quay_namespace {{ "}}" }}'
+                label_selectors:
+                  - quay-component = postgres
+              register: r_db_pod
+              retries: 40
+              delay: 5
+              until:
+                - r_db_pod.resources | length == 1
+                - r_db_pod.resources[0].status is defined
+                - r_db_pod.resources[0].status.phase is defined
+                - r_db_pod.resources[0].status.phase == "Running"
+
+            - name: Push the token expiry out to 2300
+              kubernetes.core.k8s_exec:
+                namespace: '{{ "{{" }} quay_namespace {{ "}}" }}'
+                pod: '{{ "{{" }} r_db_pod.resources[0].metadata.name {{ "}}" }}'
+                command: >-
+                  psql -d {{ "{{" }} quay_registry_name {{ "}}" }}-quay-database
+                  -c "update public.oauthaccesstoken set expires_at = '2300-12-31 00:00:00' where id = 1;"
+              register: r_extend
+              retries: 3
+              delay: 10
+              ignore_errors: true
+              until:
+                - r_extend.rc is defined
+                - r_extend.rc == 0
+
+            - name: Warn if the expiry could not be extended
+              ansible.builtin.debug:
+                msg: >-
+                  Could not extend the admin OAuth token expiry. Everything else
+                  still works; the token will simply lapse at Quay's default
+                  horizon and this job will need a fresh one after that.
+              when: r_extend is failed
+
+        # -------------------------------------------------------------------
+        # Organizations and users
+        # -------------------------------------------------------------------
+{{- range $org := .Values.quay.organizations }}
+        - name: Create organization {{ $org }}
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            body:
+              name: {{ $org }}
+            body_format: json
+            validate_certs: false
+            # 400 is "organization already exists".
+            status_code: [201, 400]
+{{- end }}
+{{- range $user := .Values.quay.users }}
+
+        - name: Create user {{ $user.username }}
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/superuser/users/'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            body:
+              username: {{ $user.username }}
+              email: {{ $user.email }}
+            body_format: json
+            validate_certs: false
+            status_code: [200, 400]
+
+        - name: Set the password for {{ $user.username }}
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/superuser/users/{{ $user.username }}'
+            method: PUT
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            body:
+              password: {{ $user.password | quote }}
+            body_format: json
+            validate_certs: false
+            status_code: [200]
+          no_log: true
+{{- end }}
+{{- if include "quay-registry.pipelineEnabled" . }}
+
+        # -------------------------------------------------------------------
+        # The pipeline push credential
+        #
+        # On the reference cluster this was all done by hand. The robot account
+        # tssc+remediation, its organization permissions, the dockerconfigjson
+        # Secret in the pipeline namespace and the ServiceAccount link are the
+        # reason `buildah-rhtap` can push output-image without the PipelineRun
+        # naming a credential at all.
+        # -------------------------------------------------------------------
+        - name: Create the pipeline robot account
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/{{ $p.organization }}/robots/{{ $p.robotName }}'
+            method: PUT
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            body:
+              description: Push credential for the ssc-demo Tekton pipelines
+            body_format: json
+            validate_certs: false
+            status_code: [201, 400]
+          register: r_robot_create
+          no_log: true
+
+        - name: Read the existing robot account
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/{{ $p.organization }}/robots/{{ $p.robotName }}'
+            method: GET
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            validate_certs: false
+            status_code: [200]
+          register: r_robot_get
+          when: r_robot_create.status == 400
+          no_log: true
+
+        - name: Record the robot credentials
+          ansible.builtin.set_fact:
+            robot_account: {{ $robot | quote }}
+            robot_token: >-
+              {{ "{{" }} r_robot_create.json.token
+                 if (r_robot_create.status == 201)
+                 else r_robot_get.json.token {{ "}}" }}
+          no_log: true
+
+        - name: Create the {{ $p.teamName }} team with the {{ $p.teamRole }} role
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/{{ $p.organization }}/team/{{ $p.teamName }}'
+            method: PUT
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            body:
+              role: {{ $p.teamRole }}
+            body_format: json
+            validate_certs: false
+            status_code: [200, 201]
+
+        - name: Add the robot to the {{ $p.teamName }} team
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/{{ $p.organization }}/team/{{ $p.teamName }}/members/{{ $robot }}'
+            method: PUT
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            validate_certs: false
+            status_code: [200, 201]
+{{- if $p.grantWritePrototype }}
+
+        # The team role covers repositories the robot creates itself. This
+        # prototype covers the rest: anything created in the organization from
+        # now on grants the robot write as well. Without it a repository made
+        # in the UI rejects the pipeline's push with a bare 403.
+        - name: Grant the robot write on new repositories
+          ansible.builtin.uri:
+            url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/{{ $p.organization }}/prototypes'
+            method: POST
+            headers:
+              Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
+            body:
+              role: write
+              delegate:
+                name: {{ $robot }}
+                kind: user
+                is_robot: true
+            body_format: json
+            validate_certs: false
+            # 400 is the duplicate-prototype answer on a re-run.
+            status_code: [200, 201, 400]
+{{- end }}
+
+        # The OpenShift Pipelines operator creates this ServiceAccount in every
+        # namespace, but only once the namespace exists -- which is the Tekton
+        # Applications' job, several sync waves earlier. Wait rather than assume.
+        - name: Wait for the {{ $p.serviceAccount }} ServiceAccount
+          kubernetes.core.k8s_info:
+            api_version: v1
+            kind: ServiceAccount
+            name: {{ $p.serviceAccount }}
+            namespace: {{ $p.namespace }}
+          register: r_pipeline_sa
+          until: r_pipeline_sa.resources | length > 0
+          retries: 60
+          delay: 10
+
+        - name: Write the push Secret into {{ $p.namespace }}
+          kubernetes.core.k8s:
+            state: present
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: {{ $p.secretName }}
+                namespace: {{ $p.namespace }}
+              type: kubernetes.io/dockerconfigjson
+              stringData:
+                .dockerconfigjson: >-
+                  {{ "{{" }} {'auths': dict([[quay_host, {
+                       'username': robot_account,
+                       'password': robot_token,
+                       'auth': (robot_account ~ ':' ~ robot_token) | b64encode
+                     }]])} | to_json {{ "}}" }}
+          no_log: true
+
+        # `secrets` and `imagePullSecrets` have no strategic-merge key, so a
+        # patch replaces each list outright. Compose the full list first --
+        # overwriting it with just this one entry would drop the
+        # pipeline-dockercfg-xxxxx the operator put there and break pulls from
+        # the internal registry.
+        - name: Compose the ServiceAccount secret list
+          ansible.builtin.set_fact:
+            sa_secrets: '{{ "{{" }} (sa_secrets | default([])) + [{"name": item}] {{ "}}" }}'
+          loop: >-
+            {{ "{{" }} ((r_pipeline_sa.resources[0].secrets | default([]) | map(attribute='name') | list)
+               + ['{{ $p.secretName }}']) | unique | list {{ "}}" }}
+
+        - name: Compose the ServiceAccount imagePullSecrets list
+          ansible.builtin.set_fact:
+            sa_pull_secrets: '{{ "{{" }} (sa_pull_secrets | default([])) + [{"name": item}] {{ "}}" }}'
+          loop: >-
+            {{ "{{" }} ((r_pipeline_sa.resources[0].imagePullSecrets | default([]) | map(attribute='name') | list)
+               + ['{{ $p.secretName }}']) | unique | list {{ "}}" }}
+
+        - name: Link the push Secret to the {{ $p.serviceAccount }} ServiceAccount
+          kubernetes.core.k8s:
+            state: patched
+            merge_type: merge
+            definition:
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: {{ $p.serviceAccount }}
+                namespace: {{ $p.namespace }}
+              secrets: '{{ "{{" }} sa_secrets {{ "}}" }}'
+              imagePullSecrets: '{{ "{{" }} sa_pull_secrets {{ "}}" }}'
+{{- end }}

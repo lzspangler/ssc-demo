@@ -1,0 +1,69 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "quay-registry.name" . }}-config
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+---
+# In its own namespace the job needs broad rights: it reads the QuayRegistry
+# status, writes the admin-token Secret, and execs into the Quay Postgres pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "quay-registry.name" . }}-config
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "quay-registry.name" . }}-config
+    namespace: {{ .Release.Namespace }}
+{{- if include "quay-registry.pipelineEnabled" . }}
+---
+# In the PIPELINE namespace it needs exactly two things: to write the push
+# Secret, and to add that Secret to the `pipeline` ServiceAccount. Upstream
+# bound `edit` into the Vault namespace for the equivalent job; this is the
+# narrow version, matching how the GitLab chart reaches the same namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: quay-pipeline-push-secret
+  namespace: {{ .Values.quay.pipeline.namespace }}
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quay-pipeline-push-secret
+  namespace: {{ .Values.quay.pipeline.namespace }}
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: quay-pipeline-push-secret
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "quay-registry.name" . }}-config
+    namespace: {{ .Release.Namespace }}
+{{- end }}

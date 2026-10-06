@@ -1,0 +1,36 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "quay-registry.name" . }}-config
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.config | quote }}
+    # Pod templates are immutable. Without Replace, any edit to the playbook
+    # fails the sync with "field is immutable" and the cluster quietly keeps
+    # running the old seeding. Replace is also how you re-seed: change the
+    # ConfigMap and sync.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccount: {{ include "quay-registry.name" . }}-config
+      containers:
+        - name: quay-config
+          image: {{ .Values.jobImage }}
+          command:
+            - /bin/bash
+            - '-c'
+            - |
+              set -e
+              ansible-playbook -i localhost /scripts/playbook.yaml
+          volumeMounts:
+            - mountPath: /scripts
+              name: playbook
+      volumes:
+        - name: playbook
+          configMap:
+            name: {{ include "quay-registry.name" . }}-config

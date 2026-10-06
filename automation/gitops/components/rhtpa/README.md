@@ -1,81 +1,105 @@
-# charts/components/rhtpa — Red Hat Trusted Profile Analyzer
+# rhtpa
 
-Deploys Trusted Profile Analyzer for the Lightwell TSSC workshop via the **RHTPA Operator** (namespace-scoped OLM Subscription) and a `TrustedProfileAnalyzer` custom resource. Supports **CycloneDX SBOM** upload and **VEX / advisory** ingest. The Track 7 Check is learner-uploaded Lightwell GAV-bound CDX+VEX from Nexus (**Q12 C+**). Do **not** enable the live Red Hat CSAF importer as that gate.
+Red Hat Trusted Profile Analyzer — the SBOM store and vulnerability analyzer
+the demo's CVE issues and remediation advice come from.
 
-## Sync waves (inside this chart)
+**The RHTPA chart itself is not vendored here.** It is the Red Hat chart
+`redhat-trusted-profile-analyzer` from `https://charts.openshift.io/`, pinned
+to 1.2.6, referenced directly by the `ssc-rhtpa` Argo Application. Its values
+live in `bootstrap-infra/templates/applications.yaml`, which is the only place
+to change them.
 
-| Wave | Resources |
-|------|-----------|
-| `0` | Namespace (`trusted-profile-analyzer`) |
-| `1` | OperatorGroup + Subscription |
-| `2` | PostgreSQL + OIDC CLI secret |
-| `3` | `TrustedProfileAnalyzer` CR |
-| `4` | Job `rhtpa-oidc-wait` (wait Keycloak OIDC; roll `server` if not Ready) |
-| `5` | Ingestion-info + RHDP userinfo ConfigMaps |
+This directory holds only what that chart expects to already exist:
 
-Root App-of-Apps places this chart at sync wave **`10`** (with other TSSC operators).
-
-## SBOM and VEX / advisory flows
-
-| Flow | How |
-|------|-----|
-| **CycloneDX SBOM** | Learner/`syft` upload via TPA UI or REST API (`supported_cyclonedx_version` in values / ingestion ConfigMap) |
-| **Track 7 scored VEX (C+)** | Learner pulls OpenVEX + CycloneDX (`LW-DEMO-0002`) for `commons-lang3:3.14.0.rhlw-00001` from Nexus and uploads to TPA. Provision does **not** pre-ingest |
-| **VEX / advisories (not the Check)** | Importers: `cve` (CVE list v5), `osv-github` (OSV). **`redhat-csaf` stays off** — OS-layer callout only (Hummingbird / RHEL) |
-| **Red Hat SBOM mirror** | Optional `redhat-sboms` importer (disabled by default — heavy) |
-| **RHDA shift-left** | IDE client of TPA intelligence — see [docs/rhda-rhtpa-shift-left.md](../../../docs/rhda-rhtpa-shift-left.md) (Showroom = TPA UI/`syft` only; no IDE in-cluster) |
-
-Storage defaults to **filesystem** on PVC `storage` (the operator mounts that claim; the CR `size` field does not create it). The PVC pins Immediate RBD (`ocs-external-storagecluster-ceph-rbd-immediate`) so it Binds without a first-consumer Job. The bind Job is off (`storage.bindJob: false`). WaitForFirstConsumer default SC plus a TTL'd bind Job is what #101 leftover Multi-Attach was. Claims without Immediate RBD: set `storageClassName` empty and `bindJob: true`. Prefer S3 / OpenShift Data Foundation object storage for production-like sizing.
-
-## Prerequisites
-
-- **OIDC** (Keycloak / RHBK) realm matching `oidc.realm` with `frontend` and `cli` clients — chart derives `https://sso.<deployer.domain>/realms/<realm>`
-- Workshop IdP: enable `components.keycloak` (wave 5) in root-app — see [`charts/components/keycloak`](../keycloak/); keep `oidc.cliClientSecret` in sync with that chart
-- Job `rhtpa-oidc-wait` waits for `…/realms/tpa/.well-known/openid-configuration` and rolls Deployment `server` only when not Ready (avoids CrashLoop when TPA syncs before Keycloak)
-- Override workshop defaults for `postgresql.password` and `oidc.cliClientSecret` via values or RHDP secret injection (**do not use committed defaults in shared environments**)
-
-## Reuse sources
-
-- RHADS / `rhpds.build-secured-dev-workflows` `trusted_profile_analyzer` role
-- [RHTPA Deployment Guide](https://docs.redhat.com/en/documentation/red_hat_trusted_profile_analyzer/2/html-single/deployment_guide/index)
-
-## Values of interest
-
-| Key | Default | Notes |
-|-----|---------|-------|
-| `rhtpa.enabled` | `true` | Chart gate |
-| `rhtpa.namespace` | `trusted-profile-analyzer` | Instance + operator NS |
-| `operator.channel` | `stable-v3` | Catalog default; `stable-v1.1` also exists |
-| `trustedProfileAnalyzer.storage.type` | `filesystem` | PoC PVC storage |
-| `trustedProfileAnalyzer.storage.storageClassName` | Immediate RBD | Binds without a pod (#101) |
-| `trustedProfileAnalyzer.storage.bindJob` | `false` | First-consumer Job; only for WaitForFirstConsumer |
-| `trustedProfileAnalyzer.importers.*.enabled` | CVE/OSV on; CSAF/RH SBOM **off** | CSAF is not the Track 7 gate (V2-18 / C+) |
-| `deployer.domain` | `""` | Injected by root-app |
-
-## Local validation
-
-```bash
-helm lint charts/components/rhtpa
-helm template rhtpa charts/components/rhtpa \
-  --set deployer.domain=apps.cluster.example.com
-
-./scripts/helm-validate.sh
+```
+tpa-prerequisites/
+  postgresql-*            PostgreSQL 16, 20Gi PVC — RHTPA's graph database
+  secret-oidc-cli.yaml    the `oidc-tpa-cli` Secret RHTPA reads its client secret from
+  objectbucketclaim.yaml  the S3 bucket (s3 mode only)
+  wait-for-keycloak.yaml  PreSync hook: block until the Keycloak issuer answers
 ```
 
-## Enable from root-app
+Vendored from `redhat-ads-tech/ocp-app-platform-demo-helm` v1.4.2
+(`trusted-profile-analyzer/charts/tpa-prerequisites`).
 
-```bash
-helm template lightwell charts/root-app \
-  --set components.rhtpa.enabled=true \
-  --set deployer.domain=apps.cluster.example.com
-```
+## Two charts, one set of values
 
-Keep `components.rhtpa.enabled: false` in committed root values until SSO + cluster capacity are ready.
+Three values must agree across the prerequisites chart and the upstream chart,
+and nothing checks that they do:
 
-## Related
+| Value | Here | In the RHTPA chart |
+|---|---|---|
+| Postgres password | `pgsql.password` | `database.password` (via the `tpa-postgresql` Secret) |
+| OIDC issuer | `oidc.issuerUrl` | `oidc.issuerUrl` |
+| Storage mode | `storage.type` | `storage.type` |
 
-- Issue [#5](https://github.com/NA-FSI-Services/lightwell-tssc-workshop/issues/5) — chart scaffold
-- V2-18 GAV-bound VEX (C+): [#11](https://github.com/NA-FSI-Services/lightwell-tssc-workshop/issues/11)
-- RHDA shift-left docs: [#26](https://github.com/NA-FSI-Services/lightwell-tssc-workshop/issues/26) → [docs/rhda-rhtpa-shift-left.md](../../../docs/rhda-rhtpa-shift-left.md)
-- Module 4 SBOM lab: [#17](https://github.com/NA-FSI-Services/lightwell-tssc-workshop/issues/17)
-- [charts/root-app/README.md](../../root-app/README.md)
+`bootstrap-infra` derives all three from single values
+(`credentials.tpaDbPassword`, `components.keycloak.realm` + `deployer.domain`,
+`components.rhtpa.storage.type`), so installing through the app-of-apps keeps
+them in step. Installing this chart standalone does not.
+
+The fourth consumer of `tpa-cli`'s secret — the pipeline's `tpa-secret` — is
+not GitOps-managed at all; see step 5 of the root README.
+
+## The PreSync hook
+
+`wait-for-keycloak.yaml` polls the realm's
+`/.well-known/openid-configuration` before the rest of the sync proceeds. It
+is why `keycloak` is a lower sync wave than this component: RHTPA's server
+reads its OIDC configuration once at startup and does not retry, so starting
+it against a realm that is not yet serving produces a pod that comes up
+Healthy and rejects every request.
+
+## Storage
+
+**s3 (default, matches the reference cluster).** Requires OpenShift Data
+Foundation. This chart creates an `ObjectBucketClaim` against the
+`openshift-storage.noobaa.io` provisioner; ODF answers with a Secret and
+ConfigMap named after the claim, and the RHTPA Application reads the access
+keys out of that Secret. Note that the `region` RHTPA is given is NooBaa's S3
+endpoint URL, not an AWS region name.
+
+**filesystem.** This chart creates nothing and RHTPA provisions its own PVC,
+named `storage`. That PVC is mounted by **both** the server and the importer
+Deployments, and chart 1.2.6 hardcodes `accessModes: [ReadWriteOnce]` on it
+(`templates/services/server/010-PersistentVolumeClaim-storage.yaml`) with no
+value to override. Pointing `storageClassName` at an RWX class therefore does
+not make it shareable — the claim still requests RWO, Kubernetes requires both
+pods on one node, and the importer stays Pending whenever that is not
+possible. Usable for a small single-worker demo; prefer s3 otherwise.
+
+Switch `components.rhtpa.storage.type` and nothing else; `bootstrap-infra`
+fans it out to both charts.
+
+## Postgres sizing
+
+Upstream's 250m/1Gi and a 1-second readiness timeout do not survive the first
+ingest. RHTPA's importers replay the entire CVE List v5, the GitHub advisory
+database and the Red Hat CSAF feed — hours of sustained write load. At the
+upstream limits the ingest saturates the CPU quota, a `SELECT 1` queued behind
+it counts as a failed readiness probe, Postgres is marked NotReady mid-ingest,
+and the analysis endpoints end up answering from partial data. The values here
+(2 CPU / 4Gi, 5-second probe timeout) are what the reference cluster converged
+on.
+
+## Route timeout
+
+RHTPA's Route is **generated from an Ingress** by the ingress-to-route
+controller and carries an `ownerReference`, so `oc annotate` on the Route is
+reverted within seconds. The `haproxy.router.openshift.io/timeout: 300s`
+annotation goes on the Ingress instead, through the chart's
+`ingress.additionalAnnotations` — set from `components.rhtpa.routeTimeout`.
+
+The default 30 s is not survivable: `/purl/recommend` cannot complete inside
+it at any batch size, and the failure surfaces to the pipeline as a truncated
+response rather than an error.
+
+## Changed from upstream
+
+* `objectbucketclaim.yaml` is now conditional on `storage.type == "s3"`, and
+  its names come from values rather than being hardcoded.
+* `_helpers.tpl` gained `tpa-prerequisites.issuerUrl`, so the issuer can be
+  derived from `global.cluster.subdomain` instead of passed in; the PreSync
+  hook uses it.
+* `values.yaml` rewritten with the resource/probe changes above documented in
+  place.

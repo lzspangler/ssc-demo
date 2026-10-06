@@ -1,0 +1,20 @@
+---
+apiVersion: quay.redhat.com/v1
+kind: QuayRegistry
+metadata:
+  name: {{ include "quay-registry.name" . }}
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    # On a first install the quayregistries CRD does not exist when Argo runs
+    # its dry run -- the operator Subscription two sync waves earlier is still
+    # resolving. Without this the Application fails before the CRD can land.
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.registry | quote }}
+spec:
+  configBundleSecret: {{ include "quay-registry.name" . }}-config-bundle
+  components:
+    {{- range $kind := list "postgres" "clairpostgres" "objectstorage" "redis" "tls" "route" "clair" "horizontalpodautoscaler" "mirror" "monitoring" "quay" }}
+    - kind: {{ $kind }}
+      {{- toYaml (index $.Values.quay.component $kind) | nindent 6 }}
+    {{- end }}

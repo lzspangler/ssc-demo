@@ -1,0 +1,18 @@
+nameOverride: "quay"
+
+# AllNamespaces install. openshift-operators already has an OperatorGroup --
+# adding a second one puts every operator in that namespace into an error
+# state, so this chart deliberately ships none.
+namespace: openshift-operators
+
+subscription:
+  channel: stable-3.13
+  installPlanApproval: Automatic
+  name: quay-operator
+  # The reference cluster pins `redhat-operators-snapshot`, a catalog that only
+  # exists inside the Red Hat workshop environment. A stock cluster has
+  # `redhat-operators`.
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+
+syncWave: "-2"

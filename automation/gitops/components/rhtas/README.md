@@ -1,71 +1,65 @@
-# charts/components/rhtas — Red Hat Trusted Artifact Signer
+# rhtas
 
-Deploys keyless signing infrastructure for the Lightwell TSSC workshop via the **RHTAS Operator** (OLM Subscription) and a `Securesign` custom resource (Fulcio, Rekor, Trillian, CTlog, TUF).
+Red Hat Trusted Artifact Signer. Two subcharts:
 
-## Sync waves (inside this chart)
+| Wave | Subchart | What it does |
+|---|---|---|
+| 1 | `rhtas-operator` | Subscription for `rhtas-operator` in `openshift-operators` |
+| 2 | `trusted-artifact-signer` | a `Securesign` CR, which the operator expands into Fulcio, Rekor, CTlog, Trillian, a timestamp authority and a TUF server |
 
-| Wave | Resources |
-|------|-----------|
-| `0` | Namespace (`trusted-artifact-signer`) |
-| `1` | OLM Subscription (`openshift-operators`) |
-| `2` | `Securesign` CR |
-| `3` | RHDP `demo-userinfo-rhtas` ConfigMap |
+Vendored from `redhat-ads-tech/ocp-app-platform-demo-helm` v1.4.2, which is
+what the reference cluster runs.
 
-Root App-of-Apps places this chart at sync wave **`10`** (with other TSSC operators).
+## What the demo uses it for
 
-## Keyless signing stack
+Keyless signing of the container image the Maven pipeline builds. `cosign`
+obtains an OIDC token from the `trusted-artifact-signer` client in the Keycloak
+`backstage` realm, Fulcio issues a short-lived certificate bound to that
+identity, and the signature is logged to Rekor. There is no long-lived key
+anywhere, which is the point.
 
-| Component | Role |
-|-----------|------|
-| **Fulcio** | Short-lived signing certificates from OIDC identity |
-| **Rekor** | Tamper-evident transparency log |
-| **Trillian** | Merkle-tree backend for Rekor / CTlog |
-| **CTlog** | Certificate transparency for Fulcio |
-| **TUF** | Trust-root distribution for verifiers |
-| **TSA** | Optional RFC 3161 timestamp authority (`securesign.tsa.enabled`) |
+The pipeline's verification step reads the Rekor URL and TUF mirror from its
+own parameters; those must point at this namespace
+(`trusted-artifact-signer`), not at the `tssc-tas` the upstream workshop uses.
 
-Default Fulcio OIDC issuer is the **Kubernetes API** (`Type: kubernetes`) so pipeline / Tekton SA keyless signing works without a separate IdP. Optional Keycloak / RHBK email issuer can be enabled via `oidc.keycloak.enabled` when SSO is available (RHADS pattern).
+## The OIDC issuer
 
-## Reuse sources
+`securesignCR.yaml` takes its issuer from the
+`trusted-artifact-signer.oidcIssuer` helper: an explicit `oidc` value wins,
+otherwise it is built as `https://<ssoHostPrefix>.<global.cluster.subdomain>/realms/<realm>`.
+That has to resolve to exactly the same string Keycloak publishes as its
+issuer — Fulcio fetches `/.well-known/openid-configuration` from it and
+validates the `iss` claim against it, so a trailing-slash or realm-name
+mismatch fails at signing time with a token-validation error that names
+neither component.
 
-- Trusted Software Factory: `agd-v2.trusted-software-factory-cnv.prod`
-- RHADS / `rhpds.ads` `ocp4_workload_trusted_artifact_signer` Securesign templates
-- [RHTAS Deployment Guide](https://docs.redhat.com/en/documentation/red_hat_trusted_artifact_signer/1/html/deployment_guide/rhtas-ocp-deploy)
+`bootstrap-infra` passes `realm` from the same value it gives Keycloak, so
+the two cannot drift when installed together.
 
-## Values of interest
+## Removed from upstream
 
-| Key | Default | Notes |
-|-----|---------|-------|
-| `rhtas.enabled` | `true` | Chart gate |
-| `rhtas.namespace` | `trusted-artifact-signer` | Instance namespace |
-| `operator.channel` | `stable` | Or `stable-v1.3` |
-| `operator.namespace` | `openshift-operators` | OperatorHub AllNamespaces |
-| `oidc.kubernetes.enabled` | `true` | SA keyless signing |
-| `oidc.keycloak.enabled` | `false` | Enable when SSO exists |
-| `securesign.tsa.enabled` | `false` | Lighter default footprint |
-| `deployer.domain` | `""` | Injected by root-app |
+`cosign-keygen-{job,serviceaccount,clusterrole,clusterrolebinding}.yaml` — a
+Job that generated a cosign key pair and wrote it into Vault, plus the
+cluster-scoped RBAC it needed to do so. ssc-demo has no Vault and signs
+keylessly, so the key pair had no consumer and the ClusterRole was pure
+attack surface.
 
-## Local validation
+## Changed
 
-```bash
-helm lint charts/components/rhtas
-helm template rhtas charts/components/rhtas \
-  --set deployer.domain=apps.cluster.example.com
+* **Catalog source** `redhat-operators-snapshot` → `redhat-operators` (the
+  snapshot catalog is workshop-only).
+* **Namespace is templated.** Upstream's `Securesign` CR took the namespace
+  from the release; here it is `trusted-artifact-signer.namespace`, so the
+  Argo Application and the CR cannot disagree.
+* **`values.yaml` rewritten** around `global.cluster.subdomain` instead of
+  per-cluster hostnames.
 
-./scripts/helm-validate.sh
-```
+## Values you must set
 
-## Enable from root-app
+| Value | Notes |
+|---|---|
+| `global.cluster.subdomain` | apps subdomain, no leading dot |
+| `trusted-artifact-signer.realm` | must match the Keycloak component's realm |
 
-```bash
-helm template lightwell charts/root-app \
-  --set components.rhtas.enabled=true \
-  --set deployer.domain=apps.cluster.example.com
-```
-
-Keep `components.rhtas.enabled: false` in committed root values until a cluster is ready to sync this chart.
-
-## Related
-
-- Issue [#4](https://github.com/NA-FSI-Services/lightwell-tssc-workshop/issues/4)
-- [charts/root-app/README.md](../../root-app/README.md)
+`email` / `org` populate the certificate authority's subject and are cosmetic
+for the demo.

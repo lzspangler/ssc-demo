@@ -1,0 +1,25 @@
+nameOverride: ""
+
+# Namespace the Securesign CR (and therefore Fulcio, Rekor, CTlog, Trillian,
+# TSA and TUF) is created in. The operator itself lives in openshift-operators.
+namespace: trusted-artifact-signer
+
+# Name of the Securesign instance. Every Route the operator creates is named
+# after its component, not after this, so changing it is cosmetic.
+instance: securesign
+
+# Certificate subject written into the Fulcio root and the TSA chain. Shows up
+# in `cosign verify` output, nothing more.
+email: admin@rhdemo.com
+org: Parasol
+
+# OIDC. Leave `oidc` empty to derive `<ssoHostPrefix>.<global.cluster.subdomain>/realms/<realm>`
+# from the Keycloak component's defaults.
+oidc: ""
+ssoHostPrefix: sso
+realm: backstage
+oidcClientId: trusted-artifact-signer
+
+argocd:
+  enabled: true
+  syncwave: "2"

@@ -1,0 +1,162 @@
+nameOverride: "quay"
+
+global:
+  cluster:
+    # Apps subdomain of the target cluster, e.g. apps.cluster-abcde.example.com.
+    # No leading dot. `quay.host` derives from it when left empty.
+    subdomain: ""
+
+quay:
+  displayName: "ssc-demo Quay"
+
+  # Registry hostname. Leave empty to derive `quay.<global.cluster.subdomain>`,
+  # which is what the reference cluster publishes and what the pipelines'
+  # `output-image` parameter is built from.
+  host: ""
+
+  # EXTERNAL_TLS_TERMINATION. The operator creates an edge-terminated Route
+  # using the cluster's default ingress certificate, and already annotates it
+  # with `haproxy.router.openshift.io/timeout: 30m` -- so unlike GitLab and
+  # RHTPA, this component needs no timeout work of its own.
+  tls: true
+
+  # Pushing to a repository that does not exist creates it. false keeps those
+  # repositories public, which is what lets `oc new-app` and a plain `podman
+  # pull` reach demo images without a pull secret.
+  createPrivateRepoOnPush: false
+
+  configureAdmin: true
+  adminUser: quayadmin
+  # Supplied at install time from bootstrap-infra's credentials block. Never
+  # commit a real value.
+  adminUserPassword: REPLACE_ME
+  adminEmail: quayadmin@demo.redhat.com
+
+  # Mirrors the reference cluster's QuayRegistry spec, including the modest
+  # resource requests -- the defaults ask for far more than a workshop cluster
+  # has, and the registry never schedules.
+  component:
+    postgres:
+      managed: true
+      overrides:
+        resources:
+          requests:
+            cpu: 125m
+            memory: 1Gi
+    clairpostgres:
+      managed: true
+      overrides:
+        resources:
+          requests:
+            cpu: 125m
+            memory: 1Gi
+    # Managed object storage means the operator raises an ObjectBucketClaim
+    # against NooBaa. THIS REQUIRES ODF. See `noobaa` below before turning the
+    # component off.
+    objectstorage:
+      managed: true
+    redis:
+      managed: true
+    tls:
+      managed: true
+    route:
+      managed: true
+    clair:
+      managed: true
+      overrides:
+        resources:
+          requests:
+            cpu: 125m
+            memory: 1Gi
+    horizontalpodautoscaler:
+      managed: false
+    mirror:
+      managed: false
+    monitoring:
+      managed: false
+    quay:
+      managed: true
+      overrides:
+        resources:
+          requests:
+            cpu: 125m
+            memory: 1Gi
+
+  # Organizations created by the seeding job. `tssc` is the one the demo
+  # pushes to -- the pipelines' output-image is
+  # `quay.<subdomain>/tssc/<app>:<revision>`.
+  #
+  # The reference cluster also carries `parasol`, which belongs to the upstream
+  # RHDH workshop and holds none of this demo's images. It is not created here.
+  organizations:
+    - tssc
+
+  # Quay users created through the superuser API. ssc-demo authenticates as the
+  # robot account below, not as a human, so this is empty by default. Entries
+  # look like: {username: dev1, email: dev1@example.com, password: ...}
+  users: []
+
+  # ---------------------------------------------------------------------------
+  # The pipeline push credential.
+  #
+  # This is the part the reference cluster had wired by hand: a robot account
+  # in the demo organization, its token packed into a dockerconfigjson Secret
+  # in the pipeline namespace, and that Secret linked to the `pipeline`
+  # ServiceAccount so buildah-rhtap can push without the PipelineRun naming a
+  # credential at all.
+  # ---------------------------------------------------------------------------
+  pipeline:
+    enabled: true
+
+    # Namespace the Tekton pipelines run in. Set by bootstrap-infra from
+    # `pipelineNamespace`; leave empty to skip the whole robot/Secret step.
+    namespace: ""
+
+    # Organization the robot belongs to. Must appear in `organizations` above.
+    organization: tssc
+
+    # Short name. The full Quay account becomes `<organization>+<robotName>`,
+    # i.e. `tssc+remediation` -- the account the reference cluster pushes with.
+    robotName: remediation
+
+    # Team the robot joins, and its org role. `creator` lets the robot make new
+    # repositories in the organization (which is how the first push of a new
+    # component succeeds) without handing it org administration.
+    teamName: pipeline
+    teamRole: creator
+
+    # A default permission prototype granting the robot `write` on every
+    # repository created in the organization. Without it the robot can only
+    # push to repositories it created itself, so a repository made in the UI
+    # would silently reject the pipeline.
+    grantWritePrototype: true
+
+    secretName: quay-push
+    # Tekton's ServiceAccount. The OpenShift Pipelines operator creates it in
+    # every namespace; the job waits for it rather than assuming it exists.
+    serviceAccount: pipeline
+
+# NooBaa, i.e. the object storage backend behind `component.objectstorage`.
+#
+# The pre-flight job waits for the NooBaa CR to go Ready and then raises the
+# default BackingStore's resources: ODF ships it asking for 256Mi, the agent
+# pod needs at least 400Mi, and left alone the BackingStore sits in Rejected
+# and the registry never gets a bucket.
+#
+# Set enabled: false ONLY together with component.objectstorage.managed: false
+# and an unmanaged storage config -- otherwise the registry waits forever for a
+# bucket that is never provisioned.
+noobaa:
+  enabled: true
+  name: noobaa
+  namespace: openshift-storage
+
+# Container image for the two Ansible jobs. Same execution environment the
+# GitLab seeding job uses.
+jobImage: quay.io/agnosticd/ee-multicloud:latest
+
+syncWaves:
+  noobaa: "-2"
+  rbac: "-1"
+  registry: "0"
+  config: "1"

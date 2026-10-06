@@ -1,44 +1,20 @@
-# App of Apps — ArgoCD Applications for each enabled Lightwell workshop component.
-# Sync waves: keycloak (5) → pipelines (8) → operators (10) → config (20) → apps (40) → validate (45) 
-
-{{- if .Values.components.keycloak.enabled }}
----
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: {{ .Release.Name }}-keycloak
-  namespace: {{ .Values.argocd.namespace }}
-  labels:
-    {{- include "root-app.labels" . | nindent 4 }}
-  annotations:
-    argocd.argoproj.io/sync-wave: {{ .Values.components.keycloak.syncWave | quote }}
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: {{ .Values.argocd.project }}
-  source:
-    repoURL: {{ .Values.gitops.repoUrl }}
-    targetRevision: {{ .Values.gitops.revision }}
-    path: {{ .Values.gitops.basePath }}/components/keycloak
-    helm:
-      valuesObject:
-        keycloak:
-          enabled: {{ .Values.components.keycloak.enabled }}
-          namespace: {{ .Values.components.keycloak.namespace }}
-        deployer:
-          domain: {{ .Values.deployer.domain | quote }}
-          apiUrl: {{ .Values.deployer.apiUrl | quote }}
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: {{ .Values.components.keycloak.namespace }}
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - ServerSideApply=true
-{{- end }}
+{{- $domain := required "Set deployer.domain to the cluster's apps subdomain" .Values.deployer.domain }}
+{{- $realm := .Values.components.keycloak.realm }}
+{{- $issuer := printf "https://sso.%s/realms/%s" $domain $realm }}
+# =============================================================================
+# Argo CD Applications for the ssc-demo platform. See values.yaml for the
+# sync-wave dependency chain.
+#
+# Every Application gets the same syncPolicy as the reference cluster:
+#   * automated prune + selfHeal -- which also means any `oc annotate` stopgap
+#     applied to a managed resource is reverted on the next reconcile. Fix
+#     things in the chart, not on the cluster.
+#   * a long retry (30 attempts, exponential to 2 m). Operator-backed CRs fail
+#     their first few syncs while the CRD is still being installed; without the
+#     retry those Applications land in Failed and stay there.
+#   * SkipDryRunOnMissingResource -- same reason: the dry run cannot validate a
+#     CR whose CRD does not exist yet.
+# =============================================================================
 
 {{- if .Values.components.pipelines.enabled }}
 ---
@@ -61,22 +37,283 @@ spec:
     path: {{ .Values.gitops.basePath }}/components/pipelines
     helm:
       valuesObject:
-        pipelines:
-          enabled: {{ .Values.components.pipelines.enabled }}
         deployer:
-          domain: {{ .Values.deployer.domain | quote }}
+          domain: {{ $domain | quote }}
           apiUrl: {{ .Values.deployer.apiUrl | quote }}
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.pipelines.namespace }}
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - SkipDryRunOnMissingResource=true
-      - ServerSideApply=true
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.tekton.enabled }}
+{{- $tk := .Values.components.tekton }}
+{{- $ns := .Values.pipelineNamespace }}
+{{- $mavenVariants := list "maven-build-ci-pipeline.yaml" "maven-build-ci-pipeline-ai.yaml" "maven-build-ci-pipeline-no-acs.yaml" }}
+{{- if not (has $tk.mavenBuildPipeline $mavenVariants) }}
+{{- fail (printf "components.tekton.mavenBuildPipeline must be one of %v, got %q" $mavenVariants $tk.mavenBuildPipeline) }}
+{{- end }}
+# -----------------------------------------------------------------------------
+# The Tekton layer. These four Applications replace the `oc apply -f tasks/`,
+# `oc apply -f pipelines/...` and `oc apply -f triggers/...` steps in
+# pipelines/README.md.
+#
+# What stays manual, and why: every Secret the runs mount. `ai-agent-secret`
+# and `maven-settings` hold real credentials and are created with
+# `oc create secret`; `tpa-secret` is step 5 of the gitops README. The two the
+# demo used to need by hand -- `scm-auth-secret` and `gitlab-webhook-secret` --
+# are now minted by the GitLab seeding job into this namespace.
+#
+# Note that `pipelines/secrets/*.example.yaml` is never synced: those files are
+# REPLACE_ME templates, and applying them would overwrite a real credential
+# with a placeholder.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-tasks
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.tasks | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/tasks
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-config
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.config | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/config
+    directory:
+      recurse: false
+      {{- if not $tk.enableImportersJob }}
+      # See values.yaml: redundant once the RHTPA Application declares the
+      # importer, and it needs the hand-made tpa-secret to run at all.
+      exclude: rhtpa-enable-importers-job.yaml
+      {{- end }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-pipelines
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.pipelines | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/pipelines
+    directory:
+      recurse: false
+      # Drop the maven-build-ci variants that were not selected. All three
+      # declare the same metadata.name, and syncing more than one makes the
+      # whole Application fail to render, not just that resource.
+      exclude: {{ printf "{%s}" (join "," (without $mavenVariants $tk.mavenBuildPipeline)) | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-tekton-triggers
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $tk.syncWaves.triggers | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.tektonPath }}/triggers
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ns }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- if ne $ns "tssc-app-ci" }}
+{{- fail (printf "pipelineNamespace is %q, but pipelines/triggers/agentic-issue-triggers.yaml hardcodes the ClusterRoleBinding subject namespace as tssc-app-ci. Edit that file to match before changing pipelineNamespace, or the EventListener cannot reach the cel/gitlab ClusterInterceptors." $ns) }}
+{{- end }}
+{{- end }}
+
+{{- if .Values.components.keycloak.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-keycloak
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.components.keycloak.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/keycloak
+    helm:
+      valuesObject:
+        global:
+          cluster:
+            subdomain: {{ $domain | quote }}
+        keycloak-db:
+          pgsql:
+            password: {{ .Values.credentials.keycloakDbPassword | quote }}
+        keycloak-realm-import:
+          realm:
+            name: {{ $realm | quote }}
+          client:
+            tpaCli:
+              secret: {{ .Values.credentials.tpaCliClientSecret | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.components.keycloak.namespace }}
+  # The realm template fills every unset client secret with a fresh
+  # `randAlphaNum 32` and every resource id with a fresh `uuidv4`, so a plain
+  # re-render always differs from the live KeycloakRealmImport. Without this
+  # the Application is permanently OutOfSync and selfHeal rewrites the realm --
+  # rotating the secrets of clients that are currently in use.
+  ignoreDifferences:
+    - group: k8s.keycloak.org
+      kind: KeycloakRealmImport
+      jqPathExpressions:
+        - '.. | (.id, .containerId, .secret)? | strings'
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.gitlab.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-gitlab
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.components.gitlab.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/gitlab
+    helm:
+      valuesObject:
+        cluster:
+          subdomain: {{ $domain | quote }}
+        gitlab:
+          rootPassword: {{ .Values.credentials.gitlabRootPassword | quote }}
+        pipeline:
+          namespace: {{ .Values.pipelineNamespace | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.components.gitlab.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.quay.enabled }}
+{{- $q := .Values.components.quay }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-quay
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $q.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/quay
+    helm:
+      valuesObject:
+        global:
+          cluster:
+            subdomain: {{ $domain | quote }}
+        quay-registry:
+          quay:
+            adminUserPassword: {{ .Values.credentials.quayAdminPassword | quote }}
+            organizations:
+              - {{ $q.organization | quote }}
+            component:
+              objectstorage:
+                managed: {{ $q.objectStorageManaged }}
+            pipeline:
+              enabled: true
+              namespace: {{ .Values.pipelineNamespace | quote }}
+              organization: {{ $q.organization | quote }}
+              robotName: {{ $q.robotName | quote }}
+              secretName: {{ $q.pushSecretName | quote }}
+          noobaa:
+            # The pre-flight BackingStore patch only makes sense when the
+            # operator is actually provisioning a NooBaa bucket.
+            enabled: {{ $q.objectStorageManaged }}
+            namespace: {{ $q.noobaaNamespace | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $q.namespace }}
+  # No ignoreDifferences needed. The three Secrets that matter here --
+  # quay-admin-token, the push Secret and the operator's own generated config
+  # -- are written by Ansible and by the Quay operator, not rendered from this
+  # chart, so they carry no Argo tracking ID and selfHeal/prune leave them
+  # alone. That is load-bearing for quay-admin-token in particular: it is the
+  # only copy of a token that /api/v1/user/initialize will not reissue.
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
 {{- if .Values.components.rhtas.enabled }}
@@ -100,26 +337,60 @@ spec:
     path: {{ .Values.gitops.basePath }}/components/rhtas
     helm:
       valuesObject:
-        rhtas:
-          enabled: {{ .Values.components.rhtas.enabled }}
-          namespace: {{ .Values.components.rhtas.namespace }}
-        deployer:
-          domain: {{ .Values.deployer.domain | quote }}
-          apiUrl: {{ .Values.deployer.apiUrl | quote }}
+        global:
+          cluster:
+            subdomain: {{ $domain | quote }}
+        trusted-artifact-signer:
+          namespace: {{ .Values.components.rhtas.namespace | quote }}
+          realm: {{ $realm | quote }}
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.rhtas.namespace }}
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - SkipDryRunOnMissingResource=true
-      - ServerSideApply=true
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.rhtpaPrerequisites.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-rhtpa-prerequisites
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.components.rhtpaPrerequisites.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/rhtpa/tpa-prerequisites
+    helm:
+      valuesObject:
+        global:
+          cluster:
+            subdomain: {{ $domain | quote }}
+        storage:
+          type: {{ .Values.components.rhtpa.storage.type | quote }}
+          bucketName: {{ .Values.components.rhtpa.storage.bucket | quote }}
+        pgsql:
+          password: {{ .Values.credentials.tpaDbPassword | quote }}
+        oidc:
+          issuerUrl: {{ $issuer | quote }}
+          tpaCli:
+            secret: {{ .Values.credentials.tpaCliClientSecret | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.components.rhtpaPrerequisites.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
 {{- if .Values.components.rhtpa.enabled }}
+{{- $tpa := .Values.components.rhtpa }}
+{{- $s3Region := $tpa.storage.regionEndpoint | default (printf "https://s3-openshift-storage.%s:443" $domain) }}
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -129,44 +400,141 @@ metadata:
   labels:
     {{- include "root-app.labels" . | nindent 4 }}
   annotations:
-    argocd.argoproj.io/sync-wave: {{ .Values.components.rhtpa.syncWave | quote }}
+    argocd.argoproj.io/sync-wave: {{ $tpa.syncWave | quote }}
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
   project: {{ .Values.argocd.project }}
   source:
-    repoURL: {{ .Values.gitops.repoUrl }}
-    targetRevision: {{ .Values.gitops.revision }}
-    path: {{ .Values.gitops.basePath }}/components/rhtpa
+    # The Red Hat chart, straight from the OpenShift chart repository -- not
+    # vendored. Only its prerequisites (Postgres, the OIDC secret, the bucket)
+    # live in this repo, under components/rhtpa/tpa-prerequisites.
+    repoURL: https://charts.openshift.io/
+    chart: redhat-trusted-profile-analyzer
+    targetRevision: {{ $tpa.chartVersion | quote }}
     helm:
       valuesObject:
-        rhtpa:
-          enabled: {{ .Values.components.rhtpa.enabled }}
-          namespace: {{ .Values.components.rhtpa.namespace }}
-        deployer:
-          domain: {{ .Values.deployer.domain | quote }}
-          apiUrl: {{ .Values.deployer.apiUrl | quote }}
+        # Suffix, not a hostname: the chart publishes each service as
+        # `<service><appDomain>`, so the console lands on
+        # server-trusted-profile-analyzer.<domain> -- which is what the
+        # tpa-frontend Keycloak client redirects back to.
+        appDomain: -{{ $tpa.namespace }}.{{ $domain }}
+
+        # Chart 1.2.6 bug: the create/migrate Job templates `deepCopy` these
+        # top-level keys unconditionally, so if they are absent the render dies
+        # with "reflect: call of reflect.Value.Type on zero Value" -- which
+        # names the Job template, not the missing key. Empty dicts are enough;
+        # the real toggles are under `modules` below.
+        createDatabase: {}
+        migrateDatabase: {}
+
+        ingress:
+          enabled: true
+          additionalAnnotations:
+            # See values.yaml: the Route is generated from this Ingress, so the
+            # timeout has to be set here or the controller reverts it.
+            haproxy.router.openshift.io/timeout: {{ $tpa.routeTimeout | quote }}
+
+        database:
+          host: tpa-postgresql
+          name: trustify
+          username: trustify
+          port: '5432'
+          # In-cluster hop to the Postgres this repo's prerequisites chart
+          # deploys; it serves plaintext, so requiring TLS here just fails.
+          sslMode: disable
+          password:
+            valueFrom:
+              secretKeyRef:
+                name: tpa-postgresql
+                key: database-password
+
+        oidc:
+          issuerUrl: {{ $issuer | quote }}
+          clients:
+            frontend:
+              clientId: tpa-frontend
+            cli:
+              clientId: tpa-cli
+              clientSecret:
+                valueFrom:
+                  secretKeyRef:
+                    name: oidc-tpa-cli
+                    key: client-secret
+
+        openshift:
+          enabled: true
+          useServiceCa: true
+
+        storage:
+          type: {{ $tpa.storage.type | quote }}
+        {{- if eq $tpa.storage.type "s3" }}
+          bucket: {{ $tpa.storage.bucket | quote }}
+          # NooBaa's S3 endpoint URL, not an AWS region name. The credentials
+          # come from the Secret the ObjectBucketClaim creates.
+          region: {{ $s3Region | quote }}
+          accessKey:
+            valueFrom:
+              secretKeyRef:
+                name: {{ $tpa.storage.bucket | quote }}
+                key: AWS_ACCESS_KEY_ID
+          secretKey:
+            valueFrom:
+              secretKeyRef:
+                name: {{ $tpa.storage.bucket | quote }}
+                key: AWS_SECRET_ACCESS_KEY
+        {{- else }}
+          # RHTPA provisions its own PVC in filesystem mode, and BOTH the
+          # server and the importer Deployments mount it -- with
+          # accessModes: [ReadWriteOnce] hardcoded in the chart template and no
+          # value to override it. Setting an RWX storageClassName does not
+          # change the requested mode, so the two pods must land on the same
+          # node or the importer stays Pending. s3 avoids the whole problem.
+          size: {{ $tpa.storage.size | quote }}
+          {{- with $tpa.storage.storageClassName }}
+          storageClassName: {{ . | quote }}
+          {{- end }}
+        {{- end }}
+
+        modules:
+          # One-shot Jobs: create the schema, then migrate it. Both are
+          # idempotent and re-run on every sync.
+          createDatabase:
+            enabled: true
+          migrateDatabase:
+            enabled: true
+          createImporters:
+            enabled: true
+            # The three feeds the demo's vulnerability analysis reads. All
+            # three are large; the first full ingest takes hours and is the
+            # reason the prerequisites chart raises Postgres' CPU limit and
+            # readiness timeout.
+            importers:
+              cve:
+                cve:
+                  description: CVE list v5
+                  disabled: false
+                  period: 12h
+                  source: https://github.com/CVEProject/cvelistV5
+              osv-github:
+                osv:
+                  description: GitHub Advisory Database
+                  disabled: false
+                  path: advisories
+                  period: 12h
+                  source: https://github.com/github/advisory-database
+              redhat-csaf:
+                csaf:
+                  description: All Red Hat CSAF data
+                  disabled: false
+                  # Red Hat's CSAF endpoint rate-limits an initial full fetch;
+                  # fewer retries and the importer gives up part-way through,
+                  # leaving the backport data the demo depends on incomplete.
+                  fetchRetries: 50
+                  period: 12h
+                  source: redhat.com
   destination:
     server: https://kubernetes.default.svc
-    namespace: {{ .Values.components.rhtpa.namespace }}
-  # Live PVC storage may already be Bound on the default WaitForFirstConsumer
-  # class; storageClassName is immutable (#101). Ignore that pointer so this
-  # claim stays Synced; next claim Binds Immediate and the ignore is a no-op.
-  ignoreDifferences:
-    - group: ""
-      kind: PersistentVolumeClaim
-      name: storage
-      jsonPointers:
-        - /spec/storageClassName
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-      - SkipDryRunOnMissingResource=true
-      - ServerSideApply=true
-      - RespectIgnoreDifferences=true
+    namespace: {{ $tpa.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
-
-

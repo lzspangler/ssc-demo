@@ -1,0 +1,144 @@
+# -----------------------------------------------------------------------------
+# GitLab for ssc-demo.
+#
+# Adapted from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2 (`gitlab`),
+# which is what the reference cluster runs. Differences from upstream, all
+# because ssc-demo is a supply-chain demo rather than the full RHDH platform
+# demo:
+#
+#   * Vault is gone. Upstream writes the root PAT and a DevSpaces OAuth client
+#     into Vault; ssc-demo has no Vault, and the only consumer of a GitLab
+#     credential is the Tekton pipeline, which reads a Secret.
+#   * The RHDH software-template import job is gone (no Developer Hub here).
+#   * Added: per-repository labels, webhooks, and a project access token that is
+#     written straight into the pipeline namespace as `scm-auth-secret`. That
+#     last piece is what makes this reproducible without hand-wiring -- see
+#     templates/cm-gitlab-init.yaml.
+#
+# The only value that MUST be set per cluster is `cluster.subdomain`; everything
+# else derives from it.
+# -----------------------------------------------------------------------------
+
+cluster:
+  # Apps subdomain of the target cluster, e.g. apps.cluster-abcde.example.com.
+  # No leading dot. Required.
+  subdomain: ""
+
+gitlab:
+  image: quay.io/redhat-gpte/gitlab:17.4.1
+
+  # Public hostname. Leave empty to derive `gitlab-<namespace>.<subdomain>`,
+  # which is what the OpenShift router gives the Route below.
+  host: ""
+  https: "true"
+
+  email:
+    address: "gitlab@rhdemo.com"
+    displayName: "GitLab Admin"
+    replyTo: "noreply@rhdemo.com"
+  rootEmail: "root@rhdemo.com"
+
+  smtp:
+    enabled: "false"
+    domain: "rhdemo.com"
+    host: ""
+    port: "587"
+    user: "gitlab"
+    password: "gitlab"
+
+  ssh:
+    # Leave empty to derive `gitlab-ssh-<namespace>.<subdomain>`.
+    host: ""
+    port: "22"
+
+  # DO NOT commit a real password. Supply it at install time, e.g.
+  #   argocd app set gitlab -p gitlab.rootPassword=...
+  # or via a Helm parameter on the Argo CD Application.
+  rootPassword: REPLACE_ME
+
+  # GitLab refuses to boot without these; they key the encrypted columns in the
+  # database. Any stable string works for a throwaway demo, but changing them
+  # after first boot orphans every stored credential.
+  keyBase:
+    db: "0123456789"
+    otp: "0123456789"
+    secret: "0123456789"
+
+  users:
+    # ssc-demo drives everything as root, so no demo users are created by
+    # default. Add entries here (id/name) to get them.
+    users: []
+    password: REPLACE_ME
+
+  # Groups, repositories and projects created by the seeding job. This mirrors
+  # the reference cluster: one group, one imported application repository.
+  groups:
+    - name: development
+      users: []
+      repo:
+        - name: spring-boot-example-application
+          url: https://github.com/lzspangler/spring-boot-example-application.git
+          defaultBranch: main
+
+          # The CVE issues opened by `open-cve-issues` carry a severity label
+          # (critical/high/medium/low/unknown) plus the base labels passed to
+          # the task. GitLab auto-creates a missing label on first use in a
+          # muddy grey; creating them up front keeps the demo board readable
+          # and gives them the shared colour.
+          labels:
+            - { name: cve, color: "#6699cc" }
+            - { name: security, color: "#6699cc" }
+            - { name: critical, color: "#6699cc" }
+            - { name: high, color: "#6699cc" }
+            - { name: medium, color: "#6699cc" }
+            - { name: low, color: "#6699cc" }
+            - { name: unknown, color: "#6699cc" }
+
+          # Issue-comment webhook that drives agentic-cve-remediation. `/remediate`
+          # in an issue comment is a note event, and ONLY a note event -- pushes
+          # and merge requests would fire the EventListener for nothing, so every
+          # other trigger stays off.
+          #
+          # The shared token is NOT stored here. The seeding job reads it from
+          # the `gitlab-webhook-secret` Secret in the pipeline namespace, and
+          # creates that Secret with a random token if it does not exist, so the
+          # webhook and the Tekton GitLab interceptor always agree without a
+          # secret ever living in git.
+          webhooks:
+            - name: agentic-issue-commands
+              # Leave empty to derive the EventListener Route hostname,
+              # `agentic-issue-commands-<pipeline namespace>.<subdomain>`.
+              url: ""
+              noteEvents: true
+
+          # Minted by the seeding job and written to the pipeline namespace as
+          # `scm-auth-secret` (keys: username=oauth2, token=<pat>), which is what
+          # the open-pr / open-cve-issues tasks consume. Set `enabled: false` if
+          # you would rather create that Secret by hand.
+          accessToken:
+            enabled: true
+            name: ssc-demo-pipeline
+            # api covers issue + merge-request creation; write_repository covers
+            # the branch push open-pr does.
+            scopes:
+              - api
+              - write_repository
+            # 40 = Maintainer. Lower levels cannot push to a protected branch.
+            accessLevel: 40
+            # GitLab rejects an expiry more than 365 days out; stay inside it.
+            expiresInDays: 364
+      project: []
+
+# Namespace the Tekton pipelines run in. The seeding job writes
+# `scm-auth-secret` and `gitlab-webhook-secret` here, and derives the webhook
+# URL from it, so it must match the namespace the pipelines are installed into.
+pipeline:
+  namespace: tssc-app-ci
+
+postgresql:
+  dbUser: gitlab
+  dbPassword: passw0rd
+  dbName: gitlab_production
+
+argocd:
+  enabled: true

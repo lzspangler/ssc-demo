@@ -1,0 +1,84 @@
+{{- if .Values.noobaa.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "quay-registry.name" . }}-noobaa
+  labels:
+    {{- include "quay-registry.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.noobaa | quote }}
+data:
+  playbook.yaml: |
+    ---
+    - name: Make NooBaa ready to back a Quay bucket
+      hosts: localhost
+      gather_facts: false
+      vars:
+        noobaa_name: {{ .Values.noobaa.name }}
+        noobaa_namespace: {{ .Values.noobaa.namespace }}
+      tasks:
+        - name: Wait until NooBaa is ready
+          kubernetes.core.k8s_info:
+            api_version: noobaa.io/v1alpha1
+            kind: NooBaa
+            name: '{{ "{{" }} noobaa_name {{ "}}" }}'
+            namespace: '{{ "{{" }} noobaa_namespace {{ "}}" }}'
+          register: r_noobaa
+          until:
+            - r_noobaa.resources | length > 0
+            - r_noobaa.resources[0].status is defined
+            - r_noobaa.resources[0].status.phase is defined
+            - r_noobaa.resources[0].status.phase == "Ready"
+          retries: 120
+          delay: 10
+
+        # ODF creates the default BackingStore asking for 256Mi, but the agent
+        # pod needs at least 400Mi, so it lands in Rejected and stays there.
+        # Wait for the object to exist, patch it, then wait for Ready -- doing
+        # the Ready wait first deadlocks against the patch that would fix it.
+        - name: Wait for the default BackingStore to exist
+          kubernetes.core.k8s_info:
+            api_version: noobaa.io/v1alpha1
+            kind: BackingStore
+            name: noobaa-default-backing-store
+            namespace: '{{ "{{" }} noobaa_namespace {{ "}}" }}'
+          register: r_backingstore
+          until:
+            - r_backingstore.resources | length > 0
+          retries: 60
+          delay: 10
+
+        - name: Increase BackingStore agent pod resources
+          kubernetes.core.k8s:
+            api_version: noobaa.io/v1alpha1
+            kind: BackingStore
+            name: noobaa-default-backing-store
+            namespace: '{{ "{{" }} noobaa_namespace {{ "}}" }}'
+            merge_type: merge
+            definition:
+              spec:
+                pvPool:
+                  resources:
+                    requests:
+                      storage: 50Gi
+                      cpu: 250m
+                      memory: 1Gi
+                    limits:
+                      cpu: "1"
+                      memory: 4Gi
+
+        - name: Wait for the default BackingStore to be Ready
+          kubernetes.core.k8s_info:
+            api_version: noobaa.io/v1alpha1
+            kind: BackingStore
+            name: noobaa-default-backing-store
+            namespace: '{{ "{{" }} noobaa_namespace {{ "}}" }}'
+          register: r_backingstore
+          until:
+            - r_backingstore.resources[0].status is defined
+            - r_backingstore.resources[0].status.phase is defined
+            - r_backingstore.resources[0].status.phase == "Ready"
+          retries: 60
+          delay: 10
+{{- end }}

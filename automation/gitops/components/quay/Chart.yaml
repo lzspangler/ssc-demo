@@ -1,0 +1,16 @@
+apiVersion: v2
+name: quay
+description: >-
+  Red Hat Quay for ssc-demo: the operator, a managed QuayRegistry backed by
+  ODF/NooBaa object storage, the demo organization, and the robot account the
+  Tekton pipelines push application images with.
+type: application
+version: 0.1.0
+
+dependencies:
+  - name: quay-operator
+    version: 0.1.0
+    repository: file://quay-operator
+  - name: quay-registry
+    version: 0.1.0
+    repository: file://quay-registry
