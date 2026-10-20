@@ -1,0 +1,308 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.openshift.io/runtime: java
+    pipelines.openshift.io/strategy: docker
+    pipelines.openshift.io/used-by: build-cloud
+    app.kubernetes.io/part-of: maven-build-ci
+  name: ci-build-publish
+spec:
+  # Continuous integration for the application repository: every merge to the
+  # default branch builds the source, builds and publishes the container image
+  # to the in-cluster Quay, attaches its SBOM, and uploads that SBOM to RHTPA.
+  #
+  # The build -> push -> SBOM chain is the same one agentic-cve-analysis uses
+  # (clone -> maven package -> buildah-rhtap -> upload-sbom-to-rhtpa); what is
+  # deliberately NOT here is everything downstream of the SBOM. No vulnerability
+  # analysis, no Conforma gate, no AI, no issues. Those belong to the agentic
+  # pipelines, which run on their own cadence against the same image. CI stays
+  # fast and either produces a published image or fails.
+  #
+  # Two defaults differ from the agentic pipelines because they matter for an
+  # image that is meant to survive:
+  #
+  #   dockerfile: Containerfile   -- the application repository ships a
+  #                                  Containerfile, not a Dockerfile, and
+  #                                  buildah-rhtap exits 1 when it cannot find
+  #                                  the file it was told to use.
+  #   no IMAGE_EXPIRES_AFTER      -- agentic-cve-analysis passes "1d", which is
+  #                                  right for a throwaway scan image. (It is
+  #                                  also inert: buildah-rhtap declares no such
+  #                                  param. Either way, a published image must
+  #                                  not carry an expiry label.)
+  params:
+    - name: component-name
+      type: string
+      description: Name of the software component; used as the SBOM component name.
+      default: spring-boot-example-application
+    - name: git-url
+      type: string
+      description: Source repository URL.
+    - name: revision
+      type: string
+      description: Commit SHA, tag or branch to build. Empty builds the default branch.
+      default: ""
+    - name: output-image
+      type: string
+      description: >-
+        Fully qualified image to publish, e.g.
+        quay.apps.<cluster domain>/tssc/spring-boot-example-application:<sha>.
+        The push is authenticated by the `quay-push` Secret linked to the
+        `pipeline` ServiceAccount -- no credential is named here.
+    - name: path-context
+      type: string
+      description: Build context, relative to the cloned source directory.
+      default: .
+    - name: dockerfile
+      type: string
+      description: Containerfile/Dockerfile path inside path-context.
+      default: Containerfile
+    - name: build-args
+      type: array
+      description: Array of --build-arg values ("arg=value" strings) for buildah.
+      default: []
+    - name: build-args-file
+      type: string
+      description: Path to a file of build arguments, see buildah-build --build-arg-file.
+      default: ""
+    - name: tls-verify
+      type: string
+      description: >-
+        Verify the registry's TLS. The Quay operator publishes an edge Route on
+        the cluster's default ingress certificate, so on a cluster whose
+        ingress cert is publicly trusted this stays "true". Set "false" only
+        for a registry with a self-signed certificate.
+      default: "true"
+    - name: subdirectory
+      type: string
+      description: Project subdirectory within the source workspace (where pom.xml lives).
+      default: source
+    - name: sboms-dir
+      type: string
+      default: sboms
+    # ---------------- Maven ----------------
+    - name: maven-goals
+      type: array
+      description: >-
+        Goals passed to `mvn -s <settings>`. The -D flags are HTTP-wagon
+        resilience against intermittent NoHttpResponseException from the
+        Artifactory route: stop reusing stale keep-alive connections and retry
+        harder. GOALS is an array, so they prepend ahead of the goal.
+      default:
+        - -Dmaven.wagon.http.pool=false
+        - -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+        - -Dmaven.wagon.http.retryHandler.class=standard
+        - -Dmaven.wagon.http.retryHandler.count=5
+        - -Dmaven.wagon.http.retryHandler.requestSentEnabled=true
+        - package
+    # ---------------- RHTPA ----------------
+    - name: upload-sbom
+      type: string
+      description: >-
+        "true" publishes the image's SBOM to RHTPA. Set "false" to build and
+        push without a running RHTPA (the agentic pipelines then have nothing
+        to analyze until it is re-enabled).
+      default: "true"
+    - name: trustification-secret-name
+      type: string
+      default: tpa-secret
+    - name: fail-if-trustification-not-configured
+      type: string
+      description: >-
+        "true" fails CI when the SBOM upload cannot authenticate, rather than
+        publishing an image that RHTPA has no record of.
+      default: "true"
+    # ---------------- Commit verification (RHTAS) ----------------
+    - name: verify-commit
+      type: string
+      description: >-
+        "true" requires the head commit to carry a gitsign signature that
+        verifies against the RHTAS Rekor/TUF below. Off by default because the
+        demo's commits are not signed; turning it on without signing every
+        commit fails every build.
+      default: "false"
+    - name: certificate-identity
+      type: string
+      default: userX@demo.redhat.com
+    - name: oidc-issuer
+      type: string
+      description: >-
+        Keycloak realm issuer. Note this is `backstage`, matching the realm the
+        platform install creates -- not the `trusted-artifact-signer` realm the
+        older pipelines default to, which does not exist on this cluster.
+      default: https://sso.<domain>/realms/backstage
+    - name: rekor-url
+      type: string
+      description: >-
+        In-cluster Rekor. The RHTAS install puts Securesign in the
+        `trusted-artifact-signer` namespace, not the `tssc-tas` the older
+        pipelines name.
+      default: http://rekor-server.trusted-artifact-signer.svc
+    - name: tuf-mirror
+      type: string
+      default: http://tuf.trusted-artifact-signer.svc
+  results:
+    - name: IMAGE_URL
+      value: $(tasks.build-container.results.IMAGE_URL)
+    - name: IMAGE_DIGEST
+      value: $(tasks.build-container.results.IMAGE_DIGEST)
+    - name: CHAINS-GIT_URL
+      value: $(tasks.clone-repository.results.url)
+    - name: CHAINS-GIT_COMMIT
+      value: $(tasks.clone-repository.results.commit)
+  tasks:
+    - name: clone-repository
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+        - name: subdirectory
+          value: $(params.subdirectory)
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: workspace
+        - name: basic-auth
+          workspace: git-auth
+
+    - name: verify-commit
+      params:
+        - name: certificate-identity
+          value: $(params.certificate-identity)
+        - name: oidc-issuer
+          value: $(params.oidc-issuer)
+        - name: rekor-url
+          value: $(params.rekor-url)
+        - name: tuf-mirror
+          value: $(params.tuf-mirror)
+      runAfter:
+        - clone-repository
+      taskRef:
+        kind: Task
+        name: verify-commit
+      workspaces:
+        - name: repository
+          workspace: workspace
+      when:
+        - input: "$(params.verify-commit)"
+          operator: in
+          values: ["true"]
+
+    # Compile and run the unit tests before anything is published. This is the
+    # CI gate: a failing build must not produce an image.
+    #
+    # It resolves through the Artifactory `maven` virtual repo via the
+    # maven-settings workspace, which is what makes a Lightwell backport
+    # coordinate resolvable at all. See the caveat in the header of
+    # ci-build-triggers.yaml about the Containerfile's own inner `mvn package`,
+    # which does NOT get these settings.
+    - name: package
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: GOALS
+          value:
+            - $(params.maven-goals[*])
+      runAfter:
+        - verify-commit
+      taskRef:
+        name: maven
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: maven_settings
+          workspace: maven-settings
+
+    # Build, push, generate the CycloneDX SBOM and `cosign attach sbom` it to
+    # the pushed image. The push credential is the `quay-push` dockerconfigjson
+    # the Quay seeding job linked to the `pipeline` ServiceAccount; buildah
+    # reads it from the pod, so nothing is named here.
+    #
+    # Only params buildah-rhtap actually declares are passed. Extra params are
+    # silently ignored by Tekton, which is how the "1d" expiry in
+    # agentic-cve-analysis came to look effective without being so.
+    - name: build-container
+      params:
+        - name: IMAGE
+          value: $(params.output-image)
+        - name: DOCKERFILE
+          value: $(params.dockerfile)
+        - name: CONTEXT
+          value: $(params.path-context)
+        - name: TLSVERIFY
+          value: $(params.tls-verify)
+        - name: BUILD_ARGS
+          value:
+            - $(params.build-args[*])
+        - name: BUILD_ARGS_FILE
+          value: $(params.build-args-file)
+        - name: SBOMS_DIR
+          value: $(params.sboms-dir)
+      runAfter:
+        - package
+      taskRef:
+        name: buildah-rhtap
+      workspaces:
+        - name: source
+          workspace: workspace
+
+    # Publish the SBOM to RHTPA so the agentic pipelines -- and anyone asking
+    # "what is in the image we shipped?" -- have something to analyze.
+    - name: upload-sbom-to-rhtpa
+      params:
+        - name: COMPONENT_NAME
+          value: $(params.component-name)
+        - name: SBOMS_DIR
+          value: $(params.sboms-dir)
+        - name: TRUSTIFICATION_SECRET_NAME
+          value: $(params.trustification-secret-name)
+        - name: FAIL_IF_TRUSTIFICATION_NOT_CONFIGURED
+          value: $(params.fail-if-trustification-not-configured)
+      runAfter:
+        - build-container
+      taskRef:
+        name: upload-sbom-to-rhtpa
+      when:
+        - input: "$(params.upload-sbom)"
+          operator: in
+          values: ["true"]
+      workspaces:
+        - name: sboms
+          workspace: workspace
+
+  finally:
+    - name: show-sbom
+      params:
+        - name: IMAGE_URL
+          value: $(tasks.build-container.results.IMAGE_URL)
+      taskRef:
+        name: show-sbom-rhdh
+    - name: show-summary
+      params:
+        - name: pipelinerun-name
+          value: $(context.pipelineRun.name)
+        - name: git-url
+          value: $(tasks.clone-repository.results.url)?rev=$(tasks.clone-repository.results.commit)
+        - name: image-url
+          value: $(params.output-image)
+        - name: build-task-status
+          value: $(tasks.build-container.status)
+      taskRef:
+        name: summary
+      workspaces:
+        - name: workspace
+          workspace: workspace
+
+  workspaces:
+    - name: workspace
+    # Required, not optional: Artifactory OSS has anonymous access off, so a
+    # build without settings.xml cannot resolve anything. A secret-backed
+    # workspace whose Secret is missing hangs the pod in PodInitializing
+    # forever rather than failing, so create `maven-settings` before the first
+    # run.
+    - name: maven-settings
+    - name: git-auth
+      optional: true

@@ -94,22 +94,36 @@ gitlab:
             - { name: low, color: "#6699cc" }
             - { name: unknown, color: "#6699cc" }
 
-          # Issue-comment webhook that drives agentic-cve-remediation. `/remediate`
-          # in an issue comment is a note event, and ONLY a note event -- pushes
-          # and merge requests would fire the EventListener for nothing, so every
-          # other trigger stays off.
+          # Two webhooks, one per EventListener. Each subscribes to exactly the
+          # events its listener acts on; every flag defaults to false.
+          #
+          # They are deliberately NOT one hook with both event types. The note
+          # hook drives agentic-cve-remediation, which pushes branches itself --
+          # if that hook also carried push events, the pipeline's own push would
+          # re-enter it.
           #
           # The shared token is NOT stored here. The seeding job reads it from
           # the `gitlab-webhook-secret` Secret in the pipeline namespace, and
           # creates that Secret with a random token if it does not exist, so the
-          # webhook and the Tekton GitLab interceptor always agree without a
-          # secret ever living in git.
+          # webhooks and the Tekton GitLab interceptors always agree without a
+          # secret ever living in git. Both hooks use the same token.
           webhooks:
+            # `/remediate` and `/generate-tests` in an issue comment.
             - name: agentic-issue-commands
               # Leave empty to derive the EventListener Route hostname,
-              # `agentic-issue-commands-<pipeline namespace>.<subdomain>`.
+              # `<name>-<pipeline namespace>.<subdomain>`.
               url: ""
               noteEvents: true
+
+            # Merge to main -> ci-build-publish. The branch filter is applied
+            # by GitLab as well as by the listener's cel filter, so a push to a
+            # feature branch never reaches the cluster at all. Remediation and
+            # test-generation open merge requests rather than pushing to main,
+            # so nothing here fires until a human merges.
+            - name: ci-build-push
+              url: ""
+              pushEvents: true
+              pushEventsBranchFilter: main
 
           # Minted by the seeding job and written to the pipeline namespace as
           # `scm-auth-secret` (keys: username=oauth2, token=<pat>), which is what

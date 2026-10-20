@@ -1,0 +1,234 @@
+# =============================================================================
+# CI trigger: merge to the default branch -> build and publish the image.
+#
+# Listens for GitLab **Push Hook** events and filters to `refs/heads/main`.
+# Push rather than "Merge Request Hook": a merge into main produces a push to
+# main, and so does a direct commit -- both are changes to what main contains
+# and both should produce a published image. A Merge Request Hook with
+# `action == 'merge'` fires at merge time but carries the SOURCE branch tip in
+# `object_attributes.last_commit`, which is not the commit that ends up on
+# main when the project squashes or merge-commits.
+#
+# This is a SEPARATE EventListener and a separate webhook from
+# `agentic-issue-commands`. That webhook is created with `push_events: false`
+# on purpose: it fires on note events, and enabling pushes on it would make the
+# remediation pipeline's own branch pushes re-trigger the remediation pipeline.
+# The branch filter below is what keeps this listener out of that loop --
+# remediation and test-generation push to feature branches and open an MR, so
+# nothing fires until a human merges.
+#
+# -----------------------------------------------------------------------------
+# CAVEAT worth knowing before the first post-remediation build
+# -----------------------------------------------------------------------------
+# The `package` task resolves through the Artifactory `maven` virtual repo via
+# the maven-settings Secret. The application's Containerfile runs its OWN
+# `mvn clean package` inside the build stage, and unless it is told otherwise
+# that one resolves from Maven Central. For the stock source both succeed.
+# After a remediation MR merges, main pins a Lightwell backport
+# (e.g. 3.14.0.rhlw-00001) that exists ONLY in Artifactory, so `package` passes
+# and `build-container` then fails inside the Containerfile with a missing
+# artifact.
+#
+# The fix belongs in the application repository, not here, and it does not need
+# a change to buildah-rhtap: the `maven` task's maven-generate step already
+# writes the resolved settings.xml to
+# <workspace>/<subdirectory>/maven-generate/settings.xml, which is inside the
+# directory buildah uses as its build context. A Containerfile build stage can
+# therefore pick it up with
+#
+#   RUN --mount=type=bind,target=/ctx \
+#       if [ -f /ctx/maven-generate/settings.xml ]; then \
+#         mvn -B -s /ctx/maven-generate/settings.xml clean package; \
+#       else mvn -B clean package; fi
+#
+# A bind mount rather than a COPY, because that settings.xml carries the
+# Artifactory credential and a mount leaves no layer holding it. The fallback
+# branch keeps the Containerfile buildable outside the pipeline.
+#
+# This is applied in lzspangler/spring-boot-example-application. Note that the
+# pipeline clones from GitLab, not GitHub, so the change only takes effect once
+# it reaches `development/spring-boot-example-application` on main.
+#
+# The alternative, if you would rather not compile twice at all, is to drop the
+# build stage and have the Containerfile COPY the jar `package` already built.
+# =============================================================================
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: ci-build-push-binding
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  params:
+    - name: git-url
+      value: $(body.project.git_http_url)
+    # The commit that now sits on the branch. On a merge this is the merge
+    # commit, which is what should be built and what the image is tagged with.
+    - name: revision
+      value: $(body.checkout_sha)
+    # The project's path slug, computed by the EventListener's cel overlay.
+    # Doubles as the SBOM component name and the Quay repository name, so the
+    # image lands at <registry>/<org>/<project>.
+    #
+    # Not `body.project.name`: that is the human-readable title and may contain
+    # spaces or capitals, neither of which is legal in an image reference. The
+    # path segment is always a slug.
+    - name: component-name
+      value: $(extensions.repoSlug)
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: ci-build-push-template
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  params:
+    - name: git-url
+    - name: revision
+    - name: component-name
+    # Quay on this cluster. The Quay operator publishes the registry at
+    # `quay.<cluster apps domain>`; override per cluster.
+    - name: image-registry
+      default: quay.apps.cluster-6jnws.dyn.redhatworkshops.io
+    # Organization the Quay seeding job created, and which the `tssc+remediation`
+    # robot in the `quay-push` Secret is a `creator` of.
+    - name: image-organization
+      default: tssc
+    - name: dockerfile
+      default: Containerfile
+    - name: subdirectory
+      default: source
+    - name: workspace-size
+      default: 5Gi
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: ci-build-publish-
+        labels:
+          app.kubernetes.io/part-of: maven-build-ci
+          tekton.dev/pipeline: ci-build-publish
+          trigger: gitlab-push
+      spec:
+        pipelineRef:
+          name: ci-build-publish
+        # Explicit, because the push depends on it: the Quay seeding job linked
+        # the `quay-push` dockerconfigjson to THIS ServiceAccount. A PipelineRun
+        # on any other SA builds fine and then fails the push with a 401 that
+        # looks like a registry problem.
+        taskRunTemplate:
+          serviceAccountName: pipeline
+        timeouts:
+          pipeline: "1h0m0s"
+        params:
+          - name: component-name
+            value: $(tt.params.component-name)
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: revision
+            value: $(tt.params.revision)
+          # Tagged with the full commit SHA rather than `latest`: the tag is
+          # then an exact, immutable pointer to the source that produced it,
+          # which is the whole premise of the SBOM and signature attached to it.
+          - name: output-image
+            value: $(tt.params.image-registry)/$(tt.params.image-organization)/$(tt.params.component-name):$(tt.params.revision)
+          - name: dockerfile
+            value: $(tt.params.dockerfile)
+          - name: subdirectory
+            value: $(tt.params.subdirectory)
+        workspaces:
+          - name: workspace
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: $(tt.params.workspace-size)
+          # Mandatory. Artifactory OSS has anonymous access off, so without this
+          # the maven task generates a default settings.xml pointed at Central
+          # and cannot resolve a Lightwell backport. The Secret MUST exist in
+          # this namespace -- a missing secret-backed workspace hangs the pod in
+          # PodInitializing instead of failing.
+          - name: maven-settings
+            secret:
+              secretName: maven-settings
+          # git-auth intentionally not bound: the application repository is
+          # public to the cluster, and binding an optional workspace to a
+          # Secret that does not exist hangs the clone pod. For a private repo,
+          # create a `git-auth` Secret and add it back here.
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: ci-build-push
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  # Reuses the ServiceAccount and bindings defined in
+  # agentic-issue-triggers.yaml -- same namespace, same permissions
+  # (create PipelineRuns, read the interceptor ClusterInterceptors).
+  serviceAccountName: tekton-triggers-sa
+  triggers:
+    - name: gitlab-push-main
+      interceptors:
+        # 1) Validate the shared secret token and that this is a push event.
+        #    The token is the same `gitlab-webhook-secret` the issue-comment
+        #    webhook uses; the GitLab seeding job mints it once and both hooks
+        #    are registered with it.
+        - ref:
+            name: gitlab
+          params:
+            - name: secretRef
+              value:
+                secretName: gitlab-webhook-secret
+                secretKey: secretToken
+            - name: eventTypes
+              value:
+                - "Push Hook"
+        # 2) Only the default branch, only real commits.
+        #
+        #    `after` is forty zeros when a branch is DELETED -- without that
+        #    check the listener would try to build a commit that no longer
+        #    exists. `total_commits_count > 0` drops branch-creation events
+        #    that carry no new commits (e.g. a branch pushed from an existing
+        #    SHA), which would otherwise rebuild and republish an identical
+        #    image under the same tag.
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: >-
+                body.ref == 'refs/heads/main' &&
+                body.after != '0000000000000000000000000000000000000000' &&
+                body.total_commits_count > 0
+            # Last segment of `development/spring-boot-example-application`.
+            # Indexed from the end so a project nested in subgroups still
+            # yields the project slug rather than the first subgroup.
+            - name: overlays
+              value:
+                - key: repoSlug
+                  expression: >-
+                    body.project.path_with_namespace.split("/")[size(body.project.path_with_namespace.split("/")) - 1]
+      bindings:
+        - ref: ci-build-push-binding
+      template:
+        ref: ci-build-push-template
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ci-build-push
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  to:
+    kind: Service
+    name: el-ci-build-push
+  port:
+    targetPort: http-listener
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
