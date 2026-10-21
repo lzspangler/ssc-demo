@@ -332,13 +332,26 @@ data:
           register: r_hooks
 
 {{- range $hook := $repo.webhooks }}
-{{- $hookUrl := $hook.url | default (printf "https://agentic-issue-commands-%s.%s" $pipelineNs (required "Set cluster.subdomain" $root.Values.cluster.subdomain)) }}
+{{- $hookName := $hook.name | default "webhook" }}
+{{- /*
+  Derived from the hook NAME, because each hook targets its own EventListener
+  and the operator names that Service/Route after the EventListener:
+  `<hook name>-<pipeline namespace>.<subdomain>`. Name the values entry after
+  the EventListener and the URL follows.
+*/}}
+{{- $hookUrl := $hook.url | default (printf "https://%s-%s.%s" $hookName $pipelineNs (required "Set cluster.subdomain" $root.Values.cluster.subdomain)) }}
+{{- /*
+  Event flags are per hook and every one defaults to FALSE. `| default` is not
+  usable here: it treats an explicit `false` as unset and would flip it back to
+  the default, which is exactly the mistake that would subscribe the CI hook to
+  note events and re-run every build on every comment. hasKey is unambiguous.
 
-        # `/remediate` in an issue comment is a note event and nothing else.
-        # Leaving push_events on (the API default) would fire the EventListener
-        # on every commit, including the ones the remediation pipeline itself
-        # pushes -- a feedback loop, not just noise.
-        - name: Create hook {{ $hook.name | default "webhook" }} on {{ $repo.name }}
+  Keeping each hook to the narrowest event set is load-bearing, not tidiness.
+  The note hook must NOT take push events: the remediation pipeline pushes
+  branches itself, and a note hook that also fired on pushes would re-enter the
+  pipeline that produced them.
+*/}}
+        - name: Create hook {{ $hookName }} on {{ $repo.name }}
           when: >-
             r_hooks.json | selectattr('url', 'equalto', '{{ $hookUrl }}') | list | length == 0
           ansible.builtin.uri:
@@ -348,10 +361,17 @@ data:
             body:
               url: {{ $hookUrl }}
               token: '{{ "{{" }} webhook_token {{ "}}" }}'
-              push_events: false
-              merge_requests_events: false
-              issues_events: false
-              note_events: {{ $hook.noteEvents | default true }}
+              push_events: {{ if hasKey $hook "pushEvents" }}{{ $hook.pushEvents }}{{ else }}false{{ end }}
+              merge_requests_events: {{ if hasKey $hook "mergeRequestsEvents" }}{{ $hook.mergeRequestsEvents }}{{ else }}false{{ end }}
+              issues_events: {{ if hasKey $hook "issuesEvents" }}{{ $hook.issuesEvents }}{{ else }}false{{ end }}
+              note_events: {{ if hasKey $hook "noteEvents" }}{{ $hook.noteEvents }}{{ else }}false{{ end }}
+              {{- if $hook.pushEventsBranchFilter }}
+              # GitLab-side branch filter, in addition to the EventListener's
+              # own cel filter. Stops the cluster from being woken for every
+              # feature-branch commit at all, rather than waking it and
+              # discarding the event.
+              push_events_branch_filter: {{ $hook.pushEventsBranchFilter | quote }}
+              {{- end }}
               enable_ssl_verification: false
             headers:
               PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
