@@ -43,9 +43,54 @@ oc get storagecluster -A                       # ODF — see below
 
 **ODF is a hard requirement** for two components: RHTPA's default `s3` storage
 and Quay's managed object storage both raise an `ObjectBucketClaim` against
-NooBaa in `openshift-storage`. If `oc get storagecluster -A` is empty, install
-ODF first, or read *Storage* in `README.md` for RHTPA's filesystem fallback and
-turn Quay off (`components.quay.enabled: false`).
+NooBaa in `openshift-storage`.
+
+If `oc get storagecluster -A` comes back empty — or errors with `the server
+doesn't have a resource type "storagecluster"`, which is the same answer on a
+cluster that has never had ODF — you have three options:
+
+1. **Let the app-of-apps install it.** Set `components.odf.enabled: true` in
+   your §4 overrides, with `storageClassName` pointing at a *block* class
+   (`gp3-csi` on AWS, `thin-csi` on vSphere) and `channel` matching the
+   cluster's OpenShift minor. See `components/odf/README.md`. Budget an extra
+   15–25 minutes, and read the note in `bootstrap-infra/values.yaml` about what
+   that does to the wave ordering before you decide where to put it.
+2. **Install ODF separately**, ahead of §5 — the same chart, staged by hand.
+   `components/odf/README.md` has the commands.
+3. **Go without it**: read *Storage* in `README.md` for RHTPA's filesystem
+   fallback and turn Quay off (`components.quay.enabled: false`). Be aware the
+   fallback mounts one RWO PVC into two Deployments.
+
+On a cluster that already has ODF — most Red Hat workshop clusters, including
+the reference cluster — leave `components.odf.enabled` at its default `false`.
+A second StorageCluster is not something you back out of cleanly.
+
+**Check whether the cluster already has a Keycloak, before anything else.**
+
+```sh
+oc get ns keycloak
+oc get oauth cluster -o jsonpath='{range .spec.identityProviders[*]}{.name}{" "}{.type}{"\n"}{end}'
+oc get user $(oc whoami) -o jsonpath='{.identities}{"\n"}'
+oc -n kube-system get secret kubeadmin
+```
+
+If an `OpenID` identity provider exists, your own user resolves through it, and
+there is no `kubeadmin` secret, then that Keycloak **is the cluster's login** —
+deleting it locks everyone out, and installing a second one alongside does not
+work because `applications.yaml` derives the issuer host as `sso.<domain>`,
+which its Route already holds. Use the bring-your-own path instead:
+
+```yaml
+components:
+  keycloak:
+    enabled: false
+    realm: <the realm it already serves>
+  keycloakClients:
+    enabled: true
+```
+
+See `components/keycloak-clients/README.md`. On a clean cluster, leave both at
+their defaults and the `keycloak` component installs its own.
 
 Egress needed: `charts.openshift.io`, `charts.jfrog.io`, `registry.redhat.io`,
 `quay.io`, `releases-docker.jfrog.io`, `github.com`, `redhat.com`,
@@ -150,6 +195,16 @@ gitops:
   revision: "<your branch>"
 ```
 
+And ODF, if §0 said you need it:
+
+```yaml
+components:
+  odf:
+    enabled: true
+    channel: stable-4.21      # must match the cluster's OpenShift minor
+    storageClassName: gp3-csi # a BLOCK class, not the demo's general-purpose one
+```
+
 **Keep this file.** `tpaCliClientSecret` is needed again in §8, and the other
 three are the only copies of the GitLab, Quay and database passwords.
 
@@ -164,6 +219,7 @@ Eleven Applications land at once; the sync waves serialise them.
 
 ```
  0  pipelines            OpenShift Pipelines operator
+ 0  odf                  ONLY if components.odf.enabled — see §0
  3  tekton-tasks, tekton-config
  4  tekton-pipelines
  5  keycloak, tekton-triggers
@@ -171,6 +227,8 @@ Eleven Applications land at once; the sync waves serialise them.
 10  quay, rhtas, rhtpa-prerequisites
 15  rhtpa
 ```
+
+Eleven, or twelve with ODF.
 
 A wave does not start until the previous one is Healthy, so one Application
 stuck in `Progressing` blocks everything behind it.

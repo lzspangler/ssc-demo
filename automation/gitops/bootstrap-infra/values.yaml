@@ -103,6 +103,45 @@ components:
     namespace: openshift-operators
     syncWave: "0"
 
+  # OpenShift Data Foundation. OPTIONAL, and OFF by default: the reference
+  # cluster and most Red Hat workshop clusters already have it, and a second
+  # StorageCluster is not something you can back out of cleanly.
+  #
+  # Turn it on only when `oc get storagecluster -A` is empty. Two components
+  # below need the object storage it provides -- rhtpa's `s3` mode and quay's
+  # managed `objectstorage`, both of which raise an ObjectBucketClaim against
+  # `openshift-storage.noobaa.io`. The alternative is the filesystem/no-Quay
+  # fallback described in README.md.
+  #
+  # Wave 0, with the Pipelines operator: it has to be Healthy before quay and
+  # rhtpa-prerequisites at wave 10. Be aware of what that costs -- waves are
+  # strictly ordered, so with the readiness gate on, keycloak and gitlab do not
+  # start until Ceph is up, adding its 15-25 minutes to the front of the
+  # install rather than overlapping it. Setting readinessGate: false lets the
+  # rest proceed in parallel and bets that ODF beats wave 10, which it usually
+  # does -- but when it loses, Quay and RHTPA fail against a NooBaa that has no
+  # StorageClass yet, and that failure reads as a Quay bug.
+  odf:
+    enabled: false
+    namespace: openshift-storage
+    syncWave: "0"
+    # MUST match the cluster's OpenShift minor version:
+    #   oc -n openshift-marketplace get packagemanifest odf-operator \
+    #     -o jsonpath='{.status.defaultChannel}{"\n"}'
+    channel: stable-4.21
+    # The BLOCK storage class Ceph carves OSDs from -- gp3-csi on AWS,
+    # thin-csi on vSphere, an LSO class on bare metal. Not the class anything
+    # else in the demo consumes.
+    storageClassName: gp3-csi
+    size: 512Gi
+    replica: 3
+    # lean | balanced | performance. lean, because this cluster also runs
+    # GitLab, Quay, Keycloak, RHTPA, Artifactory and Tekton builds.
+    resourceProfile: lean
+    # Keeps the Application Progressing until the StorageCluster, NooBaa and
+    # the openshift-storage.noobaa.io StorageClass are all up. See above.
+    readinessGate: true
+
   # The Tekton layer itself: the Tasks, Pipelines, Triggers and ConfigMap that
   # pipelines/README.md otherwise has you `oc apply` by hand. Four Applications
   # rather than one, because each points at a single directory with
@@ -148,7 +187,48 @@ components:
     syncWave: "5"
     # Baked into the OIDC issuer URL that RHTAS, RHTPA and the pipeline's
     # `oidc-issuer` parameter all carry. Renaming means changing all of them.
+    #
+    # Read even when `enabled: false` -- the issuer is computed at the top of
+    # applications.yaml, outside the component guard, so the bring-your-own
+    # path below still gets a correct issuer by setting this to the realm your
+    # existing Keycloak actually serves.
     realm: backstage
+
+  # Bring-your-own-Keycloak. Mutually exclusive with `keycloak` above: set
+  # that one to `enabled: false`, set its `realm` to the realm you already
+  # have, and turn this on.
+  #
+  # WHEN YOU NEED THIS: the cluster already runs a Keycloak you must not
+  # replace. The case that matters is a cluster whose own OAuth is federated
+  # to it -- deleting that Keycloak locks every user, including you, out of
+  # the cluster. Check before deciding:
+  #
+  #   oc get oauth cluster -o jsonpath='{range .spec.identityProviders[*]}{.name}{" "}{.type}{"\n"}{end}'
+  #   oc get user <you> -o jsonpath='{.identities}{"\n"}'
+  #   oc -n kube-system get secret kubeadmin
+  #
+  # An OpenID provider plus no kubeadmin secret means the Keycloak is
+  # load-bearing for cluster access. It is also why installing a second
+  # Keycloak alongside does not work: applications.yaml derives the issuer
+  # host as `sso.<domain>`, which that Keycloak's Route already holds.
+  #
+  # This installs no Keycloak. It runs a Job that adds only what ssc-demo
+  # needs to the existing realm -- the tpa document scopes, the tpa-* roles,
+  # and the tpa-cli / tpa-frontend / trusted-artifact-signer clients. It does
+  # not touch existing clients, users or identity-provider config.
+  keycloakClients:
+    enabled: false
+    # Must be the namespace holding the admin Secret: the Job mounts it, and
+    # a pod cannot mount a Secret from another namespace.
+    namespace: keycloak
+    # Same wave as the keycloak component it replaces -- before rhtas and
+    # rhtpa-prerequisites at wave 10, both of which authenticate against it.
+    syncWave: "5"
+    # Empty derives https://sso.<domain>.
+    keycloakUrl: ""
+    # The Keycloak operator generates this with username/password keys.
+    adminSecretName: keycloak-initial-admin
+    tlsVerify: true
 
   gitlab:
     enabled: true
