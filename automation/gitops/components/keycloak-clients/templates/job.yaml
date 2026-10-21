@@ -1,0 +1,58 @@
+---
+# Runs on every sync. The script converges rather than duplicating, so a
+# re-run is a no-op that re-asserts the client secret -- which is useful, since
+# that value drifting from `tpa-secret` is the classic cause of RHTPA 401s.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "keycloak-clients.name" . }}
+  namespace: {{ include "keycloak-clients.namespace" . }}
+  labels:
+    {{- include "keycloak-clients.labels" . | nindent 4 }}
+  annotations:
+    # A Job's pod template is immutable, so editing the script would otherwise
+    # fail the sync with "field is immutable" and keep the old one. Replace is
+    # also how you re-run it.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  # Keycloak may still be rolling when this first runs; a few retries cover
+  # that without masking a genuine misconfiguration.
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- include "keycloak-clients.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: provision
+          image: {{ .Values.jobImage }}
+          env:
+            # Mounted from the Keycloak operator's generated admin Secret.
+            # This is why the Job runs in the Keycloak namespace: a pod cannot
+            # mount a Secret from another one.
+            - name: ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminSecret.name }}
+                  key: {{ .Values.adminSecret.usernameKey }}
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminSecret.name }}
+                  key: {{ .Values.adminSecret.passwordKey }}
+          # -I isolates the interpreter so nothing is imported from the mounted
+          # directories or the cwd.
+          command: ["python3", "-I", "/scripts/provision.py"]
+          volumeMounts:
+            - mountPath: /scripts
+              name: scripts
+            - mountPath: /config
+              name: config
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "keycloak-clients.name" . }}
+        - name: config
+          secret:
+            secretName: {{ include "keycloak-clients.name" . }}-config

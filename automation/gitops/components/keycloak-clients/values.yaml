@@ -1,0 +1,88 @@
+# =============================================================================
+# Bring-your-own-Keycloak.
+#
+# Use this INSTEAD OF components.keycloak when the cluster already runs a
+# Keycloak you must not replace -- most importantly when it is the cluster's
+# own OAuth identity provider. Check before you decide:
+#
+#   oc get oauth cluster -o jsonpath='{range .spec.identityProviders[*]}{.name}{" "}{.type}{"\n"}{end}'
+#   oc get user <you> -o jsonpath='{.identities}{"\n"}'
+#
+# If your own login resolves through that Keycloak and there is no htpasswd
+# provider or kubeadmin secret left, deleting it locks everyone out of the
+# cluster.
+#
+# This chart touches ONLY the objects ssc-demo needs. It does not modify the
+# realm's existing clients, users, or identity-provider configuration, and it
+# is idempotent -- re-running converges rather than duplicating.
+#
+# What it creates in the target realm:
+#
+#   client scopes   read:document, create:document, update:document,
+#                   delete:document        -- RHTPA authorises on these scopes
+#   realm roles     tpa-user, tpa-manager (-> tpa-user),
+#                   tpa-admin (-> tpa-manager)
+#   clients         tpa-cli        confidential, service accounts on; the
+#                                  client-credentials grant the Tekton tasks
+#                                  and RHTPA importers use
+#                   tpa-frontend   public; browser login to the RHTPA console
+#                   trusted-artifact-signer
+#                                  public; RHTAS validates cosign identities
+#                                  against it
+#   role mapping    tpa-admin on service-account-tpa-cli, without which every
+#                   SBOM upload authenticates fine and then 403s
+# =============================================================================
+
+global:
+  cluster:
+    # Apps subdomain, no leading dot. Used to derive keycloakUrl and the
+    # RHTPA console redirect URIs.
+    subdomain: ""
+
+# Namespace the Job runs in. Must be the namespace holding the admin Secret
+# below -- a pod cannot mount a Secret from another namespace.
+namespace: keycloak
+
+# Leave empty to derive `https://sso.<subdomain>`. Override for a Keycloak
+# published somewhere else, or to use an in-cluster Service and skip the
+# router entirely (then set tlsVerify: false for its serving cert).
+keycloakUrl: ""
+
+# The realm to provision into -- the one your cluster's IdP already uses, NOT
+# necessarily `backstage`. This must match components.keycloak.realm in
+# bootstrap-infra, which is what builds the issuer URL handed to RHTAS and
+# RHTPA.
+realm: sso
+
+# Admin credentials. The Keycloak operator generates `keycloak-initial-admin`
+# with username/password keys; point this at whatever your install uses.
+adminSecret:
+  name: keycloak-initial-admin
+  usernameKey: username
+  passwordKey: password
+
+tlsVerify: true
+
+clients:
+  tpaCli:
+    name: tpa-cli
+    # MUST equal credentials.tpaCliClientSecret in bootstrap-infra, and the
+    # oidc_client_secret in the hand-made `tpa-secret`. Three copies of one
+    # value; if any drifts, every RHTPA call returns 401 and nothing else
+    # looks wrong.
+    secret: REPLACE_ME
+  tpaFrontend:
+    name: tpa-frontend
+    # Empty derives the RHTPA console Route,
+    # `server-trusted-profile-analyzer.<subdomain>`, which is where the
+    # browser login flow comes back to. An empty list in Keycloak gives an
+    # "Invalid parameter: redirect_uri" page and no other symptom.
+    redirectUris: []
+  trustedArtifactSigner:
+    name: trusted-artifact-signer
+    # Only needed when RHTAS commit verification is actually turned on. Left
+    # on because the client is inert until something authenticates to it.
+    enabled: true
+
+# Pure-stdlib Python; no oc, no pip install at runtime.
+jobImage: registry.access.redhat.com/ubi9/python-39:latest

@@ -51,6 +51,33 @@ spec:
       releaseName: artifactory
       # NOTE the umbrella nesting: everything sits under a top-level `artifactory:`.
       valuesObject:
+        # `global` is Helm-special and must sit OUTSIDE the `artifactory:` key --
+        # it propagates to every subchart at any depth, which is how it reaches
+        # the bundled bitnami PostgreSQL two levels down.
+        #
+        # WHY THIS IS HERE. bitnami's common chart defaults
+        # `adaptSecurityContext: auto`, and on a cluster where it detects the
+        # security.openshift.io API it runs `omit "fsGroup" "runAsUser"
+        # "runAsGroup"` over the rendered securityContext. That is correct when
+        # the pod lands on a RESTRICTED SCC, whose `fsGroup: MustRunAs` then
+        # assigns a GID from the namespace range and chowns the volume.
+        #
+        # It is wrong here. `artifactory-scc` (openshift-extras.yaml) is built
+        # from anyuid and carries `fsGroup: RunAsAny`, which assigns NOTHING. So
+        # the chart strips fsGroup 1001, the SCC adds nothing back, the RWO
+        # volume mounts root-owned, and postgres crashloops on
+        #   mkdir: cannot create directory '/bitnami/postgresql/data':
+        #   Permission denied
+        # with no clue that an SCC is involved.
+        #
+        # `disabled` makes the chart emit its own fsGroup/runAsUser 1001, which
+        # RunAsAny permits. Do NOT "fix" this by setting the SCC's fsGroup to
+        # MustRunAs instead -- JFrog's own StatefulSet sets a fixed fsGroup
+        # outside the namespace range and would be rejected.
+        global:
+          compatibility:
+            openshift:
+              adaptSecurityContext: disabled
         artifactory:
           # Expose via an OpenShift Route (openshift-extras.yaml), not the chart's
           # bundled nginx LoadBalancer.

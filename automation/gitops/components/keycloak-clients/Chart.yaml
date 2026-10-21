@@ -1,0 +1,8 @@
+apiVersion: v2
+name: keycloak-clients
+description: >-
+  Bring-your-own-Keycloak: provisions the realm roles, client scopes and
+  clients ssc-demo needs into an EXISTING Keycloak realm, instead of installing
+  a Keycloak of its own.
+type: application
+version: 0.1.0

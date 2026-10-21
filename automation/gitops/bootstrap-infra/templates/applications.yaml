@@ -1,6 +1,9 @@
 {{- $domain := required "Set deployer.domain to the cluster's apps subdomain" .Values.deployer.domain }}
 {{- $realm := .Values.components.keycloak.realm }}
 {{- $issuer := printf "https://sso.%s/realms/%s" $domain $realm }}
+{{- if and .Values.components.keycloak.enabled .Values.components.keycloakClients.enabled }}
+{{- fail "components.keycloak and components.keycloakClients are mutually exclusive: the first installs a Keycloak that claims the sso.<domain> Route, the second provisions ssc-demo's clients into one that already exists. Enable exactly one." }}
+{{- end }}
 # =============================================================================
 # Argo CD Applications for the ssc-demo platform. See values.yaml for the
 # sync-wave dependency chain.
@@ -43,6 +46,56 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.pipelines.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.odf.enabled }}
+{{- $odf := .Values.components.odf }}
+# -----------------------------------------------------------------------------
+# OpenShift Data Foundation. Optional -- see values.yaml for when to enable it
+# and what it costs in install ordering.
+#
+# The destination namespace is openshift-storage, but the chart creates that
+# namespace itself rather than relying on CreateNamespace=true: ODF needs the
+# `openshift.io/cluster-monitoring` label on it, and Argo's CreateNamespace
+# makes a bare one.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-odf
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $odf.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/odf
+    helm:
+      valuesObject:
+        odf-operator:
+          namespace: {{ $odf.namespace | quote }}
+          subscription:
+            channel: {{ $odf.channel | quote }}
+        odf-storagecluster:
+          namespace: {{ $odf.namespace | quote }}
+          storageCluster:
+            storageClassName: {{ $odf.storageClassName | quote }}
+            size: {{ $odf.size | quote }}
+            replica: {{ $odf.replica }}
+            resourceProfile: {{ $odf.resourceProfile | quote }}
+          readinessGate:
+            enabled: {{ $odf.readinessGate }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $odf.namespace }}
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
@@ -224,6 +277,54 @@ spec:
       kind: KeycloakRealmImport
       jqPathExpressions:
         - '.. | (.id, .containerId, .secret)? | strings'
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.keycloakClients.enabled }}
+{{- $kc := .Values.components.keycloakClients }}
+# -----------------------------------------------------------------------------
+# Bring-your-own-Keycloak. Replaces the keycloak component on a cluster whose
+# existing Keycloak must survive -- see values.yaml for how to tell.
+#
+# The realm comes from components.keycloak.realm deliberately: that is the same
+# value $issuer above is built from, so the clients this provisions and the
+# issuer handed to RHTAS and RHTPA cannot disagree.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-keycloak-clients
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $kc.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/keycloak-clients
+    helm:
+      valuesObject:
+        global:
+          cluster:
+            subdomain: {{ $domain | quote }}
+        namespace: {{ $kc.namespace | quote }}
+        keycloakUrl: {{ $kc.keycloakUrl | quote }}
+        realm: {{ $realm | quote }}
+        tlsVerify: {{ $kc.tlsVerify }}
+        adminSecret:
+          name: {{ $kc.adminSecretName | quote }}
+        clients:
+          tpaCli:
+            secret: {{ .Values.credentials.tpaCliClientSecret | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $kc.namespace }}
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 

@@ -1,0 +1,163 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "keycloak-clients.name" . }}
+  namespace: {{ include "keycloak-clients.namespace" . }}
+  labels:
+    {{- include "keycloak-clients.labels" . | nindent 4 }}
+data:
+  provision.py: |
+    # Provision ssc-demo's realm objects into an EXISTING Keycloak realm.
+    #
+    # Idempotent by construction: every step reads before it writes and
+    # converges rather than duplicating, because this runs on every Argo sync.
+    # Nothing here touches objects it did not create -- in particular it never
+    # looks at the realm's identity-provider clients, which on a cluster whose
+    # OAuth is federated to this Keycloak are what your own login depends on.
+    #
+    # Pure stdlib: no python-keycloak, no pip install at runtime (which fails
+    # anyway under the restricted SCC's arbitrary UID).
+    import json, os, ssl, sys, urllib.error, urllib.parse, urllib.request
+
+    CFG = json.load(open("/config/config.json"))
+    URL = CFG["keycloakUrl"].rstrip("/")
+    REALM = CFG["realm"]
+    USER = os.environ["ADMIN_USER"]
+    PASS = os.environ["ADMIN_PASSWORD"]
+
+    ctx = ssl.create_default_context()
+    if not CFG.get("tlsVerify", True):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    def req(method, url, body=None, form=None, token=None):
+        headers = {"Accept": "application/json"}
+        data = None
+        if form is not None:
+            data = urllib.parse.urlencode(form).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        r = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(r, context=ctx) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()[:400]
+
+    # --- authenticate -------------------------------------------------------
+    st, tok = req("POST", "%s/realms/master/protocol/openid-connect/token" % URL,
+                  form={"grant_type": "password", "client_id": "admin-cli",
+                        "username": USER, "password": PASS})
+    if st != 200:
+        sys.exit("ERROR: admin login failed (%s): %s" % (st, tok))
+    TOKEN = tok["access_token"]
+    BASE = "%s/admin/realms/%s" % (URL, REALM)
+
+    st, _ = req("GET", BASE, token=TOKEN)
+    if st != 200:
+        sys.exit("ERROR: realm %r not reachable (%s). Check `realm` matches the "
+                 "realm your cluster's IdP actually uses." % (REALM, st))
+    print("authenticated against realm %r" % REALM)
+
+    # --- client scopes ------------------------------------------------------
+    st, existing = req("GET", BASE + "/client-scopes", token=TOKEN)
+    by_name = {s["name"]: s for s in (existing or [])}
+    for sc in CFG["clientScopes"]:
+        if sc["name"] in by_name:
+            print("client-scope %-18s exists" % sc["name"])
+            continue
+        st, err = req("POST", BASE + "/client-scopes", body=sc, token=TOKEN)
+        if st not in (201, 409):
+            sys.exit("ERROR: creating scope %s: %s %s" % (sc["name"], st, err))
+        print("client-scope %-18s created" % sc["name"])
+    st, existing = req("GET", BASE + "/client-scopes", token=TOKEN)
+    scope_ids = {s["name"]: s["id"] for s in (existing or [])}
+
+    # --- realm roles --------------------------------------------------------
+    # Created before composites are wired, so tpa-manager can reference
+    # tpa-user and tpa-admin can reference tpa-manager.
+    for role in CFG["realmRoles"]:
+        st, _ = req("GET", "%s/roles/%s" % (BASE, role["name"]), token=TOKEN)
+        if st == 200:
+            print("realm-role   %-18s exists" % role["name"])
+            continue
+        st, err = req("POST", BASE + "/roles",
+                      body={"name": role["name"], "description": role.get("description", ""),
+                            "composite": bool(role.get("composites"))}, token=TOKEN)
+        if st not in (201, 409):
+            sys.exit("ERROR: creating role %s: %s %s" % (role["name"], st, err))
+        print("realm-role   %-18s created" % role["name"])
+
+    for role in CFG["realmRoles"]:
+        if not role.get("composites"):
+            continue
+        reps = []
+        for child in role["composites"]:
+            st, rep = req("GET", "%s/roles/%s" % (BASE, child), token=TOKEN)
+            if st == 200:
+                reps.append(rep)
+        if reps:
+            # 204 on success; 409 when the composite is already present.
+            st, err = req("POST", "%s/roles/%s/composites" % (BASE, role["name"]),
+                          body=reps, token=TOKEN)
+            if st not in (204, 409):
+                print("WARNING: composite %s -> %s: %s %s"
+                      % (role["name"], role["composites"], st, err))
+            else:
+                print("composite    %-18s -> %s" % (role["name"], ",".join(role["composites"])))
+
+    # --- clients ------------------------------------------------------------
+    for spec in CFG["clients"]:
+        rep = dict(spec["representation"])
+        cid = rep["clientId"]
+        st, found = req("GET", "%s/clients?clientId=%s" % (BASE, urllib.parse.quote(cid)),
+                        token=TOKEN)
+        if st == 200 and found:
+            uid = found[0]["id"]
+            merged = dict(found[0]); merged.update(rep)
+            st, err = req("PUT", "%s/clients/%s" % (BASE, uid), body=merged, token=TOKEN)
+            if st not in (204, 200):
+                sys.exit("ERROR: updating client %s: %s %s" % (cid, st, err))
+            print("client       %-18s updated" % cid)
+        else:
+            st, err = req("POST", BASE + "/clients", body=rep, token=TOKEN)
+            if st not in (201, 409):
+                sys.exit("ERROR: creating client %s: %s %s" % (cid, st, err))
+            st, found = req("GET", "%s/clients?clientId=%s" % (BASE, urllib.parse.quote(cid)),
+                            token=TOKEN)
+            uid = found[0]["id"]
+            print("client       %-18s created" % cid)
+
+        # Default client scopes. RHTPA authorises on the scopes present in the
+        # token, so a client without these authenticates and then 403s.
+        for name in spec.get("defaultClientScopes", []):
+            if name not in scope_ids:
+                print("WARNING: scope %s missing, skipping on %s" % (name, cid))
+                continue
+            st, err = req("PUT", "%s/clients/%s/default-client-scopes/%s"
+                          % (BASE, uid, scope_ids[name]), token=TOKEN)
+            if st not in (204, 409):
+                print("WARNING: attaching scope %s to %s: %s %s" % (name, cid, st, err))
+
+        # Service-account role mapping.
+        for role_name in spec.get("serviceAccountRealmRoles", []):
+            st, sa = req("GET", "%s/clients/%s/service-account-user" % (BASE, uid), token=TOKEN)
+            if st != 200:
+                print("WARNING: no service account on %s (%s)" % (cid, st)); break
+            st, role = req("GET", "%s/roles/%s" % (BASE, role_name), token=TOKEN)
+            if st != 200:
+                print("WARNING: role %s not found" % role_name); continue
+            st, err = req("POST", "%s/users/%s/role-mappings/realm" % (BASE, sa["id"]),
+                          body=[role], token=TOKEN)
+            if st not in (204, 409):
+                print("WARNING: granting %s to service-account-%s: %s %s"
+                      % (role_name, cid, st, err))
+            else:
+                print("role-map     %-18s service-account-%s" % (role_name, cid))
+
+    print("OK: realm %r provisioned for ssc-demo" % REALM)
