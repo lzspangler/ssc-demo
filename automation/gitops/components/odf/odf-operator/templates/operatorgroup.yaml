@@ -1,0 +1,24 @@
+---
+# Unlike the Quay operator, ODF cannot go into openshift-operators: its CSV
+# supports only OwnNamespace and SingleNamespace install modes, so OLM refuses
+# an AllNamespaces (empty targetNamespaces) OperatorGroup. Verify with:
+#
+#   oc -n openshift-marketplace get packagemanifest odf-operator \
+#     -o jsonpath='{.status.channels[0].currentCSVDesc.installModes}'
+#
+# That is also why this chart ships its own OperatorGroup where the Quay one
+# deliberately does not -- openshift-storage is a fresh namespace with none,
+# and a namespace with two OperatorGroups puts every operator in it into an
+# error state.
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: {{ include "odf-operator.name" . }}-operator-group
+  namespace: {{ include "odf-operator.namespace" . }}
+  labels:
+    {{- include "odf-operator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWave | quote }}
+spec:
+  targetNamespaces:
+    - {{ include "odf-operator.namespace" . }}

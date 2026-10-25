@@ -142,26 +142,41 @@ The pipelines read their backend from the `ai-agent-config` ConfigMap, which
 ConfigMap is reverted within minutes, so this choice is a commit.
 
 **aider + an OpenAI-compatible endpoint** (gpt-oss, Granite, vLLM, Ollama,
-OpenShift AI, watsonx) — edit `pipelines/config/ai-agent-config.yaml`:
+OpenShift AI, watsonx) — **this is the committed default**:
 
 ```yaml
 data:
   AI_PROVIDER: "openai"
   AI_AGENT:    "aider"
-  AI_MODEL:    "gpt-oss-120b"                            # or your model id
-  AI_BASE_URL: "http://vllm-gpt-oss.my-ns.svc:8000/v1"   # the /v1 endpoint
+  AI_MODEL:    "gpt-oss-120b"
+  AI_BASE_URL: "https://maas-rhdp.apps.maas.redhatworkshops.io/v1"
 ```
 
-`AI_MODEL` may be a bare id (litellm assumes the `openai/` provider) or a full
-litellm string such as `ollama_chat/granite3.3:8b`. For a self-hosted HTTPS
-endpoint behind a private CA, also set `SSL_VERIFY` to the CA path — aider
-honours it, and plain in-cluster `http://…svc` avoids the problem entirely.
-`agent-image` already defaults to `ai-agent-maven-aider`, so no pipeline edit is
-needed.
+Change `AI_MODEL`/`AI_BASE_URL` for a different endpoint. `AI_MODEL` may be a
+bare id (litellm assumes the `openai/` provider) or a full litellm string such
+as `ollama_chat/granite3.3:8b`. `agent-image` already defaults to
+`ai-agent-maven-aider`, so no pipeline edit is needed.
 
-**Anthropic + Claude Code** (the committed default) — change nothing here, but
-set `agent-image` to an `ai-agent-maven-claude` build on the PipelineRun, or
-edit the default in the pipelines.
+The shipped default also sets `AI_TLS_INSECURE: "true"` and
+`SSL_VERIFY: "False"`. That is **demo-only**. It is on because the SDKs verify
+against certifi's public roots only, and the `ai-python` image fails the
+handshake with `CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+certificate` against this endpoint even where plain `curl` from the same UBI9
+base succeeds. For anything beyond a demo, trust the CA instead: populate the
+`ai-endpoint-ca` ConfigMap, set `AI_CA_BUNDLE` to the mounted path, and set
+`SSL_VERIFY` to the same path for the aider tasks. Plain in-cluster
+`http://…svc` sidesteps TLS entirely.
+
+**Anthropic + Claude Code** — set `AI_PROVIDER: anthropic`,
+`AI_AGENT: claude-code`, `AI_MODEL: claude-opus-5`, clear `AI_BASE_URL`, and set
+`agent-image` to an `ai-agent-maven-claude` build on the PipelineRun (or edit
+the default in the pipelines).
+
+**Whichever you pick, the companion Secret must NOT contain an `AI_PROVIDER`
+key.** The AI tasks use
+`envFrom: [configMapRef: ai-agent-config, secretRef: ai-agent-secret]`, and the
+last source wins — so an `AI_PROVIDER` in the Secret silently overrides this
+ConfigMap, and the only symptom is the wrong SDK being used.
 
 Either way, commit and push before §5:
 
@@ -298,10 +313,13 @@ token request comes back 401.
 
 ### b. `ai-agent-secret` — the AI backend key
 
-Match the key name to the `AI_PROVIDER` you chose in §3:
+Match the key name to the `AI_PROVIDER` you chose in §3. Put **only** the key in
+here — adding an `AI_PROVIDER` key to this Secret overrides the ConfigMap (see
+§3), which is a genuinely confusing failure: the task uses the wrong SDK and
+reports a connection error rather than anything about configuration.
 
 ```sh
-# AI_PROVIDER=openai
+# AI_PROVIDER=openai  (the default: gpt-oss on the MaaS endpoint)
 oc -n $NS create secret generic ai-agent-secret \
   --from-literal=OPENAI_API_KEY='<key, or any placeholder for a server that ignores it>' \
   --dry-run=client -o yaml | oc apply -f -
@@ -310,6 +328,13 @@ oc -n $NS create secret generic ai-agent-secret \
 oc -n $NS create secret generic ai-agent-secret \
   --from-literal=ANTHROPIC_API_KEY='<key>' \
   --dry-run=client -o yaml | oc apply -f -
+```
+
+Verify afterwards that the Secret has exactly one key:
+
+```sh
+oc -n $NS get secret ai-agent-secret -o jsonpath='{.data}' \
+  | python3 -c 'import sys,json;print(sorted(json.load(sys.stdin)))'
 ```
 
 ### c. `maven-settings` — the Artifactory credential

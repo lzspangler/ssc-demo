@@ -1,0 +1,118 @@
+{{- if .Values.nodeLabeller.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "odf-storagecluster.name" . }}-label-nodes
+  namespace: {{ include "odf-storagecluster.namespace" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.labelNodes | quote }}
+data:
+  label_nodes.py: |
+    # Label the nodes ODF is allowed to place OSDs on.
+    #
+    # Pure stdlib against the in-cluster API: no oc, no pip install. Talking to
+    # the API directly also means the failure modes are HTTP codes rather than
+    # a CLI's exit status, which is what makes "forbidden" distinguishable from
+    # "not found" in the log.
+    import json, os, ssl, sys, urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    LABEL = "cluster.ocs.openshift.io/openshift-storage"
+    WANT = int(os.environ["REPLICA"])
+    PINNED = [n for n in os.environ.get("PINNED_NODES", "").split(",") if n]
+
+    token = open(SA + "/token").read().strip()
+    ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+
+    def call(path, method="GET", body=None, ctype="application/json"):
+        req = urllib.request.Request(
+            API + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                     **({"Content-Type": ctype} if body is not None else {})})
+        with urllib.request.urlopen(req, context=ctx) as r:
+            return json.load(r)
+
+    nodes = call("/api/v1/nodes")["items"]
+
+    def roles(n):
+        return {k.split("/", 1)[1] for k in n["metadata"].get("labels", {})
+                if k.startswith("node-role.kubernetes.io/")}
+
+    if PINNED:
+        chosen = PINNED
+        print("Using pinned nodes:", chosen)
+    else:
+        # Anything already labelled stays chosen -- re-running must be a no-op,
+        # not a reshuffle that strands OSDs on a node ODF no longer selects.
+        already = sorted(n["metadata"]["name"] for n in nodes
+                         if LABEL in n["metadata"].get("labels", {}))
+        # Prefer dedicated workers so Ceph stays off the control plane. On a
+        # compact cluster every node is both, and the fallback picks those.
+        workers = sorted(n["metadata"]["name"] for n in nodes
+                         if "worker" in roles(n)
+                         and not ({"master", "control-plane"} & roles(n)))
+        if len(workers) < WANT:
+            print("Only %d dedicated worker(s); falling back to all worker-role nodes"
+                  % len(workers))
+            workers = sorted(n["metadata"]["name"] for n in nodes if "worker" in roles(n))
+        chosen = already + [w for w in workers if w not in already]
+        chosen = chosen[:WANT]
+
+    if len(chosen) < WANT:
+        sys.exit("ERROR: need %d labelled node(s) for a replica-%d StorageCluster, "
+                 "found %d. Label them by hand or set nodeLabeller.nodes."
+                 % (WANT, WANT, len(chosen)))
+
+    for name in chosen:
+        call("/api/v1/nodes/" + name, "PATCH",
+             {"metadata": {"labels": {LABEL: ""}}},
+             "application/merge-patch+json")
+        print("labelled", name)
+
+    print("OK: %d node(s) carry %s" % (len(chosen), LABEL))
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "odf-storagecluster.name" . }}-label-nodes
+  namespace: {{ include "odf-storagecluster.namespace" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.labelNodes | quote }}
+    # A Job's pod template is immutable, so a later edit to the script would
+    # fail the sync with "field is immutable" and silently keep the old one.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels:
+        {{- include "odf-storagecluster.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "odf-storagecluster.serviceAccountName" . }}
+      containers:
+        - name: label-nodes
+          image: {{ .Values.jobImage }}
+          env:
+            - name: REPLICA
+              value: {{ .Values.storageCluster.replica | quote }}
+            - name: PINNED_NODES
+              value: {{ join "," .Values.nodeLabeller.nodes | quote }}
+          # -I isolates the interpreter so nothing is imported from the mounted
+          # directory or the cwd.
+          command: ["python3", "-I", "/scripts/label_nodes.py"]
+          volumeMounts:
+            - mountPath: /scripts
+              name: scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "odf-storagecluster.name" . }}-label-nodes
+{{- end }}

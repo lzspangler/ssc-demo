@@ -1,0 +1,22 @@
+nameOverride: "odf"
+
+# ODF is hard-wired to this namespace: the operator's own CSV, the NooBaa CR,
+# the `openshift-storage.noobaa.io` StorageClass and every ObjectBucketClaim
+# consumer assume it. Do not rename it.
+namespace: openshift-storage
+
+subscription:
+  # MUST track the OpenShift minor version -- ODF is only supported on the
+  # matching release, and OLM will not resolve stable-4.20 on a 4.21 cluster.
+  # Check what the cluster actually offers before changing this:
+  #   oc -n openshift-marketplace get packagemanifest odf-operator \
+  #     -o jsonpath='{.status.defaultChannel}{"\n"}'
+  channel: stable-4.21
+  installPlanApproval: Automatic
+  name: odf-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+
+# The operator and its OperatorGroup must exist before the StorageCluster CR in
+# the sibling subchart, which is why that one sits at a later wave.
+syncWave: "-5"
