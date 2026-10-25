@@ -1,0 +1,7 @@
+apiVersion: v2
+name: odf-storagecluster
+description: >-
+  The ODF StorageCluster, the node labelling it depends on, and a readiness
+  gate so dependent sync waves do not start against a half-built Ceph.
+type: application
+version: 0.1.0

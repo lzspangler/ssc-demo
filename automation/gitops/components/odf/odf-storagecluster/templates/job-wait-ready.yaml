@@ -1,0 +1,116 @@
+{{- if .Values.readinessGate.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "odf-storagecluster.name" . }}-wait-ready
+  namespace: {{ include "odf-storagecluster.namespace" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+data:
+  wait_ready.py: |
+    # Block until ODF can actually serve an ObjectBucketClaim.
+    #
+    # Three separate conditions, because each can lag the others and only the
+    # third is what RHTPA and Quay need:
+    #   1. StorageCluster phase Ready  -- Ceph has its OSDs
+    #   2. NooBaa phase Ready          -- the object gateway is up
+    #   3. the openshift-storage.noobaa.io StorageClass exists
+    import json, os, ssl, sys, time, urllib.error, urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    NS = os.environ["NAMESPACE"]
+    NAME = os.environ["STORAGECLUSTER"]
+    DEADLINE = time.time() + int(os.environ["TIMEOUT_SECONDS"])
+    OBC_SC = "openshift-storage.noobaa.io"
+
+    token = open(SA + "/token").read().strip()
+    ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+
+    def get(path):
+        req = urllib.request.Request(
+            API + path, headers={"Authorization": "Bearer " + token,
+                                 "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, context=ctx) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            # 404 is expected early on: the CRD or the CR may not exist yet.
+            if e.code == 404:
+                return None
+            raise
+
+    def state():
+        sc = get("/apis/ocs.openshift.io/v1/namespaces/%s/storageclusters/%s" % (NS, NAME))
+        sc_phase = (sc or {}).get("status", {}).get("phase")
+
+        nb = get("/apis/noobaa.io/v1alpha1/namespaces/%s/noobaas" % NS)
+        nb_items = (nb or {}).get("items", [])
+        nb_phase = nb_items[0].get("status", {}).get("phase") if nb_items else None
+
+        classes = get("/apis/storage.k8s.io/v1/storageclasses") or {"items": []}
+        has_sc = any(c["metadata"]["name"] == OBC_SC for c in classes["items"])
+        return sc_phase, nb_phase, has_sc
+
+    while True:
+        sc_phase, nb_phase, has_sc = state()
+        if sc_phase == "Ready" and nb_phase == "Ready" and has_sc:
+            print("ODF is ready: StorageCluster=%s NooBaa=%s %s present"
+                  % (sc_phase, nb_phase, OBC_SC))
+            sys.exit(0)
+        if time.time() > DEADLINE:
+            sys.exit("TIMEOUT waiting for ODF. StorageCluster=%s NooBaa=%s %s present=%s\n"
+                     "Check: oc -n %s get storagecluster,noobaa,pods"
+                     % (sc_phase, nb_phase, OBC_SC, has_sc, NS))
+        print("waiting... StorageCluster=%s NooBaa=%s %s present=%s"
+              % (sc_phase, nb_phase, OBC_SC, has_sc), flush=True)
+        time.sleep(20)
+---
+# PostSync, so the Application stays Progressing until ODF is genuinely up.
+# Argo CD ships no health check for StorageCluster -- without this gate the
+# Application goes Healthy the moment the CR is accepted, and the next sync
+# wave starts building Quay and RHTPA against a Ceph with no OSDs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "odf-storagecluster.name" . }}-wait-ready
+  namespace: {{ include "odf-storagecluster.namespace" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # The script does its own waiting and its own timeout, so a restart would
+  # only reset the clock and hide the diagnosis it prints.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "odf-storagecluster.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "odf-storagecluster.serviceAccountName" . }}
+      containers:
+        - name: wait-ready
+          image: {{ .Values.jobImage }}
+          env:
+            - name: NAMESPACE
+              value: {{ include "odf-storagecluster.namespace" . }}
+            - name: STORAGECLUSTER
+              value: {{ .Values.storageCluster.name }}
+            - name: TIMEOUT_SECONDS
+              value: {{ .Values.readinessGate.timeoutSeconds | quote }}
+          command: ["python3", "-I", "/scripts/wait_ready.py"]
+          volumeMounts:
+            - mountPath: /scripts
+              name: scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "odf-storagecluster.name" . }}-wait-ready
+{{- end }}

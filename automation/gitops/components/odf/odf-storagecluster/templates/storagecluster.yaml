@@ -1,0 +1,46 @@
+---
+# Internal-mode ODF: Ceph runs on the cluster, on PVs carved out of the
+# platform's own block storage class.
+#
+# `count: 1` with `replica: 3` means three OSDs, one per labelled node -- NOT
+# three device sets. Getting those two the wrong way round is how you end up
+# with nine volumes and an EBS bill.
+apiVersion: ocs.openshift.io/v1
+kind: StorageCluster
+metadata:
+  name: {{ .Values.storageCluster.name }}
+  namespace: {{ include "odf-storagecluster.namespace" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.storageCluster | quote }}
+spec:
+  resourceProfile: {{ .Values.storageCluster.resourceProfile }}
+  multiCloudGateway:
+    # `manage` is what creates the NooBaa CR, and with it the
+    # `openshift-storage.noobaa.io` StorageClass that every ObjectBucketClaim
+    # in this demo is raised against. Set it to `ignore` and RHTPA's bucket and
+    # Quay's objectstorage both stay Pending forever with no obvious cause.
+    reconcileStrategy: {{ if .Values.storageCluster.multiCloudGateway }}manage{{ else }}ignore{{ end }}
+  storageDeviceSets:
+    - name: ocs-deviceset
+      count: 1
+      replica: {{ .Values.storageCluster.replica }}
+      # Portable: the OSD follows its PV rather than being pinned to the node
+      # it was first scheduled on. Correct for dynamically provisioned cloud
+      # block storage; set false only for Local Storage Operator devices.
+      portable: true
+      resources: {}
+      dataPVCTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          # Block, not Filesystem. Ceph writes raw devices; a filesystem-mode
+          # PVC is accepted here and then fails inside the OSD prepare job.
+          volumeMode: Block
+          {{- with .Values.storageCluster.storageClassName }}
+          storageClassName: {{ . | quote }}
+          {{- end }}
+          resources:
+            requests:
+              storage: {{ .Values.storageCluster.size }}

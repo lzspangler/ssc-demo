@@ -1,0 +1,75 @@
+nameOverride: "odf"
+
+namespace: openshift-storage
+
+storageCluster:
+  name: ocs-storagecluster
+
+  # --- The OSD device set -----------------------------------------------------
+  # `replica` OSDs of `size` each, one per labelled node. 3 is the minimum Ceph
+  # will accept for a replica-3 pool, and the demo never needs more.
+  #
+  # `storageClassName` must be a BLOCK class that provisions dynamically. On AWS
+  # that is gp3-csi; on vSphere thin-csi; on bare metal use the Local Storage
+  # Operator and point this at its class. Leave empty to use the cluster
+  # default, which is only correct when that default is block.
+  storageClassName: gp3-csi
+  size: 512Gi
+  replica: 3
+
+  # lean | balanced | performance. The demo cluster also runs GitLab, Quay,
+  # Keycloak, RHTPA, Artifactory and Tekton builds, and `balanced` reserves
+  # noticeably more CPU per OSD than this workload ever uses. Raise it if Ceph
+  # becomes the bottleneck rather than the thing starving everything else.
+  resourceProfile: lean
+
+  # The Multicloud Object Gateway. This is the ONLY part of ODF ssc-demo
+  # actually needs -- it is what provides the `openshift-storage.noobaa.io`
+  # StorageClass that RHTPA's ObjectBucketClaim and Quay's managed
+  # objectstorage are both raised against. Ceph RBD/CephFS come along with it.
+  multiCloudGateway: true
+
+# --- Node labelling -----------------------------------------------------------
+# ODF schedules OSDs only onto nodes carrying
+# `cluster.ocs.openshift.io/openshift-storage`. The web console applies that
+# label for you; a CR applied by GitOps has nobody to do it, and the symptom is
+# silent -- the StorageCluster stays Progressing with OSD pods Pending and no
+# event that says "no labelled nodes".
+#
+# This Job labels `storageCluster.replica` nodes before the CR is created. It
+# prefers nodes that are workers and NOT control-plane, so a cluster with
+# dedicated workers keeps Ceph off the masters; where every node is a master
+# (compact clusters) it falls back to using them.
+nodeLabeller:
+  enabled: true
+  # Set to pin exact nodes instead of letting the Job choose, e.g.
+  #   nodes: [ip-10-0-53-166.us-east-2.compute.internal, ...]
+  nodes: []
+
+# --- Readiness gate -----------------------------------------------------------
+# Argo CD has no health check for StorageCluster, so without this the
+# Application reports Healthy the moment the CR is accepted and the next sync
+# wave starts building Quay and RHTPA against a Ceph that has no OSDs yet.
+# A PostSync hook keeps the Application Progressing until ODF is genuinely up.
+readinessGate:
+  enabled: true
+  # ODF on three fresh EBS volumes is usually ready in 10-20 minutes. The Job
+  # fails rather than hangs past this, so the Application shows a failed hook
+  # instead of sitting in Progressing forever.
+  timeoutSeconds: 2700
+
+# Pure-stdlib Python against the Kubernetes API. Deliberately NOT an image that
+# needs `oc`, and deliberately not `microdnf install` at runtime -- under the
+# restricted SCC's arbitrary UID that always fails. ubi9/python-39 is public,
+# needs no pull secret, and ships python3.
+jobImage: registry.access.redhat.com/ubi9/python-39:latest
+
+# The labelling Job is an ordinary synced resource rather than a PreSync hook
+# on purpose: it needs the ServiceAccount and ClusterRole below it, and PreSync
+# hooks run before the sync phase that would create them. Argo treats a
+# completed Job as Healthy, so a plain wave ordering gates the StorageCluster
+# just as well.
+syncWaves:
+  rbac: "-4"
+  labelNodes: "-3"
+  storageCluster: "-2"

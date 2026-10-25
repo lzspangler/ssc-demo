@@ -1,0 +1,9 @@
+dependencies:
+- name: odf-operator
+  repository: file://odf-operator
+  version: 0.1.0
+- name: odf-storagecluster
+  repository: file://odf-storagecluster
+  version: 0.1.0
+digest: sha256:ba33fcb6d3afac79e75c721a49abea0fa37aa170d04e623cbae9a091e97025fc
+generated: "2026-10-20T20:49:12.296438-04:00"

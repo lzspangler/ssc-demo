@@ -1,0 +1,25 @@
+---
+# The odf-operator CSV is a meta-package: OLM resolves it into ocs-operator,
+# mcg-operator (the Multicloud Object Gateway / NooBaa), rook-ceph and the
+# CSI addons alongside it. Subscribing to odf-operator alone is enough, and
+# subscribing to the pieces individually is how you get a version skew.
+#
+# The StorageCluster CR in the sibling subchart is applied at a later sync wave
+# and inherits SkipDryRunOnMissingResource from the Application, because on a
+# first install storageclusters.ocs.openshift.io does not exist yet when Argo
+# renders it.
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ include "odf-operator.name" . }}-operator
+  namespace: {{ include "odf-operator.namespace" . }}
+  labels:
+    {{- include "odf-operator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWave | quote }}
+spec:
+  channel: {{ .Values.subscription.channel }}
+  installPlanApproval: {{ .Values.subscription.installPlanApproval }}
+  name: {{ .Values.subscription.name }}
+  source: {{ .Values.subscription.source }}
+  sourceNamespace: {{ .Values.subscription.sourceNamespace }}

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: odf
+description: >-
+  OpenShift Data Foundation for ssc-demo: the operator, a StorageCluster backed
+  by the cluster's block storage class, and the Multicloud Object Gateway that
+  RHTPA's S3 bucket and Quay's object storage are both raised against.
+type: application
+version: 0.1.0
+
+dependencies:
+  - name: odf-operator
+    version: 0.1.0
+    repository: file://odf-operator
+  - name: odf-storagecluster
+    version: 0.1.0
+    repository: file://odf-storagecluster

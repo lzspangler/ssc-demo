@@ -1,0 +1,54 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "odf-storagecluster.serviceAccountName" . }}
+  namespace: {{ include "odf-storagecluster.namespace" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+---
+# Nodes are cluster-scoped, so the labelling Job needs a ClusterRole; there is
+# no namespaced way to patch one. Kept to exactly list/get/patch on nodes
+# rather than binding `cluster-admin`, because this runs on every sync.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "odf-storagecluster.serviceAccountName" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+  # The readiness gate reads the StorageCluster and the NooBaa CR, and checks
+  # that MCG's StorageClass has appeared. Read-only.
+  - apiGroups: ["ocs.openshift.io"]
+    resources: ["storageclusters"]
+    verbs: ["get", "list"]
+  - apiGroups: ["noobaa.io"]
+    resources: ["noobaas"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "odf-storagecluster.serviceAccountName" . }}
+  labels:
+    {{- include "odf-storagecluster.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.rbac | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "odf-storagecluster.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "odf-storagecluster.serviceAccountName" . }}
+    namespace: {{ include "odf-storagecluster.namespace" . }}

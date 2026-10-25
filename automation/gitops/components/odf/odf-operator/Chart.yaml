@@ -1,0 +1,5 @@
+apiVersion: v2
+name: odf-operator
+description: Namespace, OperatorGroup and OLM Subscription for the OpenShift Data Foundation operator.
+type: application
+version: 0.1.0

@@ -1,0 +1,14 @@
+---
+# ODF's namespace is created here rather than left to CreateNamespace=true,
+# because it needs the cluster-monitoring label: without it Prometheus does not
+# scrape Ceph, and the ODF console reports the cluster as unknown rather than
+# healthy. Argo's CreateNamespace makes a bare namespace with no labels.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "odf-operator.namespace" . }}
+  labels:
+    {{- include "odf-operator.labels" . | nindent 4 }}
+    openshift.io/cluster-monitoring: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWave | quote }}

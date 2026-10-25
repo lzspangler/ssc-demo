@@ -1,0 +1,44 @@
+# =============================================================================
+# OpenShift Data Foundation for ssc-demo.
+#
+# OPTIONAL. Most Red Hat workshop clusters arrive with ODF already installed,
+# and on those this component stays disabled -- installing a second
+# StorageCluster is not something you can undo cleanly. Enable it only on a
+# cluster where `oc get storagecluster -A` comes back empty.
+#
+# What depends on it:
+#   * components.rhtpa.storage.type: s3 -- an ObjectBucketClaim against
+#     openshift-storage.noobaa.io
+#   * components.quay.objectStorageManaged: true -- the operator raises its own
+#     ObjectBucketClaim the same way
+#
+# Both have fallbacks (filesystem RHTPA, Quay disabled) documented in
+# ../../README.md, but S3 is the path the reference cluster uses.
+#
+# Values nest under the subchart name, as with the quay umbrella chart:
+# `odf-operator.subscription.channel`, `odf-storagecluster.storageCluster.size`.
+# =============================================================================
+
+odf-operator:
+  namespace: openshift-storage
+  subscription:
+    # Must match the cluster's OpenShift minor. See the subchart's values.yaml.
+    channel: stable-4.21
+    source: redhat-operators
+
+odf-storagecluster:
+  namespace: openshift-storage
+  storageCluster:
+    # The block StorageClass Ceph carves its OSDs out of -- NOT the class
+    # anything else in the demo consumes. gp3-csi on AWS.
+    storageClassName: gp3-csi
+    size: 512Gi
+    replica: 3
+    resourceProfile: lean
+    multiCloudGateway: true
+  nodeLabeller:
+    enabled: true
+    nodes: []
+  readinessGate:
+    enabled: true
+    timeoutSeconds: 2700
