@@ -1,0 +1,152 @@
+{{- if and .Values.pipelines.enabled .Values.chains.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chains-bootstrap
+  namespace: {{ .Values.chains.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+data:
+  bootstrap.py: |
+    # Configure Tekton Chains to sign images and emit SLSA provenance.
+    #
+    # Two jobs in one, both idempotent because this runs on every Argo sync:
+    #   1. populate `signing-secrets` with a cosign keypair, IF it is still empty
+    #   2. patch TektonConfig .spec.chain with the signing/attestation settings
+    #
+    # Why a Job rather than a plain manifest: TektonConfig is created by the
+    # OpenShift Pipelines operator and is cluster-scoped and heavily defaulted.
+    # Having Argo own the whole object would fight the operator; a merge-patch
+    # of just .spec.chain does not.
+    #
+    # Pure stdlib against the in-cluster API -- no oc, no pip install at runtime.
+    import base64, json, os, ssl, sys, time, urllib.error, urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    NS = os.environ["CHAINS_NAMESPACE"]
+    SECRET = "signing-secrets"
+    token = open(SA + "/token").read().strip()
+    ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+
+    def call(path, method="GET", body=None, ctype="application/json"):
+        req = urllib.request.Request(
+            API + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                     **({"Content-Type": ctype} if body is not None else {})})
+        try:
+            with urllib.request.urlopen(req, context=ctx) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()[:300]
+
+    # ---- 1. signing key -----------------------------------------------------
+    st, sec = call("/api/v1/namespaces/%s/secrets/%s" % (NS, SECRET))
+    if st != 200:
+        sys.exit("ERROR: reading %s/%s: %s %s" % (NS, SECRET, st, sec))
+    data = sec.get("data") or {}
+    if data.get("cosign.key"):
+        print("signing key: already present, leaving it alone")
+    else:
+        # Written by the cosign initContainer.
+        key = open("/work/cosign.key", "rb").read()
+        pub = open("/work/cosign.pub", "rb").read()
+        pw = open("/work/password", "rb").read().strip()
+        body = {"data": {
+            "cosign.key": base64.b64encode(key).decode(),
+            "cosign.pub": base64.b64encode(pub).decode(),
+            "cosign.password": base64.b64encode(pw).decode(),
+        }}
+        st, err = call("/api/v1/namespaces/%s/secrets/%s" % (NS, SECRET), "PATCH",
+                       body, "application/strategic-merge-patch+json")
+        if st != 200:
+            sys.exit("ERROR: patching %s: %s %s" % (SECRET, st, err))
+        print("signing key: generated and stored in", SECRET)
+
+    # ---- 2. TektonConfig .spec.chain ---------------------------------------
+    # The operator creates TektonConfig asynchronously after the Subscription
+    # resolves, so wait rather than failing the first sync.
+    chain = json.loads(os.environ["CHAIN_CONFIG"])
+    deadline = time.time() + int(os.environ.get("TIMEOUT_SECONDS", "900"))
+    while True:
+        st, cfg = call("/apis/operator.tekton.dev/v1alpha1/tektonconfigs/config")
+        if st == 200:
+            break
+        if time.time() > deadline:
+            sys.exit("TIMEOUT: TektonConfig/config never appeared (%s)" % st)
+        print("waiting for TektonConfig/config ... (%s)" % st, flush=True)
+        time.sleep(15)
+
+    current = (cfg.get("spec") or {}).get("chain") or {}
+    if all(str(current.get(k)) == str(v) for k, v in chain.items()):
+        print("TektonConfig .spec.chain: already correct")
+    else:
+        st, err = call("/apis/operator.tekton.dev/v1alpha1/tektonconfigs/config",
+                       "PATCH", {"spec": {"chain": chain}},
+                       "application/merge-patch+json")
+        if st != 200:
+            sys.exit("ERROR: patching TektonConfig: %s %s" % (st, err))
+        print("TektonConfig .spec.chain: updated ->", json.dumps(chain))
+
+    print("OK: Tekton Chains configured for signing + SLSA provenance")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: chains-bootstrap
+  namespace: {{ .Values.chains.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+    # A Job's pod template is immutable; Replace is also how you re-run it.
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "pipelines.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: chains-bootstrap
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: scripts
+          configMap:
+            name: chains-bootstrap
+      initContainers:
+        # Generates cosign.key/cosign.pub into the shared dir. Always runs; the
+        # main container decides whether to actually store them, so a re-sync
+        # never rotates a key that pipelines have already signed with.
+        - name: keygen
+          image: {{ .Values.chains.cosignImage }}
+          workingDir: /work
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              head -c 24 /dev/urandom | base64 | tr -d '\n' > /work/password
+              COSIGN_PASSWORD="$(cat /work/password)" cosign generate-key-pair
+          volumeMounts:
+            - {name: work, mountPath: /work}
+      containers:
+        - name: bootstrap
+          image: {{ .Values.chains.jobImage }}
+          env:
+            - name: CHAINS_NAMESPACE
+              value: {{ .Values.chains.namespace | quote }}
+            - name: CHAIN_CONFIG
+              value: |
+                {{- include "pipelines.chainConfig" . | nindent 16 }}
+          command: ["python3", "-I", "/scripts/bootstrap.py"]
+          volumeMounts:
+            - {name: work, mountPath: /work}
+            - {name: scripts, mountPath: /scripts}
+{{- end }}

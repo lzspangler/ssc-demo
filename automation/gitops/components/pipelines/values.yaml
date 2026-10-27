@@ -11,6 +11,47 @@ pipelines:
   syncWaves:
     operator: "1"
     userinfo: "3"
+    # After the operator, because the Job patches the TektonConfig the operator
+    # creates. The Job waits for it rather than assuming it is already there.
+    chains: "4"
+
+# -----------------------------------------------------------------------------
+# Tekton Chains -- image signing + SLSA provenance attestations.
+#
+# The OpenShift Pipelines operator already SHIPS Chains and creates an empty
+# `signing-secrets`. With no key in it, Chains reconciles every TaskRun, marks
+# it `chains.tekton.dev/signed: "true"`, and silently signs nothing -- there is
+# no error anywhere, you just never get a .sig or .att in the registry. That is
+# the failure this section exists to prevent.
+#
+# What you get once configured:
+#   <image>.sig   simplesigning image signature
+#   <image>.att   in-toto SLSA provenance attestation
+#   a Rekor transparency-log entry, recorded on the TaskRun as
+#   `chains.tekton.dev/transparency`
+#
+# Verify with the public key from the Secret:
+#   oc -n openshift-pipelines get secret signing-secrets \
+#     -o jsonpath='{.data.cosign\.pub}' | base64 -d > /tmp/cosign.pub
+#   cosign verify --key /tmp/cosign.pub <image>
+#   cosign verify-attestation --key /tmp/cosign.pub --type slsaprovenance <image>
+# -----------------------------------------------------------------------------
+chains:
+  enabled: true
+  # Where Chains and its signing-secrets live. Fixed by the operator.
+  namespace: openshift-pipelines
+  transparency:
+    # Log signatures to Rekor. Requires RHTAS (components.rhtas) -- turn this
+    # off on a cluster without it, or the Chains controller logs an endless
+    # stream of upload failures.
+    enabled: true
+    # The in-cluster Service, deliberately NOT the Route.
+    url: "http://rekor-server.trusted-artifact-signer.svc"
+  # Same cosign build the buildah-rhtap task uses, so there is one cosign
+  # version in the platform rather than two.
+  cosignImage: registry.redhat.io/rhtas/cosign-rhel9@sha256:6fa39582a3d62a2aa5404397bb638fdd0960f9392db659d033d7bacf70bddfb1
+  # Pure-stdlib Python against the API; no oc, no runtime pip install.
+  jobImage: registry.access.redhat.com/ubi9/python-39:latest
 
 # OLM install into openshift-operators (AllNamespaces; OperatorGroup already exists)
 operator:
