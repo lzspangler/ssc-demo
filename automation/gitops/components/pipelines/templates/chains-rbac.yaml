@@ -1,0 +1,79 @@
+{{- if and .Values.pipelines.enabled .Values.chains.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chains-bootstrap
+  namespace: {{ .Values.chains.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+---
+# Narrow on purpose: only the one Secret Chains signs with. This Job runs on
+# every sync, so it should never hold broader rights than it needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chains-bootstrap
+  namespace: {{ .Values.chains.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["signing-secrets"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chains-bootstrap
+  namespace: {{ .Values.chains.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: chains-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: chains-bootstrap
+    namespace: {{ .Values.chains.namespace }}
+---
+# TektonConfig is CLUSTER-scoped, so configuring Chains needs a ClusterRole --
+# there is no namespaced path to it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: chains-bootstrap
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+rules:
+  - apiGroups: ["operator.tekton.dev"]
+    resources: ["tektonconfigs"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: chains-bootstrap
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.chains | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: chains-bootstrap
+subjects:
+  - kind: ServiceAccount
+    name: chains-bootstrap
+    namespace: {{ .Values.chains.namespace }}
+{{- end }}

@@ -1,6 +1,9 @@
 {{- $domain := required "Set deployer.domain to the cluster's apps subdomain" .Values.deployer.domain }}
 {{- $realm := .Values.components.keycloak.realm }}
 {{- $issuer := printf "https://sso.%s/realms/%s" $domain $realm }}
+{{- if and .Values.components.rhtpa.enabled .Values.components.rhtpaOperator.enabled }}
+{{- fail "components.rhtpa and components.rhtpaOperator are mutually exclusive: the first installs RHTPA 2.x from the charts.openshift.io Helm chart, the second installs RHTPA 3.x via the operator. They publish the same Route and own the same Deployments. Enable exactly one." }}
+{{- end }}
 {{- if and .Values.components.keycloak.enabled .Values.components.keycloakClients.enabled }}
 {{- fail "components.keycloak and components.keycloakClients are mutually exclusive: the first installs a Keycloak that claims the sso.<domain> Route, the second provisions ssc-demo's clients into one that already exists. Enable exactly one." }}
 {{- end }}
@@ -486,6 +489,53 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.rhtpaPrerequisites.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
+{{- if .Values.components.rhtpaOperator.enabled }}
+{{- $ro := .Values.components.rhtpaOperator }}
+# -----------------------------------------------------------------------------
+# RHTPA 3.x via the operator -- the alternative to the Helm-chart component
+# below, and the only form Exploit Intelligence can integrate with.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-rhtpa-operator
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $ro.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/rhtpa-operator
+    helm:
+      valuesObject:
+        domain: {{ $domain | quote }}
+        namespace: {{ $ro.namespace | quote }}
+        createOperatorGroup: {{ $ro.createOperatorGroup }}
+        subscription:
+          channel: {{ $ro.channel | quote }}
+        trustedProfileAnalyzer:
+          routeTimeout: {{ $ro.routeTimeout | quote }}
+          storage:
+            type: {{ $ro.storage.type | quote }}
+            bucket: {{ $ro.storage.bucket | quote }}
+            regionEndpoint: {{ $ro.storage.regionEndpoint | quote }}
+          oidc:
+            # Same $issuer the rest of the platform uses, so the clients the
+            # keycloak-clients component provisions cannot disagree with it.
+            issuerUrl: {{ $issuer | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ro.namespace }}
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 

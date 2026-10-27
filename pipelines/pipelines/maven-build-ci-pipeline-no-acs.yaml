@@ -193,6 +193,10 @@ spec:
           value: $(params.build-args-file)
         - name: SBOMS_DIR
           value: $(params.sboms-dir)
+        - name: LABELS
+          value: |
+            org.opencontainers.image.source=$(tasks.clone-repository.results.url)
+            org.opencontainers.image.revision=$(tasks.clone-repository.results.commit)
       runAfter:
         - package
       taskRef:

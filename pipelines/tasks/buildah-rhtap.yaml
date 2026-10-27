@@ -44,6 +44,29 @@ spec:
     description: Directory where the sbom will be saved
     type: string
     default: sboms
+  - name: LABELS
+    description: >-
+      Newline-separated "key=value" labels stamped onto the image with
+      --label. Blank lines are ignored.
+
+      A STRING rather than an array on purpose: the build step already
+      consumes BUILD_ARGS through "$@", and a second array parameter would
+      merge into the same positional list with no way to tell the two apart.
+
+      WHY THIS EXISTS. Set the two standard OCI source annotations here:
+
+        org.opencontainers.image.source=<git url>
+        org.opencontainers.image.revision=<commit sha>
+
+      syft reads image labels into the CycloneDX SBOM as
+      `syft:image:labels:<key>` properties under metadata.properties, which is
+      where RHTPA Exploit Intelligence looks for the source repository and
+      commit it needs to do call-chain analysis. Without them the SBOM
+      describes an image whose source EI cannot locate, and the analysis
+      cannot run. They also make the published image self-describing, which
+      is worth having regardless.
+    type: string
+    default: ""
   results:
   - description: Digest of the image just built
     name: IMAGE_DIGEST
@@ -69,6 +92,8 @@ spec:
       value: $(params.BUILD_ARGS_FILE)
     - name: SBOMS_DIR
       value: $(workspaces.source.path)/$(params.SBOMS_DIR)
+    - name: LABELS
+      value: $(params.LABELS)
   steps:
   - name: build
     image: registry.access.redhat.com/ubi9/buildah@sha256:4b82b66a71857c5167abd344cd63bebe3b8026b04b1f35fde4789868dae0af8d
@@ -97,6 +122,16 @@ spec:
       if [ -n "${BUILD_ARGS_FILE}" ]; then
         BUILDAH_ARGS+=("--build-arg-file=${SOURCE_CODE_DIR}/${BUILD_ARGS_FILE}")
       fi
+
+      # Newline-separated key=value pairs -> --label. Read with `read -r` so a
+      # value containing spaces survives; skip blanks so an empty LABELS (the
+      # default) adds nothing.
+      while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        BUILDAH_ARGS+=("--label=$label")
+      done <<EOF
+      ${LABELS}
+      EOF
 
       for build_arg in "$@"; do
         BUILDAH_ARGS+=("--build-arg=$build_arg")
@@ -148,8 +183,13 @@ spec:
     # (need to set the workdir, see https://github.com/anchore/syft/issues/2465)
     workingDir: $(workspaces.source.path)/source
     script: |
-      syft dir:$(workspaces.source.path)/source --output cyclonedx-json@1.5=/tmp/files/sbom-source.json
-      syft oci-dir:/tmp/files/image --output cyclonedx-json@1.5=/tmp/files/sbom-image.json
+      # CycloneDX 1.6, not 1.5: RHTPA Exploit Intelligence accepts CycloneDX 1.6
+      # or SPDX 2.3 only, and silently has nothing to work with otherwise. 1.6
+      # is a superset here -- RHTPA ingests it the same way, and the
+      # `syft:image:labels:*` properties the LABELS param produces are carried
+      # identically.
+      syft dir:$(workspaces.source.path)/source --output cyclonedx-json@1.6=/tmp/files/sbom-source.json
+      syft oci-dir:/tmp/files/image --output cyclonedx-json@1.6=/tmp/files/sbom-image.json
     volumeMounts:
     - mountPath: /var/lib/containers
       name: varlibcontainers
