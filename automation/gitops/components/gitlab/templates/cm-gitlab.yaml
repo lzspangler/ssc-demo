@@ -24,12 +24,12 @@ data:
   REDIS_HOST: gitlab-redis.{{ $.Release.Namespace }}.svc
   REDIS_PORT: "6379"
   SMTP_AUTHENTICATION: login
-  SMTP_DOMAIN: {{ $.Values.gitlab.smtp.domain }}
+  SMTP_DOMAIN: {{ $.Values.gitlab.smtp.domain | quote }}
   SMTP_ENABLED: "{{ $.Values.gitlab.smtp.enabled }}"
-  SMTP_HOST: {{ $.Values.gitlab.smtp.host }}
+  SMTP_HOST: {{ $.Values.gitlab.smtp.host | quote }}
   SMTP_PORT: "{{ $.Values.gitlab.smtp.port }}"
   SMTP_STARTTLS: "true"
-  SMTP_USER: {{ $.Values.gitlab.smtp.user }}
+  SMTP_USER: {{ $.Values.gitlab.smtp.user | quote }}
   TZ: UTC
 kind: ConfigMap
 metadata:

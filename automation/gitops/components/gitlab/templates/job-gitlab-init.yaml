@@ -8,7 +8,15 @@ metadata:
     # playbook makes the next Argo sync fail with "field is immutable" and the
     # cluster quietly keeps the old seeding. Replace deletes and recreates it,
     # which is also how you re-seed: bump anything in the ConfigMap and sync.
-    argocd.argoproj.io/sync-options: Replace=true
+    # Force=true is REQUIRED with Replace=true for a Job. Replace alone runs
+    # `kubectl replace`, which the API server rejects because the live Job
+    # carries a server-generated spec.selector and controller-uid labels the
+    # rendered manifest does not:
+    #   spec.selector: Required value / `selector` does not match template
+    #   `labels` / spec.selector: field is immutable
+    # The Application then sits OutOfSync forever with a failing sync, which
+    # also blocks every OTHER resource in the same Application from syncing.
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
 spec:
   backoffLimit: 100
   template:
