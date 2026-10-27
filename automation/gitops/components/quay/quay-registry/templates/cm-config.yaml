@@ -297,6 +297,13 @@ data:
             validate_certs: false
             status_code: [200, 201]
 
+        # 400 is tolerated because this Job re-runs on every sync (Replace +
+        # Force), and Quay answers a repeat membership PUT with
+        #   400 {"message": "User <robot> is already a member of team <team>"}
+        # rather than a 200. Without it the task fails, the Job burns through
+        # its backoffLimit, and the whole Application reports Degraded even
+        # though Quay is configured correctly. Every other re-runnable task in
+        # this playbook already accepts 400 for the same reason.
         - name: Add the robot to the {{ $p.teamName }} team
           ansible.builtin.uri:
             url: '{{ "{{" }} quay_api {{ "}}" }}/api/v1/organization/{{ $p.organization }}/team/{{ $p.teamName }}/members/{{ $robot }}'
@@ -304,7 +311,7 @@ data:
             headers:
               Authorization: 'Bearer {{ "{{" }} quay_token {{ "}}" }}'
             validate_certs: false
-            status_code: [200, 201]
+            status_code: [200, 201, 400]
 {{- if $p.grantWritePrototype }}
 
         # The team role covers repositories the robot creates itself. This
