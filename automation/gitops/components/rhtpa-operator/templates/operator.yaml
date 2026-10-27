@@ -1,0 +1,40 @@
+{{- if .Values.createOperatorGroup }}
+---
+# The rhtpa-operator CSV supports only OwnNamespace/SingleNamespace, so it
+# cannot go into openshift-operators (AllNamespaces) the way the Quay and
+# Pipelines operators do -- OLM would reject an empty targetNamespaces.
+#
+# Guarded by a value rather than created unconditionally: a namespace with two
+# OperatorGroups puts EVERY operator in it into an error state, and the symptom
+# (a CSV stuck in Failed, workloads still running) does not mention
+# OperatorGroups at all. Check before enabling:
+#   oc -n {{ .Values.namespace }} get operatorgroup
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: rhtpa-operator-group
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "rhtpa-operator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.operator | quote }}
+spec:
+  targetNamespaces:
+    - {{ .Values.namespace }}
+{{- end }}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ .Values.subscription.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "rhtpa-operator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.operator | quote }}
+spec:
+  channel: {{ .Values.subscription.channel }}
+  installPlanApproval: {{ .Values.subscription.installPlanApproval }}
+  name: {{ .Values.subscription.name }}
+  source: {{ .Values.subscription.source }}
+  sourceNamespace: {{ .Values.subscription.sourceNamespace }}

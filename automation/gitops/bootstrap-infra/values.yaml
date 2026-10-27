@@ -275,6 +275,38 @@ components:
     namespace: trusted-profile-analyzer
     syncWave: "10"
 
+  # RHTPA 3.x via the operator. MUTUALLY EXCLUSIVE with `rhtpa` below -- both
+  # publish the same Route and own the same Deployments, so bootstrap-infra
+  # fails the render if both are on.
+  #
+  # Enable this INSTEAD OF `rhtpa` when you need Exploit Intelligence: it
+  # integrates through `spec.exploitIntelligence` on the TrustedProfileAnalyzer
+  # CR, which the charts.openshift.io Helm chart has no equivalent for.
+  #
+  # `rhtpaPrerequisites` stays enabled either way -- Postgres, the S3
+  # ObjectBucketClaim and the oidc-tpa-cli Secret are shared, and this
+  # component reuses all three. That is what keeps the switch a swap rather
+  # than a rebuild.
+  #
+  # MIGRATING AN EXISTING INSTALL is not just a flag flip: Trustify 2.x -> 3.x
+  # is a major version, and the operator's own migrateDatabase module runs
+  # against the SAME Postgres the old release used. Take a database backup
+  # first, and expect the Route to be briefly unavailable during the cutover.
+  rhtpaOperator:
+    enabled: false
+    namespace: trusted-profile-analyzer
+    syncWave: "15"
+    # stable-v3 is RHTPA 3.x, the first line Exploit Intelligence supports.
+    channel: stable-v3
+    # Set false if the namespace already has an OperatorGroup -- two in one
+    # namespace puts every operator in it into an error state.
+    createOperatorGroup: true
+    routeTimeout: 300s
+    storage:
+      type: s3
+      bucket: trustify
+      regionEndpoint: ""
+
   rhtpa:
     enabled: true
     namespace: trusted-profile-analyzer

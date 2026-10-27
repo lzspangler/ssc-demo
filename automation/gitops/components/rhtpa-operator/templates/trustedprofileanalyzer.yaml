@@ -1,0 +1,129 @@
+{{- $t := .Values.trustedProfileAnalyzer }}
+---
+# The TrustedProfileAnalyzer CR.
+#
+# NOTE ON VALIDATION: the CRD declares `spec` as a bare object with
+# `x-kubernetes-preserve-unknown-fields: true` and no property schema -- this
+# is a Helm-based operator and spec passes straight through to the bundled
+# chart's values. So the API server will accept ANY shape here, including
+# typos, and a misspelt key fails silently as "the setting had no effect"
+# rather than as a rejected resource. Change fields deliberately and check the
+# rendered Deployments afterwards.
+#
+# The shape mirrors the charts.openshift.io values this replaces, which is what
+# makes the migration a swap rather than a rewrite.
+apiVersion: rhtpa.io/v1
+kind: TrustedProfileAnalyzer
+metadata:
+  name: {{ $t.name }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "rhtpa-operator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.instance | quote }}
+spec:
+  # A SUFFIX, not a hostname -- the server is published at `server<appDomain>`.
+  appDomain: {{ include "rhtpa-operator.appDomain" . | quote }}
+  partOf: {{ $t.partOf }}
+
+  openshift:
+    useServiceCa: true
+
+  ingress:
+    # HAProxy's `timeout server`. The Route is GENERATED from an Ingress by the
+    # ingress-to-route controller and carries an ownerReference, so annotating
+    # the Route directly is reverted -- the annotation has to go here.
+    additionalAnnotations:
+      haproxy.router.openshift.io/timeout: {{ $t.routeTimeout | quote }}
+
+  database:
+    host: {{ $t.database.host | quote }}
+    port: {{ $t.database.port | quote }}
+    name: {{ $t.database.name | quote }}
+    username: {{ $t.database.username | quote }}
+    sslMode: {{ $t.database.sslMode | quote }}
+    password:
+      valueFrom:
+        secretKeyRef:
+          name: {{ $t.database.passwordSecret.name | quote }}
+          key: {{ $t.database.passwordSecret.key | quote }}
+
+  storage:
+    type: {{ $t.storage.type | quote }}
+    {{- if eq $t.storage.type "s3" }}
+    bucket: {{ $t.storage.bucket | quote }}
+    region: {{ include "rhtpa-operator.s3Endpoint" . | quote }}
+    accessKey:
+      valueFrom:
+        secretKeyRef:
+          name: {{ $t.storage.credentialsSecret | quote }}
+          key: AWS_ACCESS_KEY_ID
+    secretKey:
+      valueFrom:
+        secretKeyRef:
+          name: {{ $t.storage.credentialsSecret | quote }}
+          key: AWS_SECRET_ACCESS_KEY
+    {{- end }}
+
+  oidc:
+    issuerUrl: {{ required "Set trustedProfileAnalyzer.oidc.issuerUrl" $t.oidc.issuerUrl | quote }}
+    clients:
+      cli:
+        clientId: {{ $t.oidc.cliClientId | quote }}
+        clientSecret:
+          valueFrom:
+            secretKeyRef:
+              name: {{ $t.oidc.cliClientSecret.name | quote }}
+              key: {{ $t.oidc.cliClientSecret.key | quote }}
+      frontend:
+        clientId: {{ $t.oidc.frontendClientId | quote }}
+
+  modules:
+    createDatabase:
+      enabled: {{ $t.modules.createDatabase }}
+    migrateDatabase:
+      enabled: {{ $t.modules.migrateDatabase }}
+    createImporters:
+      enabled: {{ $t.modules.createImporters }}
+      importers:
+        {{- with $t.importers.cve }}
+        cve:
+          cve:
+            description: "CVE list v5"
+            disabled: {{ not .enabled }}
+            period: {{ .period | quote }}
+            source: {{ .source | quote }}
+        {{- end }}
+        {{- with (index $t.importers "osv-github") }}
+        osv-github:
+          osv:
+            description: "GitHub Advisory Database"
+            disabled: {{ not .enabled }}
+            path: {{ .path | quote }}
+            period: {{ .period | quote }}
+            source: {{ .source | quote }}
+        {{- end }}
+        {{- with (index $t.importers "redhat-csaf") }}
+        redhat-csaf:
+          csaf:
+            description: "All Red Hat CSAF data"
+            disabled: {{ not .enabled }}
+            fetchRetries: {{ .fetchRetries }}
+            period: {{ .period | quote }}
+            source: {{ .source | quote }}
+        {{- end }}
+
+  {{- if .Values.exploitIntelligence.enabled }}
+  # Phase 2. Requires a running ExploitIQStack; see components/exploit-iq.
+  exploitIntelligence:
+    enabled: true
+    url: {{ required "Set exploitIntelligence.url" .Values.exploitIntelligence.url | quote }}
+    oidc:
+      clientId: {{ .Values.exploitIntelligence.oidc.clientId | quote }}
+      issuerUrl: {{ .Values.exploitIntelligence.oidc.issuerUrl | quote }}
+      clientSecret:
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.exploitIntelligence.oidc.clientSecret.name | quote }}
+            key: {{ .Values.exploitIntelligence.oidc.clientSecret.key | quote }}
+  {{- end }}

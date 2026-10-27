@@ -1,0 +1,9 @@
+apiVersion: v2
+name: rhtpa-operator
+description: >-
+  Red Hat Trusted Profile Analyzer 3.x installed via the RHTPA operator
+  (TrustedProfileAnalyzer, rhtpa.io/v1) instead of the charts.openshift.io Helm
+  chart. Required for Exploit Intelligence, which integrates through
+  spec.exploitIntelligence on this CR.
+type: application
+version: 0.1.0

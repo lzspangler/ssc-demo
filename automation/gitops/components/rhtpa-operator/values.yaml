@@ -1,0 +1,124 @@
+# =============================================================================
+# RHTPA 3.x via the operator.
+#
+# MUTUALLY EXCLUSIVE with components.rhtpa (the charts.openshift.io Helm chart,
+# which installs Trustify 2.x). Both publish the same Route hostname and own the
+# same Deployments; bootstrap-infra fails the render if both are enabled.
+#
+# WHY THIS EXISTS: Exploit Intelligence integrates through
+# `spec.exploitIntelligence` on the TrustedProfileAnalyzer CR, which only the
+# operator provides. There is no equivalent in the Helm chart, so Exploit
+# Intelligence cannot be used with a chart-installed RHTPA at all.
+#
+# WHAT IT REUSES: nothing here provisions Postgres, the S3 bucket or the OIDC
+# client secret. Those come from components.rhtpaPrerequisites exactly as
+# before, and that component stays enabled. This replaces only the RHTPA
+# application itself, which is what keeps the migration tractable:
+#   tpa-postgresql  (Secret + Deployment)  database credentials
+#   trustify        (Secret from the ObjectBucketClaim)  S3 credentials
+#   oidc-tpa-cli    (Secret)  the tpa-cli client secret
+# =============================================================================
+
+# Apps subdomain, no leading dot. Set by bootstrap-infra.
+domain: ""
+
+namespace: trusted-profile-analyzer
+
+subscription:
+  # Must track the RHTPA major you want. stable-v3 is RHTPA 3.x, which is the
+  # first line Exploit Intelligence supports.
+  channel: stable-v3
+  name: rhtpa-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+
+# The operator's CSV supports only OwnNamespace/SingleNamespace, so it needs an
+# OperatorGroup in its own namespace. Create one ONLY if that namespace has
+# none -- two OperatorGroups in a namespace put every operator in it into an
+# error state, which is a genuinely hard failure to diagnose.
+#   oc -n <ns> get operatorgroup
+createOperatorGroup: true
+
+trustedProfileAnalyzer:
+  name: trusted-profile-analyzer
+  # Appended to the hostnames the operator publishes; the server lands on
+  # `server<appDomain>`. Leave empty to derive `-trusted-profile-analyzer.<domain>`.
+  appDomain: ""
+  partOf: trustify
+
+  database:
+    host: tpa-postgresql
+    port: "5432"
+    name: trustify
+    username: trustify
+    sslMode: disable
+    # Secret created by components.rhtpaPrerequisites.
+    passwordSecret:
+      name: tpa-postgresql
+      key: database-password
+
+  storage:
+    # s3 (needs ODF/NooBaa) or filesystem. Must match the prerequisites
+    # component -- it only raises the ObjectBucketClaim in s3 mode.
+    type: s3
+    bucket: trustify
+    # NooBaa's S3 endpoint. Empty derives `https://s3-openshift-storage.<domain>:443`.
+    regionEndpoint: ""
+    credentialsSecret: trustify
+
+  oidc:
+    # Realm the cluster's Keycloak actually serves. On a bring-your-own-Keycloak
+    # cluster this is NOT `backstage` -- bootstrap-infra feeds it from
+    # components.keycloak.realm so the issuer cannot disagree with the clients
+    # the keycloak-clients component provisions.
+    issuerUrl: ""
+    cliClientId: tpa-cli
+    frontendClientId: tpa-frontend
+    cliClientSecret:
+      name: oidc-tpa-cli
+      key: client-secret
+
+  # HAProxy `timeout server` for the RHTPA Route. The 30 s default is not
+  # survivable: /purl/recommend cannot complete inside it at any batch size.
+  routeTimeout: 300s
+
+  modules:
+    createDatabase: true
+    migrateDatabase: true
+    createImporters: true
+
+  # Feed importers. redhat-csaf is the one the demo narrative needs; the other
+  # two are large and slow but give realistic breadth.
+  importers:
+    cve:
+      enabled: true
+      source: https://github.com/CVEProject/cvelistV5
+      period: 12h
+    osv-github:
+      enabled: true
+      source: https://github.com/github/advisory-database
+      path: advisories
+      period: 12h
+    redhat-csaf:
+      enabled: true
+      source: redhat.com
+      period: 12h
+      fetchRetries: 50
+
+# Phase 2 hook. Turning this on requires the exploit-iq operator and an
+# ExploitIQStack to already be running -- see components/exploit-iq.
+exploitIntelligence:
+  enabled: false
+  # Route of the exploit-iq-client service.
+  url: ""
+  oidc:
+    clientId: ""
+    issuerUrl: ""
+    clientSecret:
+      name: ""
+      key: ""
+
+syncWaves:
+  operator: "-2"
+  instance: "0"

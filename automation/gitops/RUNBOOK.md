@@ -184,6 +184,30 @@ Either way, commit and push before §5:
 git -C <your clone> commit -am "pick AI backend" && git push
 ```
 
+## 3b. RHTPA: Helm chart or operator?  ← decide before installing
+
+The default (`components.rhtpa`) installs RHTPA 2.x from
+`charts.openshift.io`. That is simpler and is what the rest of this runbook
+assumes.
+
+Switch to `components.rhtpaOperator` **only if you need Exploit
+Intelligence** — it integrates through `spec.exploitIntelligence` on the
+`TrustedProfileAnalyzer` CR, which the Helm chart has no equivalent for:
+
+```yaml
+components:
+  rhtpa:
+    enabled: false
+  rhtpaOperator:
+    enabled: true
+```
+
+The two are mutually exclusive and the render fails if both are on.
+`rhtpaPrerequisites` stays enabled either way — Postgres, the S3 bucket and
+`oidc-tpa-cli` are shared. See `components/rhtpa-operator/README.md`,
+including the migration procedure if you are switching an install that already
+has data.
+
 ## 4. Write an uncommitted overrides file
 
 Five credentials have no default and must not reach git.
