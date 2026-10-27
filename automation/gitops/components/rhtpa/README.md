@@ -1,15 +1,23 @@
-# rhtpa
+# rhtpa — prerequisites only
 
-Red Hat Trusted Profile Analyzer — the SBOM store and vulnerability analyzer
-the demo's CVE issues and remediation advice come from.
+Shared infrastructure for Red Hat Trusted Profile Analyzer: Postgres, the S3
+bucket, and the OIDC client secret.
 
-**The RHTPA chart itself is not vendored here.** It is the Red Hat chart
-`redhat-trusted-profile-analyzer` from `https://charts.openshift.io/`, pinned
-to 1.2.6, referenced directly by the `ssc-rhtpa` Argo Application. Its values
-live in `bootstrap-infra/templates/applications.yaml`, which is the only place
-to change them.
+**RHTPA itself is no longer installed from here.** It is installed by
+`components/rhtpa-operator` via the RHTPA operator
+(`TrustedProfileAnalyzer`, `rhtpa.io/v1`). The `redhat-trusted-profile-analyzer`
+Helm chart from `https://charts.openshift.io/` that this directory used to
+accompany — and the `ssc-rhtpa` Application that referenced it — have been
+removed, because Exploit Intelligence integrates through
+`spec.exploitIntelligence` on that CR and has no Helm-chart equivalent.
 
-This directory holds only what that chart expects to already exist:
+This directory survives the change untouched and is still enabled via
+`components.rhtpaPrerequisites`. The operator-installed RHTPA consumes exactly
+the same three objects, which is what made the switch a swap rather than a
+rebuild. Note it reads `storage.type` from `components.rhtpaOperator`, so the
+two cannot disagree about s3-vs-filesystem.
+
+What it provides:
 
 ```
 tpa-prerequisites/

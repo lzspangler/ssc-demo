@@ -28,7 +28,7 @@
 #   6.0.3.rhlw-00001 still sorts inside the upstream GHSA range [0, 6.4.0), so
 #   analyze keeps calling it affected no matter what VEX you load. That is why
 #   rhtpa-vulnerability-analysis makes a second pass over
-#   GET /api/v2/purl/{purl} (which DOES return fixed / not_affected) and
+#   GET /api/v3/purl/{purl} (which DOES return fixed / not_affected) and
 #   suppresses those findings. This script's --verify output is exactly the data
 #   that pass consumes, so if verification is clean, the pipeline scan is clean.
 #
@@ -80,6 +80,23 @@ secret_key() {
     || die "cannot read key '$1' from secret $SECRET in namespace $NAMESPACE (logged in with 'oc'?)"
 }
 RHTPA=$(secret_key bombastic_api_url)
+
+# --- RHTPA API version bases -------------------------------------------------
+# RHTPA 3.x moved most of the API from /api/v2 to /api/v3. For everything this
+# script touches the move is a pure rename (PurlDetails, BasePurlDetails and
+# PaginatedResults_AdvisorySummary are identical between the two), so those use
+# $V3 below.
+#
+# TWO endpoints deliberately stay on $V2, because their v3 forms return a
+# different shape than the parsing here expects, and both still exist on v2 in
+# 3.1:
+#   POST /vulnerability/analyze   AnalysisResponse -> AnalysisResponseV3
+#   GET  /sbom  (collection)      ...SbomSummary   -> ...SbomPackageSummary
+# Note /api/v2/sbom is GET-ONLY in 3.1: POST (upload) and DELETE were not
+# carried over, and /sbom/{id} does not exist on v2 at all. So the collection
+# search stays on $V2 while uploads, deletes and by-id lookups use $V3.
+V2="$RHTPA/api/v2"
+V3="$RHTPA/api/v3"
 ISSUER=$(secret_key oidc_issuer_url)
 CLIENT_ID=$(secret_key oidc_client_id)
 CLIENT_SECRET=$(secret_key oidc_client_secret)
@@ -116,10 +133,10 @@ if [[ "$MODE" == "purge" ]]; then
     local kind="$1" uuid="$2"
     echo "  deleting $kind $uuid (a 504 here is expected)"
     "${API[@]}" -X DELETE -o /dev/null -w "    DELETE -> http=%{http_code}\n" \
-      "$RHTPA/api/v2/$kind/$uuid" || true
+      "$V3/$kind/$uuid" || true
     for _ in $(seq 1 30); do
       local code
-      code=$("${API[@]}" -o /dev/null -w '%{http_code}' "$RHTPA/api/v2/$kind/$uuid" || true)
+      code=$("${API[@]}" -o /dev/null -w '%{http_code}' "$V3/$kind/$uuid" || true)
       [[ "$code" == "404" ]] && { echo "    gone"; return 0; }
       sleep 10
     done
@@ -131,7 +148,7 @@ if [[ "$MODE" == "purge" ]]; then
     doc=$(python3 -c 'import sys,json;print(json.load(open(sys.argv[1]))["id"])' "$f")
     # deprecated=Consider so superseded versions get cleaned up too.
     uuids=$("${API[@]}" --get --data-urlencode "q=$doc" --data-urlencode 'deprecated=Consider' \
-      "$RHTPA/api/v2/advisory" | python3 -c '
+      "$V3/advisory" | python3 -c '
 import sys, json
 for i in json.load(sys.stdin).get("items", []):
     print(i["uuid"])' || true)
@@ -141,7 +158,7 @@ for i in json.load(sys.stdin).get("items", []):
   for f in "$DATA_DIR"/sbom/*.cdx.json; do
     [[ -e "$f" ]] || continue
     serial=$(python3 -c 'import sys,json;print(json.load(open(sys.argv[1]))["serialNumber"])' "$f")
-    uuids=$("${API[@]}" --get --data-urlencode "q=$serial" "$RHTPA/api/v2/sbom" | python3 -c '
+    uuids=$("${API[@]}" --get --data-urlencode "q=$serial" "$V2/sbom" | python3 -c '
 import sys, json
 for i in json.load(sys.stdin).get("items", []):
     print(i["id"])' || true)
@@ -167,7 +184,7 @@ d = json.load(open(sys.argv[1]))
 if not d.get("aliases"):
     sys.exit("%s has no aliases -- it would ingest but link no vulnerability" % sys.argv[1])' "$f"
     resp=$("${API[@]}" -X POST -H 'content-type: application/json' --data-binary "@$f" \
-      "$RHTPA/api/v2/advisory?format=osv&labels.source=lightwell&labels.tier=remediated")
+      "$V3/advisory?format=osv&labels.source=lightwell&labels.tier=remediated")
     python3 -c '
 import sys, json
 try:
@@ -184,7 +201,7 @@ print("  %-20s -> %s" % (sys.argv[1].rsplit("/", 1)[-1], r["id"]))' "$f" "$resp"
   for f in "$DATA_DIR"/sbom/*.cdx.json; do
     [[ -e "$f" ]] || die "no SBOMs under $DATA_DIR/sbom"
     resp=$("${API[@]}" -X POST -H 'content-type: application/json' --data-binary "@$f" \
-      "$RHTPA/api/v2/sbom?labels.source=lightwell&labels.tier=remediated")
+      "$V3/sbom?labels.source=lightwell&labels.tier=remediated")
     python3 -c '
 import sys, json
 try:
@@ -220,7 +237,7 @@ for pair in "${PAIRS[@]}"; do
   # /purl/base/{key} takes the url-encoded base PURL directly -- the `q=` search
   # does NOT match on a full purl string, only on name fragments.
   base_no_version="${base%@*}"
-  versions=$("${API[@]}" "$RHTPA/api/v2/purl/base/$(urlenc "$base_no_version")" | python3 -c '
+  versions=$("${API[@]}" "$V3/purl/base/$(urlenc "$base_no_version")" | python3 -c '
 import sys, json
 try:
     print(" ".join(v.get("version", "") for v in json.load(sys.stdin).get("versions", [])))
@@ -239,7 +256,7 @@ except Exception:
   # 2. For every CVE that still matches the remediated PURL by version range,
   #    is there an explicit fixed / not_affected status to suppress it? Any CVE
   #    left with only `affected` is one the pipeline scan will still report.
-  "${API[@]}" "$RHTPA/api/v2/purl/$(urlenc "$remediated")" > /tmp/lw-purl.json || true
+  "${API[@]}" "$V3/purl/$(urlenc "$remediated")" > /tmp/lw-purl.json || true
   python3 - /tmp/lw-purl.json <<'PY' || RC=1
 import collections, json, sys
 

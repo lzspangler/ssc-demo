@@ -25,6 +25,29 @@ spec:
   # A SUFFIX, not a hostname -- the server is published at `server<appDomain>`.
   appDomain: {{ include "rhtpa-operator.appDomain" . | quote }}
   partOf: {{ $t.partOf }}
+  replicas: {{ $t.replicas }}
+
+  # REQUIRED EMPTY-OBJECT SCAFFOLDING. Do not delete these because they look
+  # redundant -- several chart templates call `deepCopy` on these keys, and
+  # `deepCopy` on a missing key aborts the whole render with
+  #   error calling deepCopy: reflect: call of reflect.Value.Type on zero Value
+  # The CR is then accepted by the API server and the operator simply never
+  # creates anything, surfacing only as Irreconcilable/ReleaseFailed on the CR
+  # status. The charts.openshift.io values this replaces carried the same
+  # empty `createDatabase: {}` / `migrateDatabase: {}` keys for this reason,
+  # and the operator's own alm-example carries the rest.
+  collector: {}
+  image: {}
+  rust: {}
+  tls: {}
+  createDatabase: {}
+  migrateDatabase: {}
+  infrastructure:
+    port: {{ $t.infrastructurePort }}
+  metrics:
+    enabled: {{ $t.metrics }}
+  tracing:
+    enabled: {{ $t.tracing }}
 
   openshift:
     useServiceCa: true
