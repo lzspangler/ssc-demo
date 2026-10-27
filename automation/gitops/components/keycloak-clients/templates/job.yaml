@@ -10,10 +10,20 @@ metadata:
   labels:
     {{- include "keycloak-clients.labels" . | nindent 4 }}
   annotations:
-    # A Job's pod template is immutable, so editing the script would otherwise
-    # fail the sync with "field is immutable" and keep the old one. Replace is
-    # also how you re-run it.
-    argocd.argoproj.io/sync-options: Replace=true
+    # A Job's pod template is immutable, so a plain sync fails with "field is
+    # immutable" and keeps the old one.
+    #
+    # Force=true is REQUIRED alongside Replace=true, not optional polish.
+    # Replace on its own runs `kubectl replace`, which the API server
+    # rejects for a Job because the live object carries a server-generated
+    # spec.selector and controller-uid labels the rendered manifest does
+    # not:
+    #   spec.selector: Required value / `selector` does not match template
+    #   `labels` / spec.selector: field is immutable
+    # The Application then sits OutOfSync forever with a SyncFailed op.
+    # Force makes Argo delete and recreate instead, which is also what
+    # makes "edit the script and re-sync" actually re-run the Job.
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
 spec:
   # Keycloak may still be rolling when this first runs; a few retries cover
   # that without masking a genuine misconfiguration.
