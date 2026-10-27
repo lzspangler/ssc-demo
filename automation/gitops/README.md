@@ -12,7 +12,7 @@ installed by Argo CD onto a cluster that already has OpenShift GitOps running.
 | `components/quay` | vendored from the same, plus the robot-account wiring | the registry application images are published to, and the `quay-push` credential the pipelines push with |
 | `components/rhtas` | vendored from the same | Fulcio / Rekor / CTlog / TSA / TUF for keyless signing |
 | `components/rhtpa/tpa-prerequisites` | vendored from the same | RHTPA's Postgres, OIDC secret and S3 bucket |
-| RHTPA itself | `https://charts.openshift.io/`, chart `redhat-trusted-profile-analyzer` 1.2.6 | SBOM ingest, vulnerability analysis, backport/fix-version lookup |
+| `components/rhtpa-operator` | RHTPA operator (`TrustedProfileAnalyzer`, `rhtpa.io/v1`), channel `stable-v3` | SBOM ingest, vulnerability analysis, backport/fix-version lookup. The only RHTPA install path — required for Exploit Intelligence |
 | `artifactory/` | `https://charts.jfrog.io`, chart `artifactory-oss` | the Maven mirror. **Separate install — see `artifactory/INSTALL.md`.** |
 
 `bootstrap-infra` is the app-of-apps. Artifactory is deliberately not part of

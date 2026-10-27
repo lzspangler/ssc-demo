@@ -5,9 +5,10 @@
 #
 # Vendored from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2
 # (`trusted-profile-analyzer/charts/tpa-prerequisites`), which is what the
-# reference cluster runs. RHTPA itself is NOT vendored -- it is the Red Hat
-# chart `redhat-trusted-profile-analyzer` from https://charts.openshift.io/,
-# referenced directly by its Argo Application.
+# reference cluster runs. RHTPA itself is NOT installed from here -- it is
+# installed by components/rhtpa-operator via the RHTPA operator
+# (TrustedProfileAnalyzer, rhtpa.io/v1). This chart provides the three objects
+# that CR reuses: Postgres, the S3 ObjectBucketClaim and oidc-tpa-cli.
 # -----------------------------------------------------------------------------
 
 nameOverride: "tpa-postgresql"

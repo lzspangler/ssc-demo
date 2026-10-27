@@ -4,7 +4,7 @@
 # WHY THIS IS A JOB, NOT A CR:
 # In RHTPA 2.2.6 the importer set is seeded into Trustify's database at install
 # time (with the large Red Hat SBOM/CSAF importers DISABLED by default), and
-# importer enablement is a runtime setting managed through the /api/v2/importer
+# importer enablement is a runtime setting managed through the /api/v3/importer
 # REST API -- it is not exposed as a first-class field on the RHTPA operator CR.
 # This Job makes enabling them reproducible / GitOps-able by applying the exact
 # same API calls idempotently: enable each importer (flip the nested `disabled`
@@ -111,7 +111,7 @@ spec:
 
               for name in IMPORTERS:
                   print("== %s ==" % name)
-                  url = "%s/api/v2/importer/%s" % (RHTPA, name)
+                  url = "%s/api/v3/importer/%s" % (RHTPA, name)
 
                   # The `disabled` flag lives nested under the single type key
                   # (sbom/csaf/osv/...); discover that key and flip it in place.
@@ -130,4 +130,4 @@ spec:
                   http("POST", url + "/force", bearer())
                   print("  %s forced -- run will start within ~1 minute" % name)
 
-              print("Done. Poll importer state via GET /api/v2/importer/<name>.")
+              print("Done. Poll importer state via GET /api/v3/importer/<name>.")

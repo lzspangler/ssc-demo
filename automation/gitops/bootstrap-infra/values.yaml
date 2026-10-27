@@ -30,7 +30,10 @@
 #   10  rhtpa-prerequisites      Postgres + oidc-tpa-cli Secret + the S3 bucket. Its PreSync
 #                                hook blocks on the Keycloak issuer, which is the real
 #                                reason keycloak is a lower wave.
-#   15  rhtpa                    The analyzer itself, from charts.openshift.io.
+#   15  rhtpa-operator           The analyzer itself, via the RHTPA operator
+#                                (TrustedProfileAnalyzer, rhtpa.io/v1). The
+#                                charts.openshift.io Helm path was removed: only
+#                                the operator supports Exploit Intelligence.
 #
 # BEFORE INSTALLING: set deployer.domain and replace every REPLACE_ME in
 # `credentials` below. Do that in a LOCAL values override that you do not
@@ -292,8 +295,18 @@ components:
   # is a major version, and the operator's own migrateDatabase module runs
   # against the SAME Postgres the old release used. Take a database backup
   # first, and expect the Route to be briefly unavailable during the cutover.
+  # RHTPA itself. The operator (TrustedProfileAnalyzer, rhtpa.io/v1) is now the
+  # ONLY install path -- the charts.openshift.io Helm chart that used to live
+  # at components.rhtpa has been removed. Exploit Intelligence integrates
+  # through `spec.exploitIntelligence` on this CR and has no Helm-chart
+  # equivalent, so keeping two paths meant keeping one that could never grow
+  # the feature.
+  #
+  # `rhtpaPrerequisites` above stays separate and still owns Postgres, the S3
+  # ObjectBucketClaim and the oidc-tpa-cli Secret. It reads `storage` from
+  # HERE, so the two cannot disagree about s3-vs-filesystem.
   rhtpaOperator:
-    enabled: false
+    enabled: true
     namespace: trusted-profile-analyzer
     syncWave: "15"
     # stable-v3 is RHTPA 3.x, the first line Exploit Intelligence supports.
@@ -301,43 +314,17 @@ components:
     # Set false if the namespace already has an OperatorGroup -- two in one
     # namespace puts every operator in it into an error state.
     createOperatorGroup: true
+    # HAProxy's `timeout server` for the RHTPA Route. The default 30 s is not
+    # survivable: /purl/recommend cannot complete inside it at any batch size.
+    # The Route is GENERATED from an Ingress, so the annotation goes on the
+    # Ingress via the CR's ingress.additionalAnnotations.
     routeTimeout: 300s
     storage:
+      # s3 (needs ODF) or filesystem. Also read by rhtpaPrerequisites, which
+      # only raises the ObjectBucketClaim in s3 mode.
       type: s3
       bucket: trustify
+      # NooBaa's S3 endpoint. Empty derives
+      # `https://s3-openshift-storage.<domain>:443`.
       regionEndpoint: ""
 
-  rhtpa:
-    enabled: true
-    namespace: trusted-profile-analyzer
-    syncWave: "15"
-    # Red Hat chart from https://charts.openshift.io/, not vendored into this
-    # repo. Pinned to what the reference cluster runs.
-    chartVersion: "1.2.6"
-    storage:
-      # s3 (needs OpenShift Data Foundation) or filesystem. Must match
-      # rhtpaPrerequisites' storage.type -- the prerequisites chart only
-      # creates the ObjectBucketClaim in s3 mode.
-      type: s3
-      bucket: trustify
-      # NooBaa's S3 endpoint; `https://s3-openshift-storage.<domain>:443`.
-      # Override only if your object gateway is published elsewhere.
-      regionEndpoint: ""
-      # filesystem mode only: size of the PVC RHTPA provisions, and the class
-      # to provision it from. Leave storageClassName empty for the cluster
-      # default.
-      #
-      # Caveat: the chart mounts this one PVC into both the server and the
-      # importer Deployment and hardcodes accessModes: [ReadWriteOnce] with no
-      # override. An RWX class does not fix that -- the claim still asks for
-      # RWO, so the two pods must co-schedule and the importer stays Pending
-      # when it cannot. Prefer s3.
-      size: 50Gi
-      storageClassName: ""
-    # HAProxy's `timeout server` for the RHTPA Route. The default 30 s is not
-    # survivable for this demo: /purl/recommend cannot complete inside it at
-    # any batch size, and because the Route is GENERATED from an Ingress by the
-    # ingress-to-route controller, annotating the Route by hand is reverted.
-    # The annotation therefore goes on the Ingress, via the chart's own
-    # ingress.additionalAnnotations, and the controller copies it down.
-    routeTimeout: 300s

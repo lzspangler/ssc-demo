@@ -180,6 +180,24 @@ spec:
         }
 
         RHTPA_URL="$(read_secret bombastic_api_url)"
+
+        # --- RHTPA API version bases ---------------------------------------
+        # RHTPA 3.x moved most of the API from /api/v2 to /api/v3. The move is
+        # a pure rename for the endpoints used here -- PurlDetails and
+        # BasePurlDetails are byte-identical between the two -- so those are on
+        # v3 below.
+        #
+        # TWO endpoints deliberately stay on v2, because their v3 forms return
+        # a DIFFERENT shape and the parsing below expects the old one:
+        #   /vulnerability/analyze   AnalysisResponse -> AnalysisResponseV3
+        #   /sbom                    ...SbomSummary   -> ...SbomPackageSummary
+        # Both still exist on v2 in 3.1. Revisit when the v3 shapes are
+        # adopted; do not "tidy" them to v3 without changing the parsing.
+        #
+        # v2-only RHTPA (2.x) is no longer supported by this task: the
+        # automation installs 3.x via the operator only.
+        RHTPA_V2="${RHTPA_URL%/}/api/v2"
+        RHTPA_V3="${RHTPA_URL%/}/api/v3"
         OIDC_ISSUER_URL="$(read_secret oidc_issuer_url)"
         OIDC_CLIENT_ID="$(read_secret oidc_client_id)"
         OIDC_CLIENT_SECRET="$(read_secret oidc_client_secret)"
@@ -468,7 +486,7 @@ spec:
           echo "Processing batch $((i + 1))/${BATCH_COUNT}..."
 
           if fetch_json /tmp/recommend-batch.json \
-               "${RHTPA_URL%/}/api/v2/purl/recommend" \
+               "${RHTPA_V3}/purl/recommend" \
                --header "Content-Type: application/json" \
                --data @/tmp/recommend-body.json; then
             cat /tmp/recommend-batch.json >> /tmp/recommendations.jsonl
@@ -515,9 +533,9 @@ spec:
         #
         # So we answer that question directly. For each still-vulnerable PURL:
         #
-        #   1. GET /api/v2/purl/{purl}             -> the CVEs affecting it
-        #   2. GET /api/v2/purl/base/{base purl}   -> every version RHTPA knows
-        #   3. GET /api/v2/purl/{base@version}     -> that version's statuses
+        #   1. GET /api/v3/purl/{purl}             -> the CVEs affecting it
+        #   2. GET /api/v3/purl/base/{base purl}   -> every version RHTPA knows
+        #   3. GET /api/v3/purl/{base@version}     -> that version's statuses
         #
         # A sibling version FIXES a CVE when EITHER
         #
@@ -530,7 +548,7 @@ spec:
         #
         # BOTH signals are needed, and the two endpoints are NOT interchangeable:
         # analyze matches on VERSION RANGE and ignores purl qualifiers, while
-        # GET /api/v2/purl/{purl} returns statements about one EXACT qualified
+        # GET /api/v3/purl/{purl} returns statements about one EXACT qualified
         # purl. Treating silence from the purl endpoint as "clean" is wrong --
         # pkg:maven/com.fasterxml.woodstox/woodstox-core@6.0.3.redhat-00001 has
         # no statuses under that unqualified spelling (the real ones hang off
@@ -614,7 +632,7 @@ spec:
           BASE_ENCODED="$(jq -rn --arg p "${BASE_PURL}" '$p | @uri')"
 
           if ! fetch_json /tmp/base-purl.json \
-                 "${RHTPA_URL%/}/api/v2/purl/base/${BASE_ENCODED}"; then
+                 "${RHTPA_V3}/purl/base/${BASE_ENCODED}"; then
             continue
           fi
 
@@ -694,7 +712,7 @@ spec:
             > /tmp/analyze-body.json
 
           if fetch_json /tmp/analyze-batch.json \
-               "${RHTPA_URL%/}/api/v2/vulnerability/analyze" \
+               "${RHTPA_V2}/vulnerability/analyze" \
                --header "Content-Type: application/json" \
                --data @/tmp/analyze-body.json; then
             cat /tmp/analyze-batch.json >> /tmp/cand-analyze.jsonl
@@ -758,7 +776,7 @@ spec:
             LOOKUP_ENCODED="$(jq -rn --arg p "${LOOKUP}" '$p | @uri')"
 
             if fetch_json /tmp/candidate.json \
-                 "${RHTPA_URL%/}/api/v2/purl/${LOOKUP_ENCODED}"; then
+                 "${RHTPA_V3}/purl/${LOOKUP_ENCODED}"; then
               cat /tmp/candidate.json >> /tmp/cand-variants.jsonl
               echo >> /tmp/cand-variants.jsonl
             fi

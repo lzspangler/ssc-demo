@@ -184,29 +184,36 @@ Either way, commit and push before §5:
 git -C <your clone> commit -am "pick AI backend" && git push
 ```
 
-## 3b. RHTPA: Helm chart or operator?  ← decide before installing
+## 3b. RHTPA is installed by its operator
 
-The default (`components.rhtpa`) installs RHTPA 2.x from
-`charts.openshift.io`. That is simpler and is what the rest of this runbook
-assumes.
+There is no choice to make here any more, but it is worth knowing: RHTPA is
+installed by the RHTPA operator (`TrustedProfileAnalyzer`, `rhtpa.io/v1`) via
+`components.rhtpaOperator`, which is enabled by default. The
+`charts.openshift.io` Helm path has been removed — Exploit Intelligence
+integrates through `spec.exploitIntelligence` on that CR and has no
+Helm-chart equivalent.
 
-Switch to `components.rhtpaOperator` **only if you need Exploit
-Intelligence** — it integrates through `spec.exploitIntelligence` on the
-`TrustedProfileAnalyzer` CR, which the Helm chart has no equivalent for:
+`components.rhtpaPrerequisites` stays enabled and still owns Postgres, the S3
+ObjectBucketClaim and `oidc-tpa-cli`; the CR reuses all three, and reads
+`storage` from `components.rhtpaOperator` so the two cannot disagree.
 
-```yaml
-components:
-  rhtpa:
-    enabled: false
-  rhtpaOperator:
-    enabled: true
-```
+Two things that will bite if you edit the CR, both in
+`components/rhtpa-operator/README.md`:
 
-The two are mutually exclusive and the render fails if both are on.
-`rhtpaPrerequisites` stays enabled either way — Postgres, the S3 bucket and
-`oidc-tpa-cli` are shared. See `components/rhtpa-operator/README.md`,
-including the migration procedure if you are switching an install that already
-has data.
+* The CRD declares `spec` with `x-kubernetes-preserve-unknown-fields` and no
+  property schema, so the API server accepts **any** shape. A misspelt key is
+  not rejected — it silently has no effect.
+* Several chart templates call `deepCopy` on top-level keys such as
+  `migrateDatabase` and `createDatabase`. If those keys are absent the whole
+  render aborts with `reflect: call of reflect.Value.Type on zero Value`, the
+  CR is accepted, and the operator creates nothing — visible only as
+  `Irreconcilable` on the CR status. The empty-object scaffolding in the CR
+  template is there for this; do not tidy it away.
+
+If you are migrating a cluster that already ran the Helm chart, follow the
+migration section of that README. Budget time: an in-place 2.x -> 3.x data
+migration of a ~2.7 GB database measured around 90 minutes, and RHTPA is down
+for all of it.
 
 ## 4. Write an uncommitted overrides file
 

@@ -11,7 +11,7 @@
 # repo) is NOT a valid importer source. The ad-hoc endpoint below is the supported
 # way to inject one document:
 #
-#     POST {bombastic_api_url}/api/v2/advisory?format=<fmt>&labels.<k>=<v>
+#     POST {bombastic_api_url}/api/v3/advisory?format=<fmt>&labels.<k>=<v>
 #
 # Auth is the same OIDC client-credentials flow the `upload-sbom-to-rhtpa` task
 # uses; credentials come from the `tpa-secret` Secret in the pipeline namespace.
@@ -44,12 +44,12 @@
 #
 #  2. Re-uploading the same document id creates a NEW VERSION; it does not
 #     replace. The version with the latest `modified` is current, older ones are
-#     deprecated, and GET /api/v2/advisory defaults to deprecated=Ignore. So a
+#     deprecated, and GET /api/v3/advisory defaults to deprecated=Ignore. So a
 #     corrected re-upload that forgets to bump `modified` is invisible to search
 #     while still being fetchable by uuid -- "it uploaded but I can't find it".
 #     This script warns when the uploaded version did not become current.
 #
-#  3. DELETE /api/v2/advisory/{uuid} returns HTTP 504 from the OpenShift router
+#  3. DELETE /api/v3/advisory/{uuid} returns HTTP 504 from the OpenShift router
 #     but COMPLETES ASYNCHRONOUSLY (~1-2 min). Do not retry on the 504 -- poll
 #     GET .../{uuid} for a 404, which is what --delete does.
 #
@@ -94,6 +94,22 @@ secret_key() {
     || die "cannot read key '$1' from secret $SECRET in namespace $NAMESPACE (are you logged in with 'oc'?)"
 }
 RHTPA=$(secret_key bombastic_api_url)
+
+# --- RHTPA API version bases -------------------------------------------------
+# RHTPA 3.x moved most of the API from /api/v2 to /api/v3. For everything this
+# script touches the move is a pure rename (PurlDetails, BasePurlDetails and
+# PaginatedResults_AdvisorySummary are identical between the two), so those use
+# $V3 below.
+#
+# TWO endpoints deliberately stay on $V2, because their v3 forms return a
+# different shape than the parsing here expects, and both still exist on v2 in
+# 3.1:
+#   POST /vulnerability/analyze   AnalysisResponse -> AnalysisResponseV3
+#   GET  /sbom  (collection)      ...SbomSummary   -> ...SbomPackageSummary
+# Note the SINGLE-resource /sbom/{id} is v3-only -- the v2 form was removed, so
+# deletes and by-id lookups must use $V3 even though the collection does not.
+V2="$RHTPA/api/v2"
+V3="$RHTPA/api/v3"
 ISSUER=$(secret_key oidc_issuer_url)
 CLIENT_ID=$(secret_key oidc_client_id)
 CLIENT_SECRET=$(secret_key oidc_client_secret)
@@ -119,7 +135,7 @@ echo "namespace: $NAMESPACE (secret $SECRET)"
 list_versions() {
   local doc="$1"
   "${API[@]}" --get --data-urlencode "q=$doc" --data-urlencode 'deprecated=Consider' \
-    "$RHTPA/api/v2/advisory" | python3 -c '
+    "$V3/advisory" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -133,7 +149,7 @@ for i in d.get("items", []):
 # uuid of the CURRENT (non-deprecated) version, if any.
 current_uuid() {
   local doc="$1"
-  "${API[@]}" --get --data-urlencode "q=$doc" "$RHTPA/api/v2/advisory" | python3 -c '
+  "${API[@]}" --get --data-urlencode "q=$doc" "$V3/advisory" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -145,7 +161,7 @@ for i in d.get("items", []):
 
 report_advisory() {
   local uuid="$1"
-  "${API[@]}" "$RHTPA/api/v2/advisory/$uuid" | python3 -c '
+  "${API[@]}" "$V3/advisory/$uuid" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 vulns = [v.get("identifier") for v in (d.get("vulnerabilities") or [])]
@@ -180,10 +196,10 @@ if [[ "$MODE" == "delete" ]]; then
   echo
   echo "Deleting $TARGET (a 504 here is expected -- the router times out, the delete still runs)"
   "${API[@]}" -X DELETE -o /dev/null -w "  DELETE -> http=%{http_code}\n" \
-    "$RHTPA/api/v2/advisory/$TARGET" || true
+    "$V3/advisory/$TARGET" || true
   echo -n "  waiting for it to disappear "
   for _ in $(seq 1 30); do
-    code=$("${API[@]}" -o /dev/null -w '%{http_code}' "$RHTPA/api/v2/advisory/$TARGET" || true)
+    code=$("${API[@]}" -o /dev/null -w '%{http_code}' "$V3/advisory/$TARGET" || true)
     if [[ "$code" == "404" ]]; then echo "-> gone"; exit 0; fi
     echo -n "."
     sleep 10
@@ -254,7 +270,7 @@ for kv in "${LABELS[@]:-}"; do
 done
 
 RESP=$("${API[@]}" -X POST -H 'content-type: application/json' \
-  --data-binary "@$FILE" "$RHTPA/api/v2/advisory?$QS") \
+  --data-binary "@$FILE" "$V3/advisory?$QS") \
   || die "upload failed"
 UUID=$(python3 -c 'import sys,json
 try:

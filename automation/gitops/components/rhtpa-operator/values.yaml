@@ -1,14 +1,11 @@
 # =============================================================================
 # RHTPA 3.x via the operator.
 #
-# MUTUALLY EXCLUSIVE with components.rhtpa (the charts.openshift.io Helm chart,
-# which installs Trustify 2.x). Both publish the same Route hostname and own the
-# same Deployments; bootstrap-infra fails the render if both are enabled.
-#
-# WHY THIS EXISTS: Exploit Intelligence integrates through
-# `spec.exploitIntelligence` on the TrustedProfileAnalyzer CR, which only the
-# operator provides. There is no equivalent in the Helm chart, so Exploit
-# Intelligence cannot be used with a chart-installed RHTPA at all.
+# THE ONLY WAY the automation installs RHTPA. The charts.openshift.io Helm
+# chart (Trustify 2.x) that used to live at components.rhtpa has been removed:
+# Exploit Intelligence integrates through `spec.exploitIntelligence` on the
+# TrustedProfileAnalyzer CR, which only the operator provides, so the Helm
+# path was a dead end that could never grow the feature.
 #
 # WHAT IT REUSES: nothing here provisions Postgres, the S3 bucket or the OIDC
 # client secret. Those come from components.rhtpaPrerequisites exactly as
@@ -46,6 +43,11 @@ trustedProfileAnalyzer:
   # `server<appDomain>`. Leave empty to derive `-trusted-profile-analyzer.<domain>`.
   appDomain: ""
   partOf: trustify
+  replicas: 1
+  # Matches the operator's alm-example.
+  infrastructurePort: 9010
+  metrics: false
+  tracing: false
 
   database:
     host: tpa-postgresql

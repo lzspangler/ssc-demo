@@ -1,9 +1,6 @@
 {{- $domain := required "Set deployer.domain to the cluster's apps subdomain" .Values.deployer.domain }}
 {{- $realm := .Values.components.keycloak.realm }}
 {{- $issuer := printf "https://sso.%s/realms/%s" $domain $realm }}
-{{- if and .Values.components.rhtpa.enabled .Values.components.rhtpaOperator.enabled }}
-{{- fail "components.rhtpa and components.rhtpaOperator are mutually exclusive: the first installs RHTPA 2.x from the charts.openshift.io Helm chart, the second installs RHTPA 3.x via the operator. They publish the same Route and own the same Deployments. Enable exactly one." }}
-{{- end }}
 {{- if and .Values.components.keycloak.enabled .Values.components.keycloakClients.enabled }}
 {{- fail "components.keycloak and components.keycloakClients are mutually exclusive: the first installs a Keycloak that claims the sso.<domain> Route, the second provisions ssc-demo's clients into one that already exists. Enable exactly one." }}
 {{- end }}
@@ -478,8 +475,8 @@ spec:
           cluster:
             subdomain: {{ $domain | quote }}
         storage:
-          type: {{ .Values.components.rhtpa.storage.type | quote }}
-          bucketName: {{ .Values.components.rhtpa.storage.bucket | quote }}
+          type: {{ .Values.components.rhtpaOperator.storage.type | quote }}
+          bucketName: {{ .Values.components.rhtpaOperator.storage.bucket | quote }}
         pgsql:
           password: {{ .Values.credentials.tpaDbPassword | quote }}
         oidc:
@@ -539,153 +536,3 @@ spec:
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
-{{- if .Values.components.rhtpa.enabled }}
-{{- $tpa := .Values.components.rhtpa }}
-{{- $s3Region := $tpa.storage.regionEndpoint | default (printf "https://s3-openshift-storage.%s:443" $domain) }}
----
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: {{ .Release.Name }}-rhtpa
-  namespace: {{ .Values.argocd.namespace }}
-  labels:
-    {{- include "root-app.labels" . | nindent 4 }}
-  annotations:
-    argocd.argoproj.io/sync-wave: {{ $tpa.syncWave | quote }}
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: {{ .Values.argocd.project }}
-  source:
-    # The Red Hat chart, straight from the OpenShift chart repository -- not
-    # vendored. Only its prerequisites (Postgres, the OIDC secret, the bucket)
-    # live in this repo, under components/rhtpa/tpa-prerequisites.
-    repoURL: https://charts.openshift.io/
-    chart: redhat-trusted-profile-analyzer
-    targetRevision: {{ $tpa.chartVersion | quote }}
-    helm:
-      valuesObject:
-        # Suffix, not a hostname: the chart publishes each service as
-        # `<service><appDomain>`, so the console lands on
-        # server-trusted-profile-analyzer.<domain> -- which is what the
-        # tpa-frontend Keycloak client redirects back to.
-        appDomain: -{{ $tpa.namespace }}.{{ $domain }}
-
-        # Chart 1.2.6 bug: the create/migrate Job templates `deepCopy` these
-        # top-level keys unconditionally, so if they are absent the render dies
-        # with "reflect: call of reflect.Value.Type on zero Value" -- which
-        # names the Job template, not the missing key. Empty dicts are enough;
-        # the real toggles are under `modules` below.
-        createDatabase: {}
-        migrateDatabase: {}
-
-        ingress:
-          enabled: true
-          additionalAnnotations:
-            # See values.yaml: the Route is generated from this Ingress, so the
-            # timeout has to be set here or the controller reverts it.
-            haproxy.router.openshift.io/timeout: {{ $tpa.routeTimeout | quote }}
-
-        database:
-          host: tpa-postgresql
-          name: trustify
-          username: trustify
-          port: '5432'
-          # In-cluster hop to the Postgres this repo's prerequisites chart
-          # deploys; it serves plaintext, so requiring TLS here just fails.
-          sslMode: disable
-          password:
-            valueFrom:
-              secretKeyRef:
-                name: tpa-postgresql
-                key: database-password
-
-        oidc:
-          issuerUrl: {{ $issuer | quote }}
-          clients:
-            frontend:
-              clientId: tpa-frontend
-            cli:
-              clientId: tpa-cli
-              clientSecret:
-                valueFrom:
-                  secretKeyRef:
-                    name: oidc-tpa-cli
-                    key: client-secret
-
-        openshift:
-          enabled: true
-          useServiceCa: true
-
-        storage:
-          type: {{ $tpa.storage.type | quote }}
-        {{- if eq $tpa.storage.type "s3" }}
-          bucket: {{ $tpa.storage.bucket | quote }}
-          # NooBaa's S3 endpoint URL, not an AWS region name. The credentials
-          # come from the Secret the ObjectBucketClaim creates.
-          region: {{ $s3Region | quote }}
-          accessKey:
-            valueFrom:
-              secretKeyRef:
-                name: {{ $tpa.storage.bucket | quote }}
-                key: AWS_ACCESS_KEY_ID
-          secretKey:
-            valueFrom:
-              secretKeyRef:
-                name: {{ $tpa.storage.bucket | quote }}
-                key: AWS_SECRET_ACCESS_KEY
-        {{- else }}
-          # RHTPA provisions its own PVC in filesystem mode, and BOTH the
-          # server and the importer Deployments mount it -- with
-          # accessModes: [ReadWriteOnce] hardcoded in the chart template and no
-          # value to override it. Setting an RWX storageClassName does not
-          # change the requested mode, so the two pods must land on the same
-          # node or the importer stays Pending. s3 avoids the whole problem.
-          size: {{ $tpa.storage.size | quote }}
-          {{- with $tpa.storage.storageClassName }}
-          storageClassName: {{ . | quote }}
-          {{- end }}
-        {{- end }}
-
-        modules:
-          # One-shot Jobs: create the schema, then migrate it. Both are
-          # idempotent and re-run on every sync.
-          createDatabase:
-            enabled: true
-          migrateDatabase:
-            enabled: true
-          createImporters:
-            enabled: true
-            # The three feeds the demo's vulnerability analysis reads. All
-            # three are large; the first full ingest takes hours and is the
-            # reason the prerequisites chart raises Postgres' CPU limit and
-            # readiness timeout.
-            importers:
-              cve:
-                cve:
-                  description: CVE list v5
-                  disabled: false
-                  period: 12h
-                  source: https://github.com/CVEProject/cvelistV5
-              osv-github:
-                osv:
-                  description: GitHub Advisory Database
-                  disabled: false
-                  path: advisories
-                  period: 12h
-                  source: https://github.com/github/advisory-database
-              redhat-csaf:
-                csaf:
-                  description: All Red Hat CSAF data
-                  disabled: false
-                  # Red Hat's CSAF endpoint rate-limits an initial full fetch;
-                  # fewer retries and the importer gives up part-way through,
-                  # leaving the backport data the demo depends on incomplete.
-                  fetchRetries: 50
-                  period: 12h
-                  source: redhat.com
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: {{ $tpa.namespace }}
-  {{- include "root-app.syncPolicy" . | nindent 2 }}
-{{- end }}
