@@ -447,7 +447,34 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.rhtas.namespace }}
-  {{- include "root-app.syncPolicy" . | nindent 2 }}
+    # The operator populates these; the chart deliberately does not set them, so
+  # without this the Application is permanently OutOfSync on defaults alone.
+  # Everything the chart DOES set now matches the live object exactly -- see
+  # components/rhtas/trusted-artifact-signer/templates/securesignCR.yaml for
+  # the v1alpha1 -> v1 migration that made that true.
+  ignoreDifferences:
+    - group: rhtas.redhat.com
+      kind: Securesign
+      name: securesign
+      namespace: {{ .Values.components.rhtas.namespace }}
+      jsonPointers:
+        - /spec/ctlog
+        - /spec/fulcio/replicas
+        - /spec/rekor/maxRequestBodySize
+        - /spec/rekor/monitoring/tlog
+        - /spec/rekor/monitoring/tuf
+        - /spec/rekor/replicas
+        - /spec/rekor/searchIndex/tls
+        - /spec/trillian/database/provider
+        - /spec/trillian/database/tls
+        - /spec/trillian/database/uri
+        - /spec/trillian/maxRecvMessageSize
+        - /spec/trillian/server
+        - /spec/trillian/signer
+        - /spec/tsa/maxRequestBodySize
+        - /spec/tsa/replicas
+        - /spec/tuf/replicas
+{{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
 {{- if .Values.components.rhtpaPrerequisites.enabled }}

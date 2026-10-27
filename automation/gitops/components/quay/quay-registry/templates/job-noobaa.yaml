@@ -11,7 +11,15 @@ metadata:
     # A Job's pod template is immutable, so editing the playbook would
     # otherwise fail the sync with "field is immutable" and leave the old
     # seeding in place. Replace is also how you re-run it.
-    argocd.argoproj.io/sync-options: Replace=true
+    # Force=true is REQUIRED with Replace=true for a Job. Replace alone runs
+    # `kubectl replace`, which the API server rejects because the live Job
+    # carries a server-generated spec.selector and controller-uid labels the
+    # rendered manifest does not:
+    #   spec.selector: Required value / `selector` does not match template
+    #   `labels` / spec.selector: field is immutable
+    # The Application then sits OutOfSync with a failing sync, which also
+    # blocks every OTHER resource in the same Application from syncing.
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
 spec:
   # Deliberately not the upstream 100. If ODF is absent, every attempt burns
   # 20 minutes of retries before failing; a bounded limit turns that into a

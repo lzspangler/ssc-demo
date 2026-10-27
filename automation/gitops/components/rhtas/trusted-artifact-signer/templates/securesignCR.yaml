@@ -1,5 +1,33 @@
 ---
-apiVersion: rhtas.redhat.com/v1alpha1
+# Securesign, written against the v1 API served by rhtas-operator 1.5.x.
+#
+# WHY THIS WAS REWRITTEN. This template used to declare
+# `apiVersion: rhtas.redhat.com/v1alpha1` with the old field names. The CRD
+# still serves v1alpha1, but v1 is the STORAGE version, so a conversion webhook
+# rewrote every apply into v1 -- renaming `OIDCIssuers` -> `oidcIssuers`,
+# `externalAccess` -> `ingress`, `monitoring.enabled` ->
+# `monitoring.metrics`/`serviceMonitor`, `certificate` ->
+# `signer.certificateChain`, and `ctlog.port`+`prefix` -> `ctlog.url`.
+#
+# The consequence was a PERMANENT OutOfSync: Argo rendered v1alpha1 and compared
+# it against a stored v1 object, producing ~56 spurious differences. Worse, the
+# CRD sets `x-kubernetes-preserve-unknown-fields: false`, so the old names only
+# survived because the conversion shim translated them. If a future operator
+# release drops v1alpha1, those fields would be pruned with nothing to replace
+# them and the OIDC configuration would vanish silently.
+#
+# SCOPE OF THIS CHANGE: API version and field names only. Every value below is
+# what the converted live object already held, so applying this is a no-op for
+# the running Fulcio/Rekor/CTlog/TSA/TUF. Two values are conversion artifacts
+# carried over deliberately rather than "fixed" here -- see the notes at
+# fulcio.ctlog and tuf.ctlog. Changing those is a behavioural change and
+# belongs in its own commit, tested on its own.
+#
+# Fields the OPERATOR defaults (replicas, tls, maxRequestBodySize,
+# maxCertChainSize, database.provider/uri, searchIndex.tls, monitoring.tlog,
+# monitoring.tuf) are deliberately NOT set here; the Application carries
+# ignoreDifferences for them.
+apiVersion: rhtas.redhat.com/v1
 kind: Securesign
 metadata:
   name: {{ .Values.instance }}
@@ -10,46 +38,66 @@ metadata:
   namespace: {{ .Values.namespace }}
 spec:
   fulcio:
-    certificate:
-      commonName: fulcio.hostname
-      organizationEmail: {{ .Values.email }}
-      organizationName: {{ .Values.org }}
+    signer:
+      type: file
+      certificateChain:
+        commonName: fulcio.hostname
+        organizationEmail: {{ .Values.email }}
+        organizationName: {{ .Values.org }}
     config:
-      OIDCIssuers:
+      oidcIssuers:
         {{- /* Must match the `trusted-artifact-signer` client in the Keycloak
                realm, and the `oidc-issuer` parameter the verify-commit task
                passes to cosign. A mismatch here is only visible as a signing
                failure at the end of a build. */}}
-        - ClientID: {{ .Values.oidcClientId }}
-          Issuer: 'https://{{ include "trusted-artifact-signer.oidcIssuer" . }}'
-          IssuerURL: 'https://{{ include "trusted-artifact-signer.oidcIssuer" . }}'
-          Type: email
+        - clientID: {{ .Values.oidcClientId }}
+          issuer: 'https://{{ include "trusted-artifact-signer.oidcIssuer" . }}'
+          issuerURL: 'https://{{ include "trusted-artifact-signer.oidcIssuer" . }}'
+          type: email
     ctlog:
-      port: 80
-      prefix: trusted-artifact-signer
-    externalAccess:
+      {{- /* CONVERSION ARTIFACT, carried over verbatim. v1alpha1 had
+             `port: 80` + `prefix: trusted-artifact-signer`, which the webhook
+             folded into this URL with an empty host. It is what the running
+             instance has, and Fulcio is healthy with it, so it is reproduced
+             rather than corrected here. The idiomatic v1 form is a `ref:
+             {name, namespace}` pointing at the CTlog instance -- switching to
+             it is a behavioural change, so do it separately and watch Fulcio. */}}
+      url: '//:80/trusted-artifact-signer'
+    ingress:
       enabled: true
     monitoring:
-      enabled: true
+      metrics:
+        enabled: true
+      serviceMonitor:
+        enabled: true
   rekor:
-    monitoring:
-      enabled: true
     signer:
-      kms: secret
+      type: secret
     trillian:
-      port: 8091
-    externalAccess:
+      url: ':8091'
+    ingress:
       enabled: true
+    monitoring:
+      metrics:
+        enabled: true
+      serviceMonitor:
+        enabled: true
     backFillRedis:
       enabled: true
       schedule: 0 0 * * *
-    rekorSearchUI:
+    {{- /* v1alpha1 `rekorSearchUI.enabled` became `searchIndex.create`. */}}
+    searchIndex:
+      create: true
+    {{- /* v1alpha1 had a bare `rekor.pvc`; v1 nests it under attestations. */}}
+    attestations:
       enabled: true
-    pvc:
-      accessModes:
-        - ReadWriteOnce
-      retain: true
-      size: 5Gi
+      maxSize: 100Ki
+      url: 'file:///var/run/attestations?no_tmp_dir=true'
+      pvc:
+        accessModes:
+          - ReadWriteOnce
+        retain: true
+        size: 5Gi
   trillian:
     database:
       create: true
@@ -59,15 +107,22 @@ spec:
         retain: true
         size: 5Gi
     monitoring:
-      enabled: true
+      metrics:
+        enabled: true
+      serviceMonitor:
+        enabled: true
   tsa:
-    externalAccess:
-      enabled: true
-    monitoring:
+    ingress:
       enabled: true
     ntpMonitoring:
       enabled: true
+    monitoring:
+      metrics:
+        enabled: true
+      serviceMonitor:
+        enabled: true
     signer:
+      type: file
       certificateChain:
         intermediateCA:
           - commonName: tsa.hostname
@@ -82,18 +137,26 @@ spec:
           organizationEmail: {{ .Values.email }}
           organizationName: {{ .Values.org }}
   tuf:
-    externalAccess:
+    ingress:
       enabled: true
-    keys:
-      - name: rekor.pub
-      - name: ctfe.pub
-      - name: fulcio_v1.crt.pem
-      - name: tsa.certchain.pem
     port: 80
+    rootKeySecretRef:
+      name: tuf-root-keys
     pvc:
       accessModes:
         - ReadWriteOnce
       retain: true
       size: 100Mi
-    rootKeySecretRef:
-      name: tuf-root-keys
+    {{- /* v1alpha1 listed the trusted keys as `keys: [{name: rekor.pub}, ...]`.
+           v1 models them as one list per service instead. Empty entries mean
+           "use the in-cluster instance", which is what the conversion produced
+           and what the running TUF has. The ctlog URL is the same empty-host
+           artifact described at fulcio.ctlog above. */}}
+    ctlog:
+      - url: '///trusted-artifact-signer'
+    fulcio:
+      - {}
+    rekor:
+      - {}
+    tsa:
+      - {}
