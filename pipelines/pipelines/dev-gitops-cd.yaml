@@ -134,4 +134,5 @@ spec:
         - name: GIT_IMAGE
           value: $(params.agent-image)
       taskRef:
+        kind: Task
         name: gitops-bump-image
