@@ -1,0 +1,228 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: gitops-bump-image
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "git, pull-request, gitlab, gitops"
+spec:
+  description: >-
+    Bump the image tag in a Helm values file of the gitops repository and land
+    it as an MR: clone the gitops repo, rewrite `image.tag`, push a
+    `gitops/<env>-image-*` branch, open an MR, and -- with AUTO_MERGE="true" --
+    merge it right away. Auth comes from the SCM_SECRET_NAME secret (keys:
+    token, username): the same `scm-auth-secret` the remediation `open-pr` task
+    uses, so the token needs Developer on the gitops project, which is enough
+    to push a branch and open + accept an MR while main stays protected against
+    direct push. GitLab only (this is the demo's gitops SCM); a GitHub variant
+    would follow the provider switch in open-pr.
+  params:
+    - name: GIT_URL
+      type: string
+      description: HTTPS URL of the gitops repository to promote into.
+    - name: GIT_HOST
+      type: string
+      description: SCM host, e.g. gitlab-gitlab.apps.cluster.example.com
+    - name: IMAGE
+      type: string
+      description: >-
+        Full image reference published by CI (registry/org/component:tag).
+        Only the part after the last ':' is written to values.yaml, so this
+        must be a TAG reference -- a @digest reference has no tag to extract
+        and fails the task.
+    - name: VALUES_PATH
+      type: string
+      description: >-
+        Path, inside the gitops repo, of the environment values file whose
+        image.tag should be bumped.
+      default: app/spring-boot-example/environments/dev/values.yaml
+    - name: ENVIRONMENT
+      type: string
+      description: Environment being promoted to (names the branch and MR title).
+      default: dev
+    - name: BASE_BRANCH
+      type: string
+      description: Branch the MR targets (the gitops repo's default branch).
+      default: main
+    - name: AUTO_MERGE
+      type: string
+      description: >-
+        "true" merges the MR immediately after creating it; "false" leaves it
+        open for human review. The demo auto-merges dev and leaves qa/prod
+        promotion to humans.
+      default: "true"
+    - name: APP_REPO_URL
+      type: string
+      description: Application repo the image was built from (MR description context only).
+      default: ""
+    - name: APP_COMMIT
+      type: string
+      description: Application commit the image was built from (MR description context only).
+      default: ""
+    - name: SCM_SECRET_NAME
+      type: string
+      default: scm-auth-secret
+    - name: GIT_IMAGE
+      type: string
+      description: >-
+        Image this task runs in. It MUST contain git AND glab. The pipeline
+        overrides this with the agent image, which bundles all three of
+        git/glab/gh. WARNING: the default below (pipelines-git-init) ships git
+        ONLY -- no glab -- so override it (or supply your own git+glab image)
+        when running this task standalone.
+      default: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8:latest
+  results:
+    - name: MR_URL
+      description: URL of the created MR (empty if the tag was already current).
+    - name: MERGED
+      description: '"1" if the MR was merged, "0" if left open or nothing to promote.'
+  volumes:
+    - name: scm-secret
+      secret:
+        secretName: $(params.SCM_SECRET_NAME)
+        optional: false
+  steps:
+    - name: gitops-bump
+      image: $(params.GIT_IMAGE)
+      workingDir: /tmp
+      volumeMounts:
+        - name: scm-secret
+          mountPath: /run/secrets/scm
+          readOnly: true
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: IMAGE
+          value: $(params.IMAGE)
+        - name: VALUES_PATH
+          value: $(params.VALUES_PATH)
+        - name: ENVIRONMENT
+          value: $(params.ENVIRONMENT)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: AUTO_MERGE
+          value: $(params.AUTO_MERGE)
+        - name: APP_REPO_URL
+          value: $(params.APP_REPO_URL)
+        - name: APP_COMMIT
+          value: $(params.APP_COMMIT)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        TOKEN="$(cat /run/secrets/scm/token)"
+        USERNAME="$(cat /run/secrets/scm/username 2>/dev/null || echo oauth2)"
+
+        # --- derive the tag from the full image reference --------------------
+        # output-image is registry/org/component:<commit sha>, so everything
+        # after the last ':' is the tag. A digest ref fails the guard below.
+        IMAGE_TAG="${IMAGE##*:}"
+        if [ -z "${IMAGE_TAG}" ] || [ "${IMAGE_TAG}" = "${IMAGE}" ]; then
+          echo "ERROR: cannot extract a tag from IMAGE '${IMAGE}' (expected registry/org/component:tag)." >&2
+          exit 1
+        fi
+
+        REPO_PATH="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
+        AUTH_URL="https://${USERNAME}:${TOKEN}@${GIT_HOST}/${REPO_PATH}.git"
+        CLEAN_URL="https://${GIT_HOST}/${REPO_PATH}.git"
+
+        # --- clone the gitops repo --------------------------------------------
+        # The task clones the repo itself (same pod, same uid), so there is no
+        # "dubious ownership" problem and no need for safe.directory here --
+        # unlike open-pr, which inherits a workspace cloned by another task.
+        # Clone with the credential URL in case the repo is private, then reset
+        # the remote to the clean URL so the token does not sit in .git/config;
+        # the push below passes the credential explicitly, same as open-pr.
+        WORK="$(mktemp -d)/gitops"
+        git clone --quiet --branch "${BASE_BRANCH}" "${AUTH_URL}" "${WORK}"
+        cd "${WORK}"
+        git remote set-url origin "${CLEAN_URL}"
+
+        if [ ! -f "${VALUES_PATH}" ]; then
+          echo "ERROR: ${VALUES_PATH} not found in ${CLEAN_URL} @ ${BASE_BRANCH}." >&2
+          exit 1
+        fi
+
+        # --- rewrite image.tag -------------------------------------------------
+        # The environment values files are deliberately two lines (image: /
+        # tag:), so a line-level sed is the whole editor. Assert exactly one
+        # 'tag:' line first so the sed can never silently edit some other key,
+        # and validate the rewrite afterwards. If the values file ever grows a
+        # second tag:, this fails loudly instead of guessing.
+        TAG_LINES="$(grep -cE '^[[:space:]]*tag:' "${VALUES_PATH}" || true)"
+        if [ "${TAG_LINES}" != "1" ]; then
+          echo "ERROR: expected exactly one 'tag:' line in ${VALUES_PATH}, found ${TAG_LINES}." >&2
+          exit 1
+        fi
+        OLD_TAG="$(sed -n -E 's/^[[:space:]]*tag:[[:space:]]*"?([^"#]*)"?.*/\1/p' "${VALUES_PATH}")"
+        if [ "${OLD_TAG}" = "${IMAGE_TAG}" ]; then
+          echo "${ENVIRONMENT} is already at image tag ${IMAGE_TAG}; nothing to promote."
+          printf '' > "$(results.MR_URL.path)"
+          printf '0' > "$(results.MERGED.path)"
+          exit 0
+        fi
+
+        sed -Ei 's|^([[:space:]]*tag:)[[:space:]]*.*|\1 "'"${IMAGE_TAG}"'"|' "${VALUES_PATH}"
+        grep -qF "tag: \"${IMAGE_TAG}\"" "${VALUES_PATH}" || {
+          echo "ERROR: rewrite of image.tag in ${VALUES_PATH} did not take." >&2
+          exit 1
+        }
+
+        git config user.email "tekton-bot@${GIT_HOST}"
+        git config user.name  "TSSC GitOps Bot"
+
+        BRANCH="gitops/${ENVIRONMENT}-image-${IMAGE_TAG}"
+        git checkout -q -b "${BRANCH}"
+        git add "${VALUES_PATH}"
+        git commit -q -m "Promote ${ENVIRONMENT}: image tag ${OLD_TAG} -> ${IMAGE_TAG}"
+
+        git push --quiet "${AUTH_URL}" "${BRANCH}"
+
+        TITLE="Promote ${ENVIRONMENT}: ${IMAGE_TAG}"
+        BODY="Automated promotion from the dev-gitops-cd pipeline (started by ci-build-publish).
+
+        - New image: ${IMAGE}
+        - App commit: ${APP_COMMIT:-n/a} in ${APP_REPO_URL:-n/a}"
+
+        export GITLAB_HOST="${GIT_HOST}"
+        export GITLAB_TOKEN="${TOKEN}"
+        MR_URL="$(glab mr create \
+          --source-branch "${BRANCH}" \
+          --target-branch "${BASE_BRANCH}" \
+          --title "${TITLE}" \
+          --description "${BODY}" \
+          --yes 2>&1 | grep -Eo 'https?://[^ ]+/-/merge_requests/[0-9]+' | head -1 || true)"
+        if [ -z "${MR_URL}" ]; then
+          echo "ERROR: glab mr create produced no MR URL (see output above)." >&2
+          exit 1
+        fi
+        echo "MR opened: ${MR_URL}"
+        printf '%s' "${MR_URL}" > "$(results.MR_URL.path)"
+
+        MERGED="0"
+        if [ "${AUTO_MERGE}" = "true" ]; then
+          MR_IID="${MR_URL##*/}"
+          # A fresh MR is not always immediately mergeable (GitLab computes
+          # mergeability asynchronously), so retry briefly rather than failing
+          # a promotion over a race. All failures keep the MR open for a human.
+          for attempt in 1 2 3 4 5; do
+            if glab mr merge "${MR_IID}" --yes --remove-source-branch; then
+              MERGED="1"
+              break
+            fi
+            echo "merge attempt ${attempt} failed; retrying in 5s"
+            sleep 5
+          done
+          if [ "${MERGED}" != "1" ]; then
+            echo "ERROR: could not auto-merge ${MR_URL}; it is left open for manual merge." >&2
+            exit 1
+          fi
+          echo "MR merged: ${MR_URL}"
+        fi
+        printf '%s' "${MERGED}" > "$(results.MERGED.path)"

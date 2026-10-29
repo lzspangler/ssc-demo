@@ -1,0 +1,132 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.openshift.io/runtime: java
+    pipelines.openshift.io/strategy: docker
+    pipelines.openshift.io/used-by: build-cloud
+    app.kubernetes.io/part-of: maven-build-ci
+  name: dev-gitops-cd
+spec:
+  # Dev gitops CD: promote the image ci-build-publish just published into the
+  # dev environment of the gitops repository.
+  #
+  #   ci-build-publish (finally) -> dev-gitops-cd -> MR to
+  #   app/spring-boot-example/environments/dev/values.yaml -> auto-merged
+  #   -> Argo CD picks the tag change up and rolls dev.
+  #
+  # HOW IT IS TRIGGERED. Tekton has no native "run this pipeline when that one
+  # finishes", so ci-build-publish runs `start-dev-gitops-cd` as a finally task
+  # (gated on build-container having succeeded). That task POSTs a PipelineRun
+  # of THIS pipeline through the Kubernetes API with the pod's service account
+  # token, passing the exact `output-image` that CI published -- the tag is the
+  # commit SHA, an immutable pointer to the source, SBOM and signatures, so the
+  # values file never references an image that was not just built and pushed.
+  #
+  # WHY AN MR (AND WHY AUTO-MERGE). The gitops repo's default branch is
+  # protected and the `scm-auth-secret` bot cannot push it directly -- it CAN
+  # push a branch, open an MR, and accept it (Developer). So the promotion is
+  # an MR + immediate merge: main only ever moves through GitLab, every
+  # promotion is visible as a merge record with the CI run that caused it, and
+  # Argo CD sees one atomic values.yaml change. This pipeline deliberately
+  # auto-merges DEV only; promoting to qa/prod stays a human decision made by
+  # editing those values files (or a future pipeline with AUTO_MERGE="false").
+  #
+  # WHY NO WORKSPACES. The whole job is one clone-edit-push of a tiny repo, so
+  # the task clones into a pod-local temp dir instead of a PVC workspace: no
+  # PVC to bind, no cross-task uid problems, and the run can be started by a
+  # bare PipelineRun from the finally task without workspace plumbing.
+  params:
+    - name: image
+      type: string
+      description: >-
+        Full image reference published by ci-build-publish
+        (registry/org/component:<commit sha>). Only the tag is written to the
+        values file; the full reference goes into the MR description.
+    - name: app-repo-url
+      type: string
+      description: Application repo the image was built from (MR context only).
+      default: ""
+    - name: app-commit
+      type: string
+      description: Application commit the image was built from (MR context only).
+      default: ""
+    # ---------------- gitops repo ----------------
+    # Cluster-specific: like the image-registry default in
+    # ci-build-triggers.yaml, these cannot be templated (the pipelines are
+    # synced as plain YAML), so they carry this cluster's values.
+    - name: gitops-url
+      type: string
+      description: GitLab URL of the gitops repository to promote into.
+      default: https://gitlab-gitlab.apps.cluster-6gpcf.dyn.redhatworkshops.io/development/spring-boot-example-gitops
+    - name: git-host
+      type: string
+      description: Host of the SCM serving the gitops repository.
+      default: gitlab-gitlab.apps.cluster-6gpcf.dyn.redhatworkshops.io
+    - name: values-path
+      type: string
+      description: Values file inside the gitops repo whose image.tag is bumped.
+      default: app/spring-boot-example/environments/dev/values.yaml
+    - name: environment
+      type: string
+      description: Environment being promoted to (branch name + MR title).
+      default: dev
+    - name: base-branch
+      type: string
+      description: Branch of the gitops repo the MR targets.
+      default: main
+    - name: auto-merge
+      type: string
+      description: >-
+        "true" merges the promotion MR immediately (the dev default); "false"
+        leaves it open for review.
+      default: "true"
+    - name: scm-secret-name
+      type: string
+      default: scm-auth-secret
+    # ---------------- runtime ----------------
+    # Needs git + glab (+ curl/jq for the task that starts this pipeline).
+    # The agent image bundles all of them and is already pulled onto the nodes
+    # by the prewarm DaemonSet.
+    - name: agent-image
+      type: string
+      description: >-
+        Image the promotion runs in (must bundle git + glab). The agent image
+        is reused so no new image has to be built or pulled for CD.
+      default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+  results:
+    - name: MR_URL
+      description: URL of the promotion MR (empty if the tag was already current).
+      value: $(tasks.gitops-bump-image.results.MR_URL)
+    - name: MERGED
+      description: '"1" if the MR was merged, "0" otherwise.'
+      value: $(tasks.gitops-bump-image.results.MERGED)
+  tasks:
+    - name: gitops-bump-image
+      params:
+        - name: GIT_URL
+          value: $(params.gitops-url)
+        - name: GIT_HOST
+          value: $(params.git-host)
+        - name: IMAGE
+          value: $(params.image)
+        - name: VALUES_PATH
+          value: $(params.values-path)
+        - name: ENVIRONMENT
+          value: $(params.environment)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
+        - name: AUTO_MERGE
+          value: $(params.auto-merge)
+        - name: APP_REPO_URL
+          value: $(params.app-repo-url)
+        - name: APP_COMMIT
+          value: $(params.app-commit)
+        - name: SCM_SECRET_NAME
+          value: $(params.scm-secret-name)
+        # gitops-bump-image needs git + glab; the default git-init image ships
+        # git only, so run it on the agent image (same override open-pr uses).
+        - name: GIT_IMAGE
+          value: $(params.agent-image)
+      taskRef:
+        name: gitops-bump-image
