@@ -355,11 +355,11 @@ components:
   # (ImagePullBackOff) on a fresh cluster until promotions land; that is the
   # demo working as designed.
   #
-  # MIGRATING A CLUSTER WHERE dev WAS CREATED BY HAND: an Application must not
-  # exist twice. Delete the hand-made one before the next `helm upgrade`:
-  #   oc -n openshift-gitops delete application spring-boot-example-dev
-  # (helm will then create and own the replacement rendered here. The qa and
-  # prod Applications are new -- nothing to clean up.)
+  # MIGRATING A CLUSTER WHERE dev WAS CREATED BY HAND: nothing to delete. The
+  # chart is installed with `helm template | oc apply` (RUNBOOK §5), and
+  # `oc apply` simply adopts and updates the existing Application in place --
+  # re-running the §5 command renders all three Applications and converges
+  # dev onto the chart's sync policy while creating qa and prod.
   appEnvironments:
     enabled: true
     syncWave: "16"

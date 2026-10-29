@@ -177,6 +177,7 @@ spec:
         - name: subdirectory
           value: $(params.subdirectory)
       taskRef:
+        kind: Task
         name: git-clone
       workspaces:
         - name: output
@@ -225,6 +226,7 @@ spec:
       runAfter:
         - verify-commit
       taskRef:
+        kind: Task
         name: maven
       workspaces:
         - name: source
@@ -264,6 +266,7 @@ spec:
       runAfter:
         - package
       taskRef:
+        kind: Task
         name: buildah-rhtap
       workspaces:
         - name: source
@@ -284,6 +287,7 @@ spec:
       runAfter:
         - build-container
       taskRef:
+        kind: Task
         name: upload-sbom-to-rhtpa
       when:
         - input: "$(params.upload-sbom)"
@@ -299,6 +303,7 @@ spec:
         - name: IMAGE_URL
           value: $(tasks.build-container.results.IMAGE_URL)
       taskRef:
+        kind: Task
         name: show-sbom-rhdh
     - name: show-summary
       params:
@@ -311,6 +316,7 @@ spec:
         - name: build-task-status
           value: $(tasks.build-container.status)
       taskRef:
+        kind: Task
         name: summary
       workspaces:
         - name: workspace
@@ -336,6 +342,7 @@ spec:
         - name: APP_COMMIT
           value: $(tasks.clone-repository.results.commit)
       taskRef:
+        kind: Task
         name: start-dev-gitops-cd
       when:
         - input: "$(params.deploy-dev-gitops)"

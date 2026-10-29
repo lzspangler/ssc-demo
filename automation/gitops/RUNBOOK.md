@@ -261,6 +261,17 @@ helm template ssc automation/gitops/bootstrap-infra \
   -f /tmp/ssc-demo-values.yaml | oc apply -f -
 ```
 
+**Pushing chart changes does NOT update the cluster.** No Argo Application
+tracks `bootstrap-infra` itself — it is the layer that *creates* the Argo
+Applications, and it is only ever read at this `helm template` step. So after
+changing anything under `automation/gitops/bootstrap-infra/`, re-run the §5
+command to converge the cluster. `oc apply` makes it idempotent and adopts
+existing objects (e.g. a hand-made `spring-boot-example-dev`) in place; keep
+`/tmp/ssc-demo-values.yaml` — the private override from §4 is needed for every
+re-render, not just the first. To apply only a slice of the chart, render with
+the full values and filter the output (e.g. just the `spring-boot-example-*`
+Applications) before piping to `oc apply`.
+
 Eleven Applications land at once; the sync waves serialise them.
 
 ```
