@@ -1,0 +1,121 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: start-dev-gitops-cd
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "tekton, pipelinerun"
+spec:
+  description: >-
+    Start a dev-gitops-cd PipelineRun through the Kubernetes API. Tekton has no
+    built-in "run this pipeline when that one finishes", so ci-build-publish
+    runs this as a finally task and creates the CD run directly: one POST of a
+    PipelineRun manifest, authenticated with the pod's own service account
+    token. (kubectl/tkn do NOT pick up in-cluster credentials on their own, but
+    the API is one curl away: token and CA cert are projected into every pod.)
+  params:
+    - name: NAMESPACE
+      type: string
+      description: Namespace the CD PipelineRun is created in.
+      default: tssc-app-ci
+    - name: PIPELINE
+      type: string
+      description: CD pipeline to start.
+      default: dev-gitops-cd
+    - name: IMAGE
+      type: string
+      description: Full image reference published by CI; forwarded to the CD pipeline.
+    - name: APP_REPO_URL
+      type: string
+      description: Application repo the image was built from; forwarded for MR context.
+      default: ""
+    - name: APP_COMMIT
+      type: string
+      description: Application commit the image was built from; forwarded for MR context.
+      default: ""
+    - name: GIT_IMAGE
+      type: string
+      description: >-
+        Image this task runs in. It MUST contain curl AND jq (the payload is
+        built with jq so the image reference is escaped safely). The pipeline
+        overrides this with the agent image, which bundles both.
+      default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+  results:
+    - name: PIPELINERUN
+      description: Name of the created PipelineRun.
+  steps:
+    - name: create-pipelinerun
+      image: $(params.GIT_IMAGE)
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: PARAM_NAMESPACE
+          value: $(params.NAMESPACE)
+        - name: PARAM_PIPELINE
+          value: $(params.PIPELINE)
+        - name: PARAM_IMAGE
+          value: $(params.IMAGE)
+        - name: PARAM_APP_REPO_URL
+          value: $(params.APP_REPO_URL)
+        - name: PARAM_APP_COMMIT
+          value: $(params.APP_COMMIT)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        # In-cluster API access: the service account token and CA are projected
+        # into every pod; KUBERNETES_SERVICE_HOST/PORT are injected by kubelet.
+        SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+        TOKEN="$(cat "${SA_DIR}/token")"
+        API="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS}"
+
+        # The manifest is assembled with jq --arg so every value is JSON-encoded
+        # by jq itself; no hand-built string escaping of image references.
+        PAYLOAD="$(jq -n \
+          --arg pipeline "${PARAM_PIPELINE}" \
+          --arg image "${PARAM_IMAGE}" \
+          --arg repo "${PARAM_APP_REPO_URL}" \
+          --arg commit "${PARAM_APP_COMMIT}" \
+          '{
+            apiVersion: "tekton.dev/v1",
+            kind: "PipelineRun",
+            metadata: {
+              generateName: ($pipeline + "-"),
+              labels: {
+                "app.kubernetes.io/part-of": "maven-build-ci",
+                "tekton.dev/pipeline": $pipeline,
+                trigger: "ci-build-publish"
+              }
+            },
+            spec: {
+              pipelineRef: { name: $pipeline },
+              taskRunTemplate: { serviceAccountName: "pipeline" },
+              timeouts: { pipeline: "15m0s" },
+              params: [
+                { name: "image",       value: $image },
+                { name: "app-repo-url", value: $repo },
+                { name: "app-commit",  value: $commit }
+              ]
+            }
+          }')"
+
+        HTTP_CODE="$(curl -sS --cacert "${SA_DIR}/ca.crt" \
+          -o /tmp/pipelinerun-response.json -w '%{http_code}' \
+          -H "Authorization: Bearer ${TOKEN}" \
+          -H "Content-Type: application/json" \
+          -X POST "${API}/apis/tekton.dev/v1/namespaces/${PARAM_NAMESPACE}/pipelineruns" \
+          -d "${PAYLOAD}")"
+
+        # 201 Created is the only success; anything else (403 RBAC, 422 bad
+        # manifest, ...) prints the API's own message so the CI log shows why.
+        if [ "${HTTP_CODE}" != "201" ]; then
+          echo "ERROR: creating the ${PARAM_PIPELINE} PipelineRun returned HTTP ${HTTP_CODE}:" >&2
+          cat /tmp/pipelinerun-response.json >&2
+          exit 1
+        fi
+
+        PR_NAME="$(jq -r '.metadata.name' /tmp/pipelinerun-response.json)"
+        echo "Started PipelineRun ${PARAM_NAMESPACE}/${PR_NAME} (pipeline ${PARAM_PIPELINE})"
+        printf '%s' "${PR_NAME}" > "$(results.PIPELINERUN.path)"

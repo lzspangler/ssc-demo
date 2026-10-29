@@ -117,6 +117,7 @@ image build, SBOM upload, or RHTPA scan.
 | `pipelines/agentic-cve-analysis.yaml` | Same scan chain, but analyzes every fixable CVE and opens one issue per vulnerability (each carries the six-field decision) |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
+| `pipelines/dev-gitops-cd.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
 | `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation` (one EventListener + interceptors + a binding/template pair per command + RBAC + Route) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
@@ -138,6 +139,8 @@ image build, SBOM upload, or RHTPA scan.
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR — tests + CVE remediation (runs on the **agent image** — see note below) |
 | `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipeline |
+| `tasks/gitops-bump-image.yaml` | Bumps `image.tag` in a gitops values file and lands it as an (auto-merged) MR — used by the dev CD pipeline |
+| `tasks/start-dev-gitops-cd.yaml` | Creates a `dev-gitops-cd` PipelineRun through the Kubernetes API — run as a `finally` task of `ci-build-publish` |
 | `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
 | `images/ai-agent-maven-aider/Dockerfile` | Agent runtime, **aider** flavor (ubi-minimal + JDK17 + Maven + Python/aider + git/glab/gh) |
 | `images/ai-python/Dockerfile` | CVE selection/analysis runtime (Anthropic + OpenAI Python SDKs) |
@@ -239,6 +242,45 @@ the CVE pipelines the agent and `mvn verify` run in a pod-local scratch copy to
 avoid the shared-`target/` race. It needs the `ai-agent-config`/`ai-agent-secret`
 and `scm-auth-secret` objects (and the agent image), but not `tpa-secret`, RHTPA,
 or TAS.
+
+### `dev-gitops-cd` (dev image promotion)
+
+```
+ci-build-publish (finally: start-dev-gitops-cd) → dev-gitops-cd → gitops-bump-image → MR (auto-merged)
+```
+
+`ci-build-publish` ends with a `finally` task that starts `dev-gitops-cd`
+whenever `build-container` succeeded and `deploy-dev-gitops` is `"true"` (the
+default). Tekton has no native pipeline-to-pipeline chaining, so the finally
+task (`tasks/start-dev-gitops-cd.yaml`) creates the CD PipelineRun itself with
+a `curl` POST against the Kubernetes API, authenticated by the pod's service
+account token (it runs as `tekton-triggers-sa`, which already holds `create
+pipelineruns` from the trigger RBAC). It passes the exact `output-image` CI
+just published — the tag is the commit SHA, an immutable pointer to the source,
+SBOM and signatures, so the values file only ever references an image that
+exists and was just built.
+
+The CD pipeline is one task (`gitops-bump-image`): clone the **gitops** repo
+(`development/spring-boot-example-gitops` on the cluster's GitLab), rewrite
+`image.tag` in `app/spring-boot-example/environments/dev/values.yaml`, push a
+`gitops/dev-image-<sha>` branch, open an MR, and merge it immediately
+(`AUTO_MERGE="true"`). The bot in `scm-auth-secret` cannot push the protected
+default branch directly, but can push a branch and open + accept an MR, so main
+only ever moves through GitLab and every promotion is a merge record. Argo CD
+then picks up the values change and rolls dev. No-op safe: if the tag is
+already current the run exits cleanly with no MR. **Auto-merge is scoped to
+dev** — promoting to qa/prod stays a human decision (edit those values files,
+or run the pipeline with `environment=qa auto-merge=false` as a starting
+point). The pipeline has no workspaces: the task clones the tiny gitops repo
+into a pod-local temp dir, so a bare PipelineRun needs no PVC plumbing.
+
+Run it manually the same way the finally task does:
+
+```bash
+tkn -n tssc-app-ci pipeline start dev-gitops-cd \
+  -p image=quay.apps.<domain>/tssc/spring-boot-example-application:<sha> \
+  -p app-repo-url=https://… -p app-commit=<sha> --showlog
+```
 
 ## Hand-off: selection → remediation
 
