@@ -1,0 +1,137 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.openshift.io/runtime: java
+    pipelines.openshift.io/strategy: docker
+    pipelines.openshift.io/used-by: build-cloud
+    app.kubernetes.io/part-of: maven-build-ci
+  name: prod-gitops-cd
+spec:
+  # Prod gitops CD: promote an image that has already been through dev (and
+  # normally qa) into the prod environment of the gitops repository.
+  #
+  #   prod-gitops-cd (started by a human) -> MR to
+  #   app/spring-boot-example/environments/prod/values.yaml -> left open for
+  #   review -> a human merges it -> Argo CD picks the tag change up and
+  #   rolls prod.
+  #
+  # HOW IT IS TRIGGERED. Deliberately NOT chained off ci-build-publish the way
+  # dev-gitops-cd is: dev auto-promotes on every publish, but a prod
+  # promotion is a release decision, so this pipeline is started by hand with
+  # the image reference to promote. Pass the tag that has earned the release --
+  # the tag is the commit SHA, an immutable pointer to the source, SBOM and
+  # signatures, so the values file references exactly what was reviewed.
+  #
+  # WHY AN MR (AND WHY NO AUTO-MERGE). The gitops repo's default branch is
+  # protected and the `scm-auth-gitops-secret` bot cannot push it directly --
+  # it CAN push a branch, open an MR, and accept it (Maintainer). The
+  # promotion is an MR that stays OPEN for review: main only ever moves
+  # through GitLab, the human merge IS the release decision, and Argo CD
+  # sees one atomic values.yaml change. auto-merge="true" exists for
+  # emergencies, but a prod pipeline that ships unreviewed defeats its own
+  # purpose -- leave it "false".
+  #
+  # WHY NO WORKSPACES. The whole job is one clone-edit-push of a tiny repo, so
+  # the task clones into a pod-local temp dir instead of a PVC workspace: no
+  # PVC to bind, no cross-task uid problems, and the run can be started by a
+  # bare PipelineRun without workspace plumbing.
+  params:
+    - name: image
+      type: string
+      description: >-
+        Full image reference to promote (registry/org/component:<commit sha>) --
+        normally a tag ci-build-publish already published and dev-gitops-cd (and
+        usually qa-gitops-cd) already promoted. Only the tag is written to the
+        values file; the full reference goes into the MR description.
+    - name: app-repo-url
+      type: string
+      description: Application repo the image was built from (MR context only).
+      default: ""
+    - name: app-commit
+      type: string
+      description: Application commit the image was built from (MR context only).
+      default: ""
+    # ---------------- gitops repo ----------------
+    # Cluster-specific: like the image-registry default in
+    # ci-build-triggers.yaml, these cannot be templated (the pipelines are
+    # synced as plain YAML), so they carry this cluster's values.
+    - name: gitops-url
+      type: string
+      description: GitLab URL of the gitops repository to promote into.
+      default: https://gitlab-gitlab.apps.cluster-6gpcf.dyn.redhatworkshops.io/development/spring-boot-example-gitops
+    - name: git-host
+      type: string
+      description: Host of the SCM serving the gitops repository.
+      default: gitlab-gitlab.apps.cluster-6gpcf.dyn.redhatworkshops.io
+    - name: values-path
+      type: string
+      description: Values file inside the gitops repo whose image.tag is bumped.
+      default: app/spring-boot-example/environments/prod/values.yaml
+    - name: environment
+      type: string
+      description: Environment being promoted to (branch name + MR title).
+      default: prod
+    - name: base-branch
+      type: string
+      description: Branch of the gitops repo the MR targets.
+      default: main
+    - name: auto-merge
+      type: string
+      description: >-
+        "false" leaves the promotion MR open for human review (the prod
+        default); "true" merges it immediately, the way dev-gitops-cd does.
+      default: "false"
+    - name: scm-secret-name
+      type: string
+      description: >-
+        Secret holding the gitops repository's own project access token. A
+        GitLab project-bot user cannot be shared across projects, so this is
+        NOT the application repository's scm-auth-secret.
+      default: scm-auth-gitops-secret
+    # ---------------- runtime ----------------
+    # Needs git + glab. The agent image bundles both and is already pulled
+    # onto the nodes by the prewarm DaemonSet.
+    - name: agent-image
+      type: string
+      description: >-
+        Image the promotion runs in (must bundle git + glab). The agent image
+        is reused so no new image has to be built or pulled for CD.
+      default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+  results:
+    - name: MR_URL
+      description: URL of the promotion MR (empty if the tag was already current).
+      value: $(tasks.gitops-bump-image.results.MR_URL)
+    - name: MERGED
+      description: '"1" if the MR was merged, "0" otherwise.'
+      value: $(tasks.gitops-bump-image.results.MERGED)
+  tasks:
+    - name: gitops-bump-image
+      params:
+        - name: GIT_URL
+          value: $(params.gitops-url)
+        - name: GIT_HOST
+          value: $(params.git-host)
+        - name: IMAGE
+          value: $(params.image)
+        - name: VALUES_PATH
+          value: $(params.values-path)
+        - name: ENVIRONMENT
+          value: $(params.environment)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
+        - name: AUTO_MERGE
+          value: $(params.auto-merge)
+        - name: APP_REPO_URL
+          value: $(params.app-repo-url)
+        - name: APP_COMMIT
+          value: $(params.app-commit)
+        - name: SCM_SECRET_NAME
+          value: $(params.scm-secret-name)
+        # gitops-bump-image needs git + glab; the default git-init image ships
+        # git only, so run it on the agent image (same override open-pr uses).
+        - name: GIT_IMAGE
+          value: $(params.agent-image)
+      taskRef:
+        kind: Task
+        name: gitops-bump-image

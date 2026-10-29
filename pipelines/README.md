@@ -118,6 +118,8 @@ image build, SBOM upload, or RHTPA scan.
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
 | `pipelines/dev-gitops-cd.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
+| `pipelines/qa-gitops-cd.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
+| `pipelines/prod-gitops-cd.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
 | `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation` (one EventListener + interceptors + a binding/template pair per command + RBAC + Route) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
@@ -128,7 +130,7 @@ image build, SBOM upload, or RHTPA scan.
 | `data/sbom/*.cdx.json` | One-component CycloneDX catalog SBOMs — their only job is to make each `.rhlw-00001` build a *known version* of its base PURL, so the fix-version scan can offer it |
 | `secrets/ai-agent-secret.example.yaml` | Example Secret — AI provider credentials |
 | `secrets/scm-auth-secret.example.yaml` | Example Secret — Git token for opening the PR/MR |
-| `secrets/scm-auth-gitops-secret.example.yaml` | Example Secret — the gitops repository's own token for `dev-gitops-cd` (a GitLab project bot cannot be shared across projects, so it is separate from `scm-auth-secret`) |
+| `secrets/scm-auth-gitops-secret.example.yaml` | Example Secret — the gitops repository's own token for the gitops CD pipelines (a GitLab project bot cannot be shared across projects, so it is separate from `scm-auth-secret`) |
 | `secrets/gitlab-webhook-secret.example.yaml` | Example Secret — shared token validating the GitLab issue webhook |
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
 | `tasks/rhtpa-vulnerability-analysis1.yaml` | Scans the SBOM's PURLs against RHTPA, then suppresses findings explicitly marked fixed/not_affected |
@@ -275,10 +277,10 @@ gitops repo needs a separate token (both are minted by the GitLab seeding job
 on a GitOps install). Argo CD
 then picks up the values change and rolls dev. No-op safe: if the tag is
 already current the run exits cleanly with no MR. **Auto-merge is scoped to
-dev** — promoting to qa/prod stays a human decision (edit those values files,
-or run the pipeline with `environment=qa auto-merge=false` as a starting
-point). The pipeline has no workspaces: the task clones the tiny gitops repo
-into a pod-local temp dir, so a bare PipelineRun needs no PVC plumbing.
+dev** — promoting to qa/prod stays a human decision, made through the
+pipelines below. The pipeline has no workspaces: the task clones the tiny
+gitops repo into a pod-local temp dir, so a bare PipelineRun needs no PVC
+plumbing.
 
 Run it manually the same way the finally task does:
 
@@ -287,6 +289,41 @@ tkn -n tssc-app-ci pipeline start dev-gitops-cd \
   -p image=quay.apps.<domain>/tssc/spring-boot-example-application:<sha> \
   -p app-repo-url=https://… -p app-commit=<sha> --showlog
 ```
+
+### `qa-gitops-cd` / `prod-gitops-cd` (human-gated promotion)
+
+```
+dev-gitops-cd (auto) → qa-gitops-cd (human start) → MR (open for review) → human merges → Argo CD rolls qa
+                                        └────────── prod-gitops-cd (human start) → MR (open for review) → human merges → Argo CD rolls prod
+```
+
+The qa and prod pipelines are the same one-task `gitops-bump-image` flow as
+dev, with two deliberate differences:
+
+- **Started by a human, not chained off CI.** Nothing triggers them
+  automatically — promoting past dev is a decision, not a side effect of a
+  build. You start one with the image reference that has earned the promotion
+  (usually the tag dev just rolled, and for prod, the one that survived qa).
+- **`auto-merge` defaults to `"false"`.** The run opens the promotion MR
+  (branch `gitops/qa-image-<sha>` / `gitops/prod-image-<sha>`) and leaves it
+  open; merging it in GitLab **is** the promotion. Override with
+  `-p auto-merge=true` only when you want dev-style automatic merge.
+
+They share everything else with dev: the gitops repo
+(`scm-auth-gitops-secret`), no workspaces, and the no-op-if-tag-current
+behavior. Environment and values file are baked in as defaults
+(`environments/qa/values.yaml` / `environments/prod/values.yaml`), so a run
+needs nothing but the image:
+
+```bash
+tkn -n tssc-app-ci pipeline start qa-gitops-cd \
+  -p image=quay.apps.<domain>/tssc/spring-boot-example-application:<sha> --showlog
+# read the MR URL from the results, review it, merge it in GitLab
+```
+
+The run's `MR_URL` result points at the open MR; after you merge it, the
+`spring-boot-example-qa` (or `-prod`) Argo CD Application picks up the values
+change and rolls the deployment.
 
 ## Hand-off: selection → remediation
 
@@ -452,7 +489,7 @@ enable.
 | `gitlab-webhook-secret` (key `secretToken`) | Shared token the `gitlab` interceptor checks against GitLab's `X-Gitlab-Token`. |
 | `git-auth` (Secret) | **Private repos only** — clone credentials. Not bound by either template by default (see the note at the end of this section); a public app repo needs none. |
 | `scm-auth-secret` (Secret) | SCM token to open the MR (`api` scope on GitLab). |
-| `scm-auth-gitops-secret` (Secret) | The gitops repository's own project token — what `dev-gitops-cd`'s `gitops-bump-image` pushes and merges with (`scm-secret-name` param). |
+| `scm-auth-gitops-secret` (Secret) | The gitops repository's own project token — what the gitops CD pipelines' `gitops-bump-image` pushes and merges with (`scm-secret-name` param). |
 | `maven-settings` (Secret) | Maven `settings.xml` for the build — mirrors all resolution through the Artifactory `maven` virtual repo. A **Secret** (not a ConfigMap) because Artifactory OSS has anonymous access off, so the settings.xml embeds a `<server>` credential. The mirror URL is the in-cluster **Service** (`http://artifactory.artifactory.svc.cluster.local:8082/artifactory/maven`), not the public Route — see the route-timeout caveat below. See `secrets/maven-settings-secret.example.yaml`. |
 | `ai-agent-config` + `ai-agent-secret` | AI backend config (as for the other pipelines). |
 
@@ -603,7 +640,7 @@ your own.
 | `ai-agent-config` | ConfigMap | all pipelines | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
 | `ai-agent-secret` | Secret | all pipelines | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
 | `scm-auth-secret` | Secret | analysis (issues) + remediation + test-gen (PR step) | `username` + `token` with push + PR/MR-create scope, and issue-create for analysis (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
-| `scm-auth-gitops-secret` | Secret | dev-gitops-cd only | The gitops repository's own project access token — `dev-gitops-cd`'s `scm-secret-name` default. Separate from `scm-auth-secret` because a GitLab project bot cannot be shared across projects. From `secrets/scm-auth-gitops-secret.example.yaml`. |
+| `scm-auth-gitops-secret` | Secret | dev/qa/prod-gitops-cd | The gitops repository's own project access token — the `scm-secret-name` default of all three gitops CD pipelines. Separate from `scm-auth-secret` because a GitLab project bot cannot be shared across projects. From `secrets/scm-auth-gitops-secret.example.yaml`. |
 
 #### SCM token scopes (`scm-auth-secret`)
 
