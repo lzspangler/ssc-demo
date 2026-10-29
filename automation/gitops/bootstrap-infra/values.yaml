@@ -34,11 +34,11 @@
 #                                (TrustedProfileAnalyzer, rhtpa.io/v1). The
 #                                charts.openshift.io Helm path was removed: only
 #                                the operator supports Exploit Intelligence.
-#   16  app-dev                   The dev environment of the example application --
-#                                the consumer end of the CD chain. Tracks the
-#                                gitops repository the GitLab seeding job imports;
-#                                every promotion dev-gitops-cd merges there rolls
-#                                this deployment. Last on purpose: see the
+#   16  app-environments          The example application's dev/qa/prod environments
+#                                -- the consumer end of the CD chain. Each tracks
+#                                the gitops repository the GitLab seeding job
+#                                imports; every promotion merged there rolls the
+#                                matching deployment. Last on purpose: see the
 #                                component below.
 #
 # BEFORE INSTALLING: set deployer.domain and replace every REPLACE_ME in
@@ -334,28 +334,34 @@ components:
       # `https://s3-openshift-storage.<domain>:443`.
       regionEndpoint: ""
 
-  # The dev environment of the example application: the consumer end of the CD
-  # chain. This Application tracks the gitops repository the GitLab seeding
-  # job imports (development/spring-boot-example-gitops on the cluster's own
-  # GitLab), so every promotion `dev-gitops-cd` auto-merges there rolls this
-  # deployment -- the same repo, values files and Helm layout the hand-created
-  # Application on the reference cluster uses.
+  # The example application's environments: the consumer end of the CD chain.
+  # One Application per environment, each tracking the gitops repository the
+  # GitLab seeding job imports (development/spring-boot-example-gitops on the
+  # cluster's own GitLab) with its own values file -- so a promotion merged
+  # there rolls exactly the matching deployment.
   #
-  # Wave 16, AFTER everything else, deliberately. The Application's health
+  # Which promotions happen automatically is a PIPELINE policy, not an
+  # Application one: dev-gitops-cd auto-merges dev only, and promoting to
+  # qa/prod stays a human decision (an MR editing those values files, or a
+  # pipeline run with environment=qa auto-merge=false). These Applications
+  # just make sure every environment has a deployment waiting for its turn.
+  #
+  # Wave 16, AFTER everything else, deliberately. Each Application's health
   # includes the Deployment pulling its image, and on a fresh cluster the
-  # imported values file's initial tag does not exist in Quay yet -- it appears
-  # with the first ci-build-publish run. An earlier wave would leave the whole
-  # install waiting on (or blocked behind) a permanently Degraded Application.
-  # Expect this one to sit Degraded (ImagePullBackOff) on a fresh cluster
-  # until the first promotion lands; that is the demo working as designed.
+  # imported values files' initial tags do not exist in Quay yet -- they
+  # appear with the first ci-build-publish run and its promotions. An earlier
+  # wave would leave the whole install waiting on (or blocked behind)
+  # permanently Degraded Applications. Expect them to sit Degraded
+  # (ImagePullBackOff) on a fresh cluster until promotions land; that is the
+  # demo working as designed.
   #
-  # MIGRATING A CLUSTER WHERE IT WAS CREATED BY HAND: the Application must not
+  # MIGRATING A CLUSTER WHERE dev WAS CREATED BY HAND: an Application must not
   # exist twice. Delete the hand-made one before the next `helm upgrade`:
   #   oc -n openshift-gitops delete application spring-boot-example-dev
-  # ( helm will then create and own the replacement rendered here.)
-  appDev:
+  # (helm will then create and own the replacement rendered here. The qa and
+  # prod Applications are new -- nothing to clean up.)
+  appEnvironments:
     enabled: true
-    namespace: spring-boot-example-dev
     syncWave: "16"
     # The gitops repository the GitLab seeding job imports. Its host is
     # derived from the gitlab component's namespace and deployer.domain.
@@ -363,4 +369,14 @@ components:
     gitopsRepo: spring-boot-example-gitops
     revision: main
     chartPath: app/spring-boot-example
+    environments:
+      - name: dev
+        namespace: spring-boot-example-dev
+        valuesFile: environments/dev/values.yaml
+      - name: qa
+        namespace: spring-boot-example-qa
+        valuesFile: environments/qa/values.yaml
+      - name: prod
+        namespace: spring-boot-example-prod
+        valuesFile: environments/prod/values.yaml
 
