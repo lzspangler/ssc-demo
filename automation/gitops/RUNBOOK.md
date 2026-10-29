@@ -312,7 +312,7 @@ Three credentials that used to be manual are now minted for you. Confirm them
 before going further — every later failure looks like something else.
 
 ```sh
-oc -n $NS get secret scm-auth-secret gitlab-webhook-secret quay-push
+oc -n $NS get secret scm-auth-secret scm-auth-gitops-secret gitlab-webhook-secret quay-push
 oc -n $NS get sa pipeline -o jsonpath='{.secrets[*].name}{"\n"}'
 ```
 
@@ -321,7 +321,9 @@ The last command must list `quay-push` alongside the operator's
 `output-image` and have `buildah-rhtap` push without naming a credential.
 
 `scm-auth-secret` holds a GitLab **project** access token scoped to the one
-application repository, not the root PAT.
+application repository, not the root PAT. `scm-auth-gitops-secret` holds a
+second one scoped to the gitops repository — a GitLab project-bot user cannot
+be shared across projects, so `dev-gitops-cd` needs its own token there.
 
 ## 8. Create the three remaining secrets by hand
 
@@ -432,8 +434,8 @@ oc -n $NS get pipelines                                      # 4 agentic + maven
 oc -n $NS get eventlistener agentic-issue-commands           # ADDRESS populated
 oc get clusterinterceptors                                   # at least cel, gitlab
 
-# Credentials — all five must exist
-oc -n $NS get secret scm-auth-secret gitlab-webhook-secret quay-push \
+# Credentials — all six must exist
+oc -n $NS get secret scm-auth-secret scm-auth-gitops-secret gitlab-webhook-secret quay-push \
                      tpa-secret ai-agent-secret maven-settings
 ```
 

@@ -13,11 +13,14 @@ spec:
     it as an MR: clone the gitops repo, rewrite `image.tag`, push a
     `gitops/<env>-image-*` branch, open an MR, and -- with AUTO_MERGE="true" --
     merge it right away. Auth comes from the SCM_SECRET_NAME secret (keys:
-    token, username): the same `scm-auth-secret` the remediation `open-pr` task
-    uses, so the token needs Developer on the gitops project, which is enough
-    to push a branch and open + accept an MR while main stays protected against
-    direct push. GitLab only (this is the demo's gitops SCM); a GitHub variant
-    would follow the provider switch in open-pr.
+    token, username): the gitops repository's OWN project access token
+    (`scm-auth-gitops-secret`), NOT the application repository's
+    `scm-auth-secret` -- a GitLab project-bot user is a member of exactly one
+    project and cannot be added to another, so the gitops repo needs its own
+    token (Maintainer, which is enough to push a branch and open + accept an
+    MR while main stays protected against direct push). GitLab only (this is
+    the demo's gitops SCM); a GitHub variant would follow the provider switch
+    in open-pr.
   params:
     - name: GIT_URL
       type: string

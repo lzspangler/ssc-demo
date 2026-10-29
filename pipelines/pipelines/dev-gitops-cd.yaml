@@ -24,8 +24,9 @@ spec:
   # values file never references an image that was not just built and pushed.
   #
   # WHY AN MR (AND WHY AUTO-MERGE). The gitops repo's default branch is
-  # protected and the `scm-auth-secret` bot cannot push it directly -- it CAN
-  # push a branch, open an MR, and accept it (Developer). So the promotion is
+  # protected and the `scm-auth-gitops-secret` bot cannot push it directly --
+  # it CAN push a branch, open an MR, and accept it (Maintainer). So the
+  # promotion is
   # an MR + immediate merge: main only ever moves through GitLab, every
   # promotion is visible as a merge record with the CI run that caused it, and
   # Argo CD sees one atomic values.yaml change. This pipeline deliberately
@@ -83,7 +84,11 @@ spec:
       default: "true"
     - name: scm-secret-name
       type: string
-      default: scm-auth-secret
+      description: >-
+        Secret holding the gitops repository's own project access token. A
+        GitLab project-bot user cannot be shared across projects, so this is
+        NOT the application repository's scm-auth-secret.
+      default: scm-auth-gitops-secret
     # ---------------- runtime ----------------
     # Needs git + glab (+ curl/jq for the task that starts this pipeline).
     # The agent image bundles all of them and is already pulled onto the nodes

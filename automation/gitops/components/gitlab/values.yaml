@@ -71,7 +71,8 @@ gitlab:
     password: REPLACE_ME
 
   # Groups, repositories and projects created by the seeding job. This mirrors
-  # the reference cluster: one group, one imported application repository.
+  # the reference cluster: one group, one imported application repository, and
+  # the imported gitops repository dev-gitops-cd promotes into.
   groups:
     - name: development
       users: []
@@ -141,11 +142,55 @@ gitlab:
             accessLevel: 40
             # GitLab rejects an expiry more than 365 days out; stay inside it.
             expiresInDays: 364
+
+        # The gitops repository: what the dev-gitops-cd pipeline promotes into
+        # (MR bumping image.tag in app/spring-boot-example/environments/dev/
+        # values.yaml) and what the spring-boot-example-dev Argo CD Application
+        # tracks. No labels, no webhooks -- nothing ever pushes here except the
+        # promotion pipeline, and no GitLab hook should fire on its merges.
+        - name: spring-boot-example-gitops
+          url: https://github.com/lzspangler/spring-boot-example-gitops.git
+          defaultBranch: main
+
+          # Imported repos carry the cluster they were authored on: the chart's
+          # base values hardcode a Quay host under quay.<domain>, and workshop
+          # clusters get a new domain on every rebuild. dev-gitops-cd only ever
+          # rewrites image.tag -- never repository -- so without this fix every
+          # environment would pull from a registry that no longer exists. After
+          # the import, the seeding job commits a one-line retarget of
+          # image.repository to THIS cluster's Quay.
+          rewriteImageRepository:
+            enabled: true
+            file: app/spring-boot-example/values.yaml
+            quayOrganization: tssc
+            component: spring-boot-example-application
+
+          # A SEPARATE project access token from the application repository's:
+          # a GitLab project-bot user is a member of exactly one project and
+          # CANNOT be added to another ("project bots cannot be added to other
+          # groups / projects"), so the gitops repo needs its own bot. Minted
+          # into the pipeline namespace as `scm-auth-gitops-secret`, which
+          # dev-gitops-cd reads via its `scm-secret-name` parameter.
+          accessToken:
+            enabled: true
+            name: ssc-demo-pipeline-gitops
+            secretName: scm-auth-gitops-secret
+            # api covers merge-request creation; write_repository covers the
+            # gitops/<env>-image-<tag> branch push.
+            scopes:
+              - api
+              - write_repository
+            # 40 = Maintainer: enough to push a branch and open + accept an MR
+            # while the protected default branch stays closed to direct push.
+            accessLevel: 40
+            # GitLab rejects an expiry more than 365 days out; stay inside it.
+            expiresInDays: 364
       project: []
 
 # Namespace the Tekton pipelines run in. The seeding job writes
-# `scm-auth-secret` and `gitlab-webhook-secret` here, and derives the webhook
-# URL from it, so it must match the namespace the pipelines are installed into.
+# `scm-auth-secret`, `scm-auth-gitops-secret` and `gitlab-webhook-secret` here,
+# and derives the webhook URL from it, so it must match the namespace the
+# pipelines are installed into.
 pipeline:
   namespace: tssc-app-ci
 

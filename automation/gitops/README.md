@@ -62,9 +62,9 @@ that cannot reach the `cel` and `gitlab` ClusterInterceptors.
 **Secrets stay out of it.** `pipelines/secrets/*.example.yaml` is never synced
 — those are `REPLACE_ME` templates, and applying them would overwrite a live
 credential with a placeholder. `ai-agent-secret`, `maven-settings` and
-`tpa-secret` are created by hand (steps 5–7 below). `scm-auth-secret` and
-`gitlab-webhook-secret`, which used to be manual, are now minted by the GitLab
-seeding job.
+`tpa-secret` are created by hand (steps 5–7 below). `scm-auth-secret`,
+`scm-auth-gitops-secret` and `gitlab-webhook-secret`, which used to be manual,
+are now minted by the GitLab seeding job.
 
 ## Where this came from
 
@@ -76,10 +76,12 @@ everything ssc-demo does not use removed, the per-cluster values collapsed onto
 a single `deployer.domain`, and three things added that the reference cluster
 still had wired by hand:
 
-* the GitLab group, imported application repository and CVE labels,
+* the GitLab group, imported application and gitops repositories, and the CVE
+  labels,
 * the issue-comment webhook that drives `agentic-cve-remediation`,
-* the GitLab project access token the pipeline pushes and opens MRs with,
-  written straight into the pipeline namespace as `scm-auth-secret`.
+* the GitLab project access tokens the pipelines push and open MRs with,
+  written straight into the pipeline namespace as `scm-auth-secret`
+  (application repository) and `scm-auth-gitops-secret` (gitops repository).
 
 Per-component deviations are documented at the top of each chart's
 `values.yaml`.
@@ -178,14 +180,21 @@ three in steps 5–7.
 ```sh
 oc -n gitlab        get job initialize-gitlab
 oc -n quay-registry get job quay-noobaa quay-config
-oc -n tssc-app-ci   get secret scm-auth-secret gitlab-webhook-secret quay-push
+oc -n tssc-app-ci   get secret scm-auth-secret scm-auth-gitops-secret gitlab-webhook-secret quay-push
 oc -n tssc-app-ci   get sa pipeline -o jsonpath='{.secrets[*].name}{"\n"}'
 ```
 
 `scm-auth-secret` holds a GitLab **project** access token scoped to the one
-application repository, not the root PAT. If the Secret already exists and
-holds a real token, the Job leaves it alone — so re-running the seeding does
-not invalidate a credential a pipeline is mid-run with.
+application repository, not the root PAT. `scm-auth-gitops-secret` holds a
+second one scoped to the gitops repository: a GitLab project-bot user is a
+member of exactly one project and cannot be added to another, so the gitops
+repo (which `dev-gitops-cd` pushes promotion branches to) needs its own token.
+If either Secret already exists and holds a real token, the Job leaves it
+alone — so re-running the seeding does not invalidate a credential a pipeline
+is mid-run with. The seeding also imports the gitops repository itself and
+retargets its chart's `image.repository` at this cluster's Quay (workshop
+clusters get a new domain on every rebuild, and the promotion pipeline only
+ever rewrites `image.tag`).
 
 `quay-push` holds the `tssc+remediation` robot account's token, and the last
 command should list it on the `pipeline` ServiceAccount. That link is what lets

@@ -7,9 +7,10 @@
 # Adapted from redhat-ads-tech/ocp-app-platform-demo-helm v1.4.2. Removed:
 # the Vault writes, the doorkeeper token-expiry patch and the DevSpaces OAuth
 # application -- none of which ssc-demo has. Added: per-repository labels,
-# the issue-comment webhook, and a project access token written into the
-# pipeline namespace. Those three are the hand-wiring the reference cluster
-# still had, and they are the whole reason this chart exists.
+# the issue-comment webhook, a project access token written into the
+# pipeline namespace, the imported gitops repository with its own token, and
+# the Quay retarget of that repository's chart. Those are the hand-wiring the
+# reference cluster still had, and they are the whole reason this chart exists.
 #
 # Everything is written to be re-runnable: the Job has backoffLimit 100 and
 # Argo CD will re-sync it, so every call either tolerates the "already exists"
@@ -255,6 +256,52 @@ data:
         - name: Remember the {{ $repo.name }} project id
           set_fact:
             project_id: '{{ "{{" }} r_project_{{ $repo.name | replace "-" "_" }}.json.id {{ "}}" }}'
+{{- if and $repo.rewriteImageRepository ($repo.rewriteImageRepository.enabled | default false) }}
+{{- $rewrite := $repo.rewriteImageRepository }}
+{{- $targetRepo := printf "quay.%s/%s/%s" (required "Set cluster.subdomain" $root.Values.cluster.subdomain) $rewrite.quayOrganization $rewrite.component }}
+{{- $branch := $repo.defaultBranch | default "main" }}
+
+        # ---- retarget the chart at this cluster's Quay ----------------------
+        # The imported repository carries the Quay host of the cluster its
+        # chart was authored on (workshop clusters get a new domain on every
+        # rebuild), and dev-gitops-cd only ever rewrites image.tag -- never
+        # repository. Left alone, every environment would pull from a registry
+        # that does not exist here. One commit on {{ $branch }}, made as root
+        # (the project Owner, who can commit to the protected default branch),
+        # retargets image.repository in the chart's base values for all
+        # environments. Idempotent: the commit is skipped when the line already
+        # points at this cluster.
+        - name: Read {{ $rewrite.file }} on {{ $repo.name }}
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/repository/files/{{ $rewrite.file | urlquery }}?ref={{ $branch }}
+            method: GET
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          register: r_chart_values
+
+        - name: Retarget image.repository in {{ $repo.name }} to this cluster's Quay
+          ansible.builtin.uri:
+            url: https://{{ $host }}/api/v4/projects/{{ "{{" }} project_id {{ "}}" }}/repository/files/{{ $rewrite.file | urlquery }}
+            method: PUT
+            body_format: form-urlencoded
+            body:
+              branch: {{ $branch }}
+              content: '{{ "{{" }} r_chart_values.json.content | b64decode | regex_replace("(?m)^(\\s*repository:\\s*).*$", "\\1{{ $targetRepo }}") {{ "}}" }}'
+              commit_message: "Point image.repository at this cluster's Quay"
+            headers:
+              PRIVATE-TOKEN: '{{ "{{" }} root_token {{ "}}" }}'
+            validate_certs: false
+            status_code: 200
+          # Skip when the rewrite would change nothing -- either the line
+          # already points here (re-run on the same cluster) or the file has
+          # no repository line at all (nothing this task should touch).
+          when: >-
+            r_chart_values.json.content | b64decode
+            | regex_replace("(?m)^(\\s*repository:\\s*).*$", "\\1{{ $targetRepo }}")
+            != r_chart_values.json.content | b64decode
+{{- end }}
 
 {{- if $repo.labels }}
 
@@ -389,10 +436,17 @@ data:
 {{- $tok := $repo.accessToken }}
 
         # ---- pipeline SCM credential ---------------------------------------
-        # open-pr and open-cve-issues authenticate with `scm-auth-secret` in the
-        # pipeline namespace. Minting it here is what lets the demo come up
-        # without anyone pasting a PAT; a project access token (not the root
-        # PAT) keeps the blast radius to this one repository.
+        # open-pr and open-cve-issues authenticate with `scm-auth-secret` (the
+        # application repository's token) in the pipeline namespace;
+        # dev-gitops-cd's gitops-bump-image uses the gitops repository's own
+        # `scm-auth-gitops-secret`. Minting them here is what lets the demo
+        # come up without anyone pasting a PAT; one project access token per
+        # repository (not the root PAT) keeps the blast radius to a single
+        # project each. They cannot be shared: a GitLab project-bot user is a
+        # member of exactly its own project and GitLab refuses to add it to any
+        # other ("project bots cannot be added to other groups / projects"),
+        # which is why the gitops repository gets a second token rather than a
+        # membership grant for the first bot.
         #
         # The token value is only ever returned once, at creation. So: if the
         # Secret already holds one, leave everything alone. Otherwise revoke any
@@ -402,7 +456,7 @@ data:
           kubernetes.core.k8s_info:
             api_version: v1
             kind: Secret
-            name: scm-auth-secret
+            name: {{ $tok.secretName | default "scm-auth-secret" }}
             namespace: '{{ "{{" }} pipeline_namespace {{ "}}" }}'
           register: r_scm_secret
 
@@ -471,7 +525,7 @@ data:
               apiVersion: v1
               kind: Secret
               metadata:
-                name: scm-auth-secret
+                name: {{ $tok.secretName | default "scm-auth-secret" }}
                 namespace: '{{ "{{" }} pipeline_namespace {{ "}}" }}'
                 labels:
                   app.kubernetes.io/part-of: maven-build-ci
