@@ -34,6 +34,12 @@
 #                                (TrustedProfileAnalyzer, rhtpa.io/v1). The
 #                                charts.openshift.io Helm path was removed: only
 #                                the operator supports Exploit Intelligence.
+#   16  app-dev                   The dev environment of the example application --
+#                                the consumer end of the CD chain. Tracks the
+#                                gitops repository the GitLab seeding job imports;
+#                                every promotion dev-gitops-cd merges there rolls
+#                                this deployment. Last on purpose: see the
+#                                component below.
 #
 # BEFORE INSTALLING: set deployer.domain and replace every REPLACE_ME in
 # `credentials` below. Do that in a LOCAL values override that you do not
@@ -327,4 +333,34 @@ components:
       # NooBaa's S3 endpoint. Empty derives
       # `https://s3-openshift-storage.<domain>:443`.
       regionEndpoint: ""
+
+  # The dev environment of the example application: the consumer end of the CD
+  # chain. This Application tracks the gitops repository the GitLab seeding
+  # job imports (development/spring-boot-example-gitops on the cluster's own
+  # GitLab), so every promotion `dev-gitops-cd` auto-merges there rolls this
+  # deployment -- the same repo, values files and Helm layout the hand-created
+  # Application on the reference cluster uses.
+  #
+  # Wave 16, AFTER everything else, deliberately. The Application's health
+  # includes the Deployment pulling its image, and on a fresh cluster the
+  # imported values file's initial tag does not exist in Quay yet -- it appears
+  # with the first ci-build-publish run. An earlier wave would leave the whole
+  # install waiting on (or blocked behind) a permanently Degraded Application.
+  # Expect this one to sit Degraded (ImagePullBackOff) on a fresh cluster
+  # until the first promotion lands; that is the demo working as designed.
+  #
+  # MIGRATING A CLUSTER WHERE IT WAS CREATED BY HAND: the Application must not
+  # exist twice. Delete the hand-made one before the next `helm upgrade`:
+  #   oc -n openshift-gitops delete application spring-boot-example-dev
+  # ( helm will then create and own the replacement rendered here.)
+  appDev:
+    enabled: true
+    namespace: spring-boot-example-dev
+    syncWave: "16"
+    # The gitops repository the GitLab seeding job imports. Its host is
+    # derived from the gitlab component's namespace and deployer.domain.
+    gitGroup: development
+    gitopsRepo: spring-boot-example-gitops
+    revision: main
+    chartPath: app/spring-boot-example
 

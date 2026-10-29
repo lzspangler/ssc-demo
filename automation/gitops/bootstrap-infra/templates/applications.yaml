@@ -563,3 +563,50 @@ spec:
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
+{{- if .Values.components.appDev.enabled }}
+{{- $ad := .Values.components.appDev }}
+{{- if not .Values.components.gitlab.enabled }}
+{{- fail "components.appDev tracks the gitops repository the gitlab component's seeding job imports; enable components.gitlab or disable components.appDev" }}
+{{- end }}
+{{- $gitlabHost := printf "gitlab-%s.%s" .Values.components.gitlab.namespace $domain }}
+# -----------------------------------------------------------------------------
+# The dev environment of the example application -- the consumer end of the CD
+# chain. Tracks the gitops repository the GitLab seeding job imports; every
+# promotion dev-gitops-cd auto-merges there (an MR bumping image.tag in
+# environments/dev/values.yaml) rolls this deployment.
+#
+# Wave 16, after everything else, on purpose: the Application's health includes
+# the Deployment pulling its image, and on a fresh cluster the imported values
+# file's initial tag does not exist in Quay until the first ci-build-publish
+# run promotes a real one. An earlier wave would block the install behind a
+# permanently Degraded Application. See components.appDev in values.yaml for
+# the hand-created-Application migration note.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: spring-boot-example-dev
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $ad.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: https://{{ $gitlabHost }}/{{ $ad.gitGroup }}/{{ $ad.gitopsRepo }}.git
+    targetRevision: {{ $ad.revision }}
+    path: {{ $ad.chartPath }}
+    helm:
+      valueFiles:
+        - values.yaml
+        - environments/dev/values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $ad.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
