@@ -97,12 +97,22 @@ spec:
       configMap:
         name: ai-endpoint-ca
         optional: true
+    # The remediation-decision methodology skill (SKILL.md), mounted read-only
+    # at ${HOME}/agent-skills/cve-fix-recommendation. Lives in
+    # pipelines/config/agent-skills-cve-fix-recommendation.yaml so it ships with
+    # the rest of the Tekton config and no image change is needed.
+    - name: agent-skills
+      configMap:
+        name: agent-skills-cve-fix-recommendation
   steps:
     - name: analyze
       image: $(params.AI_PYTHON_IMAGE)
       volumeMounts:
         - name: endpoint-ca
           mountPath: /etc/ai-ca
+          readOnly: true
+        - name: agent-skills
+          mountPath: /tekton/home/agent-skills/cve-fix-recommendation
           readOnly: true
       env:
         - name: HOME
@@ -379,8 +389,29 @@ spec:
             "properties": {"decisions": {"type": "array", "items": item_schema}},
         }
 
+        # --- Remediation-decision methodology skill ---------------------------
+        # Mounted read-only from the agent-skills-cve-fix-recommendation ConfigMap
+        # (pipelines/config/, synced by ssc-tekton-config). The system message
+        # below carries the skill (the HOW: interpreting each report, the
+        # decision schema, backport-first version choice); the user message from
+        # build_user carries the run contract (the policy, must-fix set, and the
+        # two RHTPA reports). Fail loudly if it is missing: without it the model
+        # gets the data but no methodology for deciding on it.
+        SKILL_PATH = os.path.join(
+            os.environ.get("HOME", "/tekton/home"),
+            "agent-skills/cve-fix-recommendation/SKILL.md")
+        try:
+            with open(SKILL_PATH) as f:
+                skill = f.read()
+        except Exception:
+            print("ERROR: %s is missing. Is the agent-skills-cve-fix-recommendation "
+                  "ConfigMap applied (pipelines/config/agent-skills-cve-fix-recommendation.yaml)?"
+                  % SKILL_PATH, file=sys.stderr)
+            sys.exit(1)
+
         system = (
-            "You are a security remediation planner. Respond with ONLY a single "
+            skill
+            + "\n\nYou are a security remediation planner. Respond with ONLY a single "
             "JSON object {\"decisions\": [...]} that conforms to the given schema, "
             "populated with real values derived from the input. Do NOT output the "
             "schema itself, field types, comments, code fences, or placeholders."
@@ -391,55 +422,15 @@ spec:
                 "User-defined policy:\n" + os.environ["POLICY_CONTEXT"] + "\n\n"
                 "Conforma must-fix CVEs (policy gate -- analyze ALL of these):\n"
                 + mf_json + "\n\n"
-                "AUTHORITATIVE SOURCE -- RHTPA vulnerability-analysis report. Its "
-                "'.findings[]' give each CVE's severity, affected_purls (the exact "
-                "vulnerable dependency, e.g. pkg:maven/group/artifact@1.2.3 -- derive "
-                "the Maven groupId:artifactId and CURRENT_VERSION from these), and "
-                "'fixed_version_hints' (best-effort version tokens scraped from the "
-                "advisory text). '.details[]' hold the full CVE title/description. The "
-                "concrete fixed version is usually stated only in that prose (e.g. "
-                "'before versions 2.13.4.1 and 2.12.17.1', 'fixed in 2.14.0'); use the "
-                "hints as candidates and read the title/description to pick the correct "
-                "fixed version on the SAME release line as the current version:\n"
+                "RHTPA vulnerability-analysis report (input 3 of the skill -- "
+                "AUTHORITATIVE for severity, affected PURLs, and advisory prose):\n"
                 + vuln_str + "\n\n"
-                "AUTHORITATIVE FIX VERSIONS -- RHTPA remediation report. Its "
-                "'.fix_versions' maps each affected PURL to each of its CVEs to the "
-                "versions RHTPA has confirmed resolve that CVE. These were resolved "
-                "against the live RHTPA instance (every known sibling version of the "
-                "affected PURL, re-analyzed), so PREFER THEM over anything scraped from "
-                "advisory prose. Each entry carries: 'version', 'cleared_by' (the "
-                "advisories that explicitly mark it fixed/not_affected -- an empty list "
-                "means it simply falls outside the vulnerable range), and 'backport' "
-                "(true when the version keeps the current base version and only adds a "
-                "vendor suffix, e.g. 6.0.3 -> 6.0.3.rhlw-00001). The list is already "
-                "ordered backports first. A BACKPORT IS THE PREFERRED FIX: it carries "
-                "the patch with no API change, so pick it over a version bump whenever "
-                "one is offered. '.recommendations', if present, is a Red Hat-rebuild "
-                "catalog lookup -- a cross-check only:\n" + report + "\n\n"
-                "Return one decision object for EACH must-fix CVE listed above (even if "
-                "there is only one). Determine PACKAGE and CURRENT_VERSION from its "
-                "affected_purl. For FIXED_VERSION, use '.fix_versions' for that PURL and "
-                "CVE when it has an entry; fall back to the analyze findings/details "
-                "prose only when it does not. Set selected=true ONLY when you can supply "
-                "a concrete fixed version; if you cannot confidently determine one for a "
-                "CVE, set selected=false for it (it will be skipped). Provide a concise "
-                "justification per CVE, and say so explicitly when you chose a backport.\n\n"
-                "Also populate, for each CVE: 'severity' -- the finding's severity "
-                "(critical / high / medium / low); and 'available_fixed_versions' -- a "
-                "list of ALL candidate fixed versions, the '.fix_versions' entries FIRST "
-                "and in order, then any extra versions from fixed_version_hints or the "
-                "title/description prose. 'fixed_version' stays the single RECOMMENDED "
-                "version to bump to -- the backport if one exists, otherwise the lowest "
-                "version that resolves the CVE, preferring the SAME release line as the "
-                "current version -- and it MUST be one of the entries in "
-                "available_fixed_versions.\n\n"
-                "Every field must hold a REAL value taken from the data above -- e.g. "
-                "package \"com.fasterxml.jackson.core:jackson-databind\", "
-                "current_version \"2.13.2\", fixed_version \"2.13.4.2\", "
-                "available_fixed_versions [\"2.13.4.2\", \"2.14.0\"], "
-                "severity \"high\", cve_id \"CVE-2020-36518\". Never emit a JSON "
-                "Schema, field types, comments, code fences, or placeholder words "
-                "like \"string\"."
+                "RHTPA remediation report (input 4 of the skill -- AUTHORITATIVE "
+                "fix versions, backports first):\n" + report + "\n\n"
+                "Follow the cve-fix-recommendation skill: return one decision object "
+                "for EACH must-fix CVE listed above (even if there is only one), per "
+                "its Output section -- selected=true only where a concrete fixed "
+                "version can be determined."
             )
 
         def call_model(user):
