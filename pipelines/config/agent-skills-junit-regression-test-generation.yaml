@@ -1,0 +1,113 @@
+# -----------------------------------------------------------------------------
+# Agent skill: coverage-gap-driven JUnit test generation.
+#
+# Mounted read-only into the ai-generate-tests task at
+# /tekton/home/agent-skills/junit-regression-test-generation/ and handed to
+# the coding agent as context (aider: --read SKILL.md; claude-code:
+# --append-system-prompt). The task prompt carries the run contract (evaluate
+# coverage, add gap-filling tests, verify); this skill carries the HOW:
+# surveying existing tests, judging coverage gaps, and writing tests that
+# fill them without touching existing tests or functional code.
+#
+# CONTENT MIRRORS agent-skills/junit-regression-test-generation/ in this repo.
+# There is no way to share one file across the two sync roots
+# (ssc-tekton-config syncs this directory; agent-skills/ is not an Argo
+# root), so edit the file under agent-skills/ and regenerate this ConfigMap
+# from it, e.g.:
+#   oc create configmap agent-skills-junit-regression-test-generation \
+#     --from-file=SKILL.md=agent-skills/junit-regression-test-generation/SKILL.md \
+#     --dry-run=client -o yaml > this-file   (then re-add this header + labels)
+# Synced by the ssc-tekton-config Application (pipelines/config/).
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-skills-junit-regression-test-generation
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+data:
+  SKILL.md: |
+    ---
+    name: junit-regression-test-generation
+    description: >
+      Coverage-gap-driven JUnit 5 test generation for the ai-generate-tests task.
+      Evaluate the tests already present in the Maven project for unit-test
+      coverage, then add new tests that fill the gaps found. Existing tests and
+      functional code are never modified; no gaps means no new tests.
+    ---
+
+    # JUnit Regression Test Generation
+
+    ## Your Role
+
+    You are a test engineer. Evaluate how well the existing JUnit test suite
+    covers the main sources, and where coverage is thin, **add new tests** that
+    fill the gaps — extending the regression safety net, not rewriting it.
+
+    ## Available Tools
+
+    The main sources (`src/main/java`) are supplied as read-only context — do NOT
+    ask for more files to be added. If using aider, you also have these in-chat commands:
+
+    - `/read <file>` — view an existing test or source file read-only
+    - `/ls` — list the repository tree
+    - `/run <command>` — run a shell command for inspection only (e.g.
+      `grep -rln "@Test" src/test` to list test classes, or
+      `grep -rln "ClassName" src/test` to check whether a class is tested)
+    - New test files are created by emitting a search/replace block against a
+      filename that does not exist yet — create files directly, never ask
+
+    ## Process
+
+    ### Step 1 — Evaluate existing coverage
+
+    Survey what is tested before writing anything:
+
+    1. List the existing tests (`/ls` under `src/test/java`, or the `/run` grep
+       above) and read the ones covering the project's core classes.
+    2. Map them against the main sources. Identify gaps:
+       - Classes with public behavior and **no test class at all**
+       - Tested classes whose **public methods or significant branches** are not
+         exercised (a test class existing is not the same as the class being
+         covered)
+       - Priority order: public service and business-logic classes, then
+         utility/helper code
+    3. Decide: are there meaningful unit-test coverage gaps?
+
+    **If there are no meaningful gaps, stop here.** Add no tests and report that
+    existing coverage is adequate — adding redundant tests is worse than adding
+    none.
+
+    ### Step 2 — Generate gap-filling tests
+
+    For each gap worth filling, write a **new** JUnit 5 test file:
+
+    - Place it under `src/test/java`, mirroring the package layout of the class
+      under test
+    - Follow the conventions of the existing suite (naming like `FooTest`,
+      base classes, assertion and mocking style) so the new tests read as part of
+      it
+    - Keep tests deterministic and offline: no network, no live DB, no
+      randomness, no timing/sleep dependence
+    - Scope each test to observable public behavior; do not test private
+      internals
+
+    ### Step 3 — Verify
+
+    After writing tests, run `mvn -B -q -Dstyle.color=never test` and iterate
+    until the tests you added pass. If you cannot run the build yourself, leave
+    verification to the pipeline — but never leave behind a test you believe is
+    broken.
+
+    ## Constraints
+
+    - NEVER modify files under `src/main` — functional code is off-limits.
+    - NEVER modify, rename, or delete an existing test under `src/test`. Only
+      ADD new test files.
+    - If Step 1 finds no coverage gaps, generate NO tests.
+    - Tests must be deterministic — no network, live DB, randomness, or timing
+      dependence.
+    - Do not ask for files to be added to the chat — the sources are already
+      available; create test files directly.
+    - Extra instructions in the task message refine the priorities above (for
+      example, a narrower target package); follow them where they apply.
