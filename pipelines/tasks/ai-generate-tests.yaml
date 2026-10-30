@@ -60,6 +60,15 @@ spec:
   results:
     - name: TESTS_ADDED
       description: Number of new/changed test files staged by the agent.
+    - name: ATTEMPTS
+      description: Agent invocations actually run.
+    - name: LAST_ERROR
+      description: >-
+        Tail of the last failed Maven verify output (truncated to ~1 kB);
+        empty when the generated tests passed. Written so a cancelled run
+        still leaves evidence -- a timeout cancels AND deletes the pod, and
+        the step logs (including the agent tee) die with it. Results are the
+        only channel that survives.
   stepTemplate:
     envFrom:
       - configMapRef:
@@ -189,14 +198,38 @@ spec:
             ;;
         esac
 
-        # Invoke the configured agent with the given prompt. Agent CLI errors are
-        # tolerated (logged, not fatal) so the retry loop can still verify/retry.
+        # ---- Time budgets -----------------------------------------------------
+        # The PipelineRun has a 1h timeout, and on timeout Tekton cancels AND
+        # deletes the pod -- the step logs (including the agent tee) vanish, so
+        # a hung run leaves nothing to diagnose. Three defenses:
+        #   1. AGENT_TIMEOUT caps each agent invocation (a stalled model
+        #      endpoint otherwise holds a call for the OpenAI client's full
+        #      10-min timeout x retries; agentic-test-generation-issue-{nrjs5,
+        #      fv6fs,mqpfm} all burned the whole hour that way).
+        #   2. A step budget stops the retry loop from starting an attempt it
+        #      cannot finish, so the task fails on its OWN terms with results
+        #      written rather than being cancelled by the pipeline timeout.
+        #   3. The ATTEMPTS / LAST_ERROR results survive pod deletion.
+        AGENT_TIMEOUT=900          # 15 min per agent invocation
+        VERIFY_COST=240            # mvn verify of the touched classes, observed ~1-2 min
+        STEP_BUDGET=$((45 * 60))   # 45 min: headroom under the 1h run timeout
+        STEP_START="$(date +%s)"
+        ATTEMPTS_RAN=0
+        LAST_ERROR_TEXT=""
+        budget_stopped=0
+
+        # Invoke the configured agent with the given prompt. Non-zero exits are
+        # tolerated (logged, not fatal) so the retry loop can still verify and
+        # retry. `timeout` wraps only the agent binary: on expiry it SIGTERMs
+        # the agent and the pipe closes behind it, so a killed attempt shows up
+        # downstream as "no test changes" (or partial changes, which the verify
+        # step judges on their own merits) rather than as a special error.
         run_agent() {
           local prompt="$1"
           set +e
           case "${AGENT}" in
             aider)
-              aider \
+              timeout "${AGENT_TIMEOUT}" aider \
                 --model "${AIDER_MODEL}" \
                 --yes-always --no-auto-commits --no-check-update --no-gitignore \
                 --no-show-model-warnings \
@@ -209,7 +242,7 @@ spec:
             claude-code|*)
               # Headless, non-interactive run. --allowedTools limits what runs
               # without prompting; acceptEdits lets it write files unattended.
-              claude -p "${prompt}" \
+              timeout "${AGENT_TIMEOUT}" claude -p "${prompt}" \
                 --model "${ANTHROPIC_MODEL}" \
                 --append-system-prompt "$(cat "${SKILL_DIR}/SKILL.md")" \
                 --permission-mode acceptEdits \
@@ -235,6 +268,20 @@ spec:
         passed=0
         tests_csv=""
         while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
+          # Elapsed-time guard: do not start an attempt we cannot finish. One
+          # attempt costs up to AGENT_TIMEOUT (agent) + VERIFY_COST (mvn); if
+          # less than that remains of the step budget, stop here so the task
+          # terminates on its own terms -- with results written and logs
+          # flushed -- instead of being cancelled mid-attempt by the 1h
+          # PipelineRun timeout.
+          elapsed=$(( $(date +%s) - STEP_START ))
+          if [ $((elapsed + AGENT_TIMEOUT + VERIFY_COST)) -gt "${STEP_BUDGET}" ]; then
+            echo "Step time budget nearly exhausted (${elapsed}s of ${STEP_BUDGET}s" \
+                 "elapsed); stopping after ${ATTEMPTS_RAN} completed attempt(s)."
+            budget_stopped=1
+            break
+          fi
+
           echo "=== test-generation attempt ${attempt}/${MAX_ATTEMPTS} ==="
 
           prompt="${PROMPT}"
@@ -247,6 +294,7 @@ spec:
         ${feedback}"
           fi
           run_agent "${prompt}"
+          ATTEMPTS_RAN=$((ATTEMPTS_RAN+1))
 
           # Which test files did the agent add/change this run? git status
           # --porcelain emits "XY <path>"; strip the 3-char status prefix.
@@ -293,21 +341,38 @@ spec:
 
           echo "Generated tests failed on attempt ${attempt} (mvn rc=${rc})."
           feedback="$(printf '%s\n' "${build_log}" | tail -n 120)"
+          # Tekton ships results through the container termination message,
+          # which is size-capped; ~1 kB keeps this inside it.
+          LAST_ERROR_TEXT="$(printf '%s\n' "${build_log}" | tail -c 1024)"
           attempt=$((attempt+1))
         done
 
         # No verifiable tests were produced across all attempts -> nothing to PR;
         # skip gracefully (the pipeline guards re-run-tests/open-pr on TESTS_ADDED).
         if [ -z "${tests_csv}" ]; then
-          echo "No test classes were generated; nothing to add."
           printf '0' > "$(results.TESTS_ADDED.path)"
+          printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+          printf '%s' "${LAST_ERROR_TEXT}" > "$(results.LAST_ERROR.path)"
+          if [ "${budget_stopped}" -ne 0 ]; then
+            # Not the graceful "coverage adequate, no gaps" outcome: the step
+            # budget ran out before any passing tests existed (e.g. a stalled
+            # model endpoint burning attempts). Fail loud rather than report a
+            # green run that produced nothing.
+            echo "ERROR: step time budget exhausted with no passing tests" \
+                 "(${ATTEMPTS_RAN} attempt(s) run; last agent attempts produced" \
+                 "no verifiable changes)." >&2
+            exit 1
+          fi
+          echo "No test classes were generated; nothing to add."
           exit 0
         fi
 
         # Tests were generated but never passed within the retry budget: fail loud
         # so the run is visible, rather than opening a PR with broken tests.
         if [ "${passed}" -ne 1 ]; then
-          echo "ERROR: generated tests still failing after ${MAX_ATTEMPTS} attempt(s)." >&2
+          printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+          printf '%s' "${LAST_ERROR_TEXT}" > "$(results.LAST_ERROR.path)"
+          echo "ERROR: generated tests still failing after ${ATTEMPTS_RAN} attempt(s)." >&2
           exit 1
         fi
 
@@ -325,6 +390,8 @@ spec:
           done <<< "${CHANGED}"
         fi
         printf '%s' "${COUNT}" > "$(results.TESTS_ADDED.path)"
+        printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+        : > "$(results.LAST_ERROR.path)"
         echo "Staged test file changes: ${COUNT}"
   # The test-generation methodology skill (SKILL.md), mounted read-only at
   # ${HOME}/agent-skills/junit-regression-test-generation. Lives in
