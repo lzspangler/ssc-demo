@@ -9,6 +9,7 @@ Patched CVE packages are sourced both from Red Hat Lightwell (https://www.redhat
 The Red Hat Lightwell public demo repositories used include:   
 
 | Repository | URL |  
+| --- | --- |  
 | Java Validated | https://packages.redhat.com/lightwell/public-lightwell-demo/java/validated/ |    
 | Java Remediated | https://packages.redhat.com/lightwell/public-lightwell-demo/java/remediated/ |    
 | Java OSV Advisories | https://packages.redhat.com/api/pulp-content/public-lightwell-demo/osv/java/remediated/ |   
