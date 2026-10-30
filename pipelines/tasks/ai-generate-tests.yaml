@@ -73,6 +73,10 @@ spec:
     - name: generate-and-run
       image: $(params.AGENT_IMAGE)
       workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      volumeMounts:
+        - name: agent-skills
+          mountPath: /tekton/home/agent-skills/junit-regression-test-generation
+          readOnly: true
       computeResources:
         requests:
           cpu: 500m
@@ -130,13 +134,32 @@ spec:
         tar -C "${WORKDIR}" --exclude=./target -cf - . | tar -C "${SCRATCH}" -xf -
         cd "${SCRATCH}"
 
+        # --- Test-generation methodology skill ---------------------------------
+        # Mounted read-only from the agent-skills-junit-regression-test-generation
+        # ConfigMap (pipelines/config/, synced by ssc-tekton-config). The task
+        # prompt below carries the WHAT (evaluate coverage, add gap-filling
+        # tests, verify); the skill carries the HOW (surveying existing tests,
+        # judging coverage gaps, writing tests that fill them without touching
+        # existing tests or functional code). Fail loudly if it is missing:
+        # aider --read and claude --append-system-prompt would both silently
+        # continue with no methodology at all.
+        SKILL_DIR="${HOME}/agent-skills/junit-regression-test-generation"
+        if [ ! -f "${SKILL_DIR}/SKILL.md" ]; then
+          echo "ERROR: ${SKILL_DIR}/SKILL.md is missing." \
+               "Is the agent-skills-junit-regression-test-generation ConfigMap applied" \
+               "(pipelines/config/agent-skills-junit-regression-test-generation.yaml)?"
+          exit 1
+        fi
+
         PROMPT="You are working in a Quarkus/Maven project at the current directory.
-        Generate JUnit 5 unit tests for classes that lack coverage. Put tests under
-        src/test/java mirroring the package layout. Do NOT modify application source
-        under src/main. The relevant source files are already available to you --
-        do NOT ask for more files to be added; create the test files directly. After
-        writing tests, run 'mvn -B -q -Dstyle.color=never test' and iterate until the
-        tests you added pass. ${TEST_INSTRUCTIONS}"
+        Follow the junit-regression-test-generation skill supplied as read-only
+        context: first evaluate the existing JUnit tests for unit-test coverage of
+        the main sources, then add new JUnit 5 tests under src/test/java (mirroring
+        the package layout) that fill the coverage gaps it identifies. Do NOT
+        modify application source under src/main, and do NOT modify existing tests
+        -- only add new test files. If coverage is adequate, add no tests. After
+        writing tests, run 'mvn -B -q -Dstyle.color=never test' and iterate until
+        the tests you added pass. ${TEST_INSTRUCTIONS}"
 
         # --- One-time setup for the configured coding agent ---
         case "${AGENT}" in
@@ -178,6 +201,7 @@ spec:
                 --yes-always --no-auto-commits --no-check-update --no-gitignore \
                 --no-show-model-warnings \
                 --map-tokens 1024 --subtree-only \
+                --read "${SKILL_DIR}/SKILL.md" \
                 ${READ_ARGS} \
                 --message "${prompt}" \
                 2>&1 | tee /tekton/home/aider-generate-tests.log
@@ -187,6 +211,7 @@ spec:
               # without prompting; acceptEdits lets it write files unattended.
               claude -p "${prompt}" \
                 --model "${ANTHROPIC_MODEL}" \
+                --append-system-prompt "$(cat "${SKILL_DIR}/SKILL.md")" \
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
                 --output-format json | tee /tekton/home/claude-generate-tests.json
@@ -301,3 +326,11 @@ spec:
         fi
         printf '%s' "${COUNT}" > "$(results.TESTS_ADDED.path)"
         echo "Staged test file changes: ${COUNT}"
+  # The test-generation methodology skill (SKILL.md), mounted read-only at
+  # ${HOME}/agent-skills/junit-regression-test-generation. Lives in
+  # pipelines/config/agent-skills-junit-regression-test-generation.yaml so it
+  # ships with the rest of the Tekton config and no image change is needed.
+  volumes:
+    - name: agent-skills
+      configMap:
+        name: agent-skills-junit-regression-test-generation
