@@ -62,6 +62,10 @@ spec:
     - name: remediate
       image: $(params.AGENT_IMAGE)
       workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      volumeMounts:
+        - name: agent-skills
+          mountPath: /tekton/home/agent-skills/maven-remediation
+          readOnly: true
       computeResources:
         requests:
           cpu: 500m
@@ -120,9 +124,30 @@ spec:
         git config --global user.email "pipeline@tekton.local" 2>/dev/null || true
         git config --global user.name "tekton-pipeline" 2>/dev/null || true
 
+        # --- Remediation methodology skill ------------------------------------
+        # Mounted read-only from the agent-skills-maven-remediation ConfigMap
+        # (pipelines/config/, synced by ssc-tekton-config). The task prompt
+        # below carries the WHAT (target package/version, no builds,
+        # REMEDIATION.md); the skill carries the HOW (reading pom structure,
+        # choosing the edit shape). Fail loudly if it is missing: aider --read
+        # and claude --append-system-prompt would both silently continue with
+        # no methodology at all.
+        SKILL_DIR="${HOME}/agent-skills/maven-remediation"
+        for f in SKILL.md pom-patterns.md; do
+          if [ ! -f "${SKILL_DIR}/${f}" ]; then
+            echo "ERROR: ${SKILL_DIR}/${f} is missing." \
+                 "Is the agent-skills-maven-remediation ConfigMap applied" \
+                 "(pipelines/config/agent-skills-maven-remediation.yaml)?"
+            exit 1
+          fi
+        done
+
         PROMPT="Update the Maven dependency '${PACKAGE}' to version '${FIXED_VERSION}'
-        to remediate ${CVE_ID}. Edit pom.xml -- prefer dependencyManagement or a BOM
-        property if the project uses one. Current version is '${CURRENT_VERSION}'.
+        to remediate ${CVE_ID}. Current version is '${CURRENT_VERSION}'. Follow the
+        maven-remediation skill supplied as read-only context: read the pom.xml
+        structure first, then apply the edit shape it prescribes (property value,
+        BOM override property, inline version, or dependencyManagement entry).
+        Apply EXACTLY version '${FIXED_VERSION}' -- never substitute another.
         Do NOT change unrelated dependencies or application logic. Do NOT run any
         build or shell commands -- the build is verified separately. Finally write a
         short REMEDIATION.md at the project root describing the change and this
@@ -140,6 +165,8 @@ spec:
               --model "${AIDER_MODEL}" \
               --yes-always --no-auto-commits --no-check-update --no-gitignore \
               --no-show-model-warnings \
+              --read "${SKILL_DIR}/SKILL.md" \
+              --read "${SKILL_DIR}/pom-patterns.md" \
               --message "${PROMPT}" \
               pom.xml 2>&1 | tee /tekton/home/aider-remediate.log
             ;;
@@ -153,6 +180,7 @@ spec:
             export ANTHROPIC_MODEL="${MODEL}"
             claude -p "${PROMPT}" \
               --model "${ANTHROPIC_MODEL}" \
+              --append-system-prompt "$(cat "${SKILL_DIR}/SKILL.md" "${SKILL_DIR}/pom-patterns.md")" \
               --permission-mode acceptEdits \
               --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*)" \
               --output-format json | tee /tekton/home/claude-remediate.json
@@ -203,3 +231,11 @@ spec:
         CHANGED="$(git -C "${WORKDIR}" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | wc -l | tr -d ' ')"
         printf '%s' "$([ "${CHANGED:-0}" -gt 0 ] && echo 1 || echo 0)" > "$(results.CHANGED.path)"
         echo "Build file changes: ${CHANGED:-0}"
+  # The remediation methodology skill (SKILL.md + pom-patterns.md), mounted
+  # read-only at ${HOME}/agent-skills/maven-remediation. Lives in
+  # pipelines/config/agent-skills-maven-remediation.yaml so it ships with the
+  # rest of the Tekton config and no image change is needed.
+  volumes:
+    - name: agent-skills
+      configMap:
+        name: agent-skills-maven-remediation
