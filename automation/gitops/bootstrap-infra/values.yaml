@@ -341,7 +341,7 @@ components:
   # there rolls exactly the matching deployment.
   #
   # Which promotions happen automatically is a PIPELINE policy, not an
-  # Application one: dev-gitops-cd auto-merges dev only, and promoting to
+  # Application one: gitops-cd-dev auto-merges dev only, and promoting to
   # qa/prod stays a human decision (an MR editing those values files, or a
   # pipeline run with environment=qa auto-merge=false). These Applications
   # just make sure every environment has a deployment waiting for its turn.

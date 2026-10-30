@@ -188,7 +188,7 @@ spec:
         git push --quiet "${AUTH_URL}" "${BRANCH}"
 
         TITLE="Promote ${ENVIRONMENT}: ${IMAGE_TAG}"
-        BODY="Automated promotion from the dev-gitops-cd pipeline (started by ci-build-publish).
+        BODY="Automated promotion from the gitops-cd-dev pipeline (started by ci-build-publish).
 
         - New image: ${IMAGE}
         - App commit: ${APP_COMMIT:-n/a} in ${APP_REPO_URL:-n/a}"

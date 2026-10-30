@@ -575,7 +575,7 @@ spec:
 # end of the CD chain. Tracks the gitops repository the GitLab seeding job
 # imports; a promotion merged there (an MR bumping image.tag in
 # {{ $env.valuesFile }}) rolls this deployment. Whether promotions are
-# automatic is a pipeline decision, not this Application's: dev-gitops-cd
+# automatic is a pipeline decision, not this Application's: gitops-cd-dev
 # auto-merges dev only, qa/prod promotions stay human MRs.
 #
 # Wave 16, after everything else, on purpose: the Application's health

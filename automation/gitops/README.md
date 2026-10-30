@@ -188,7 +188,7 @@ oc -n tssc-app-ci   get sa pipeline -o jsonpath='{.secrets[*].name}{"\n"}'
 application repository, not the root PAT. `scm-auth-gitops-secret` holds a
 second one scoped to the gitops repository: a GitLab project-bot user is a
 member of exactly one project and cannot be added to another, so the gitops
-repo (which `dev-gitops-cd` pushes promotion branches to) needs its own token.
+repo (which `gitops-cd-dev` pushes promotion branches to) needs its own token.
 If either Secret already exists and holds a real token, the Job leaves it
 alone — so re-running the seeding does not invalidate a credential a pipeline
 is mid-run with. The seeding also imports the gitops repository itself and

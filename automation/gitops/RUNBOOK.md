@@ -334,7 +334,7 @@ The last command must list `quay-push` alongside the operator's
 `scm-auth-secret` holds a GitLab **project** access token scoped to the one
 application repository, not the root PAT. `scm-auth-gitops-secret` holds a
 second one scoped to the gitops repository — a GitLab project-bot user cannot
-be shared across projects, so `dev-gitops-cd` needs its own token there.
+be shared across projects, so `gitops-cd-dev` needs its own token there.
 
 ## 8. Create the three remaining secrets by hand
 
