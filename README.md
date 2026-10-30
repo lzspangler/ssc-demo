@@ -1,43 +1,18 @@
 # ssc-demo
 
-Pre-requisite infrastructure setup adapted from:  
-https://github.com/rhpds/lightwell-tssc-workshop  
+This project contains a demo showing automated remediation of application CVEs.  
 
-Before proceeding to pipelines setup (/pipelines), install and configure:  
-* OpenShift GitOps  
-* OpenShift KeyCloak  
-* Red Hat Trusted Profile Analyzer
-* Red Hat Trusted Artifact Signer
-* GitLab  
+The demo includes analysis of an example containerized Java project to find vulnerable CVEs and recommend a fix for each; automated creation of issue tracker work items for each CVE; automated CVE remediation; automated regression test generation; automated gitops promotion to dev, qa, and production environments.  
 
+Patched CVE packages are sourced both from Red Hat Lightwell (https://www.redhat.com/en/lightwell) and upstream (Maven Central).  
 
-# OpenShift Cluster Resource Requirements  
-
-| Role | Minimum CPU (Cores) | Minimum RAM (GiB) | Recommended CPU (Cores) | Recommended RAM (GiB) |  
-| --- | --- | --- | --- | --- |  
-| Control plane | 4 per node | 16 per node | 8 per node | 32 per node |  
-| Worker | 5 per node | 17 per node | 8 per node | 24 per node |  
-  
-
-Source:  
-https://docs.redhat.com/en/documentation/red_hat_advanced_developer_suite_-_software_supply_chain/1.9/html-single/installing_red_hat_advanced_developer_suite_-_software_supply_chain/index#minimum-hardware-requirements_installing-rhads
+The Red Hat Lightwell public demo repositories used include:  
+| Repository | URL |
+| Java Validated | https://packages.redhat.com/lightwell/public-lightwell-demo/java/validated/ |  
+| Java Remediated | https://packages.redhat.com/lightwell/public-lightwell-demo/java/remediated/ |  
+| Java OSV Advisories | https://packages.redhat.com/api/pulp-content/public-lightwell-demo/osv/java/remediated/ | 
 
 
 # Setup Guide  
 
-
-## OpenShift Gitops Operator
-
-
-
-## Helm Install of App-of-Apps
-
-```
-helm upgrade ssc-demo . --set deployer.apiURL=<OCP API endpoint> --set deployer.domain=<OCP apps domain>  
-```
-
-Example:
-```
-```
-
-
+Refer to the [runbook](automation/gitops/RUNBOOK.md)
