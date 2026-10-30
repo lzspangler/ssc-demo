@@ -6,45 +6,44 @@ metadata:
     pipelines.openshift.io/strategy: docker
     pipelines.openshift.io/used-by: build-cloud
     app.kubernetes.io/part-of: maven-build-ci
-  name: qa-gitops-cd
+  name: gitops-cd-dev
 spec:
-  # QA gitops CD: promote a published image into the qa environment of the
-  # gitops repository.
+  # Dev gitops CD: promote the image ci-build-publish just published into the
+  # dev environment of the gitops repository.
   #
-  #   qa-gitops-cd (started by a human) -> MR to
-  #   app/spring-boot-example/environments/qa/values.yaml -> left open for
-  #   review -> a human merges it -> Argo CD picks the tag change up and
-  #   rolls qa.
+  #   ci-build-publish (finally) -> gitops-cd-dev -> MR to
+  #   app/spring-boot-example/environments/dev/values.yaml -> auto-merged
+  #   -> Argo CD picks the tag change up and rolls dev.
   #
-  # HOW IT IS TRIGGERED. Deliberately NOT chained off ci-build-publish the way
-  # dev-gitops-cd is: dev auto-promotes on every publish, but qa promotion is a
-  # human decision, so this pipeline is started by hand with the image
-  # reference to promote (normally one ci-build-publish already published --
-  # the tag is the commit SHA, an immutable pointer to the source, SBOM and
-  # signatures). Pass the same image that was promoted to dev when qa should
-  # follow it.
+  # HOW IT IS TRIGGERED. Tekton has no native "run this pipeline when that one
+  # finishes", so ci-build-publish runs `start-gitops-cd-dev` as a finally task
+  # (gated on build-container having succeeded). That task POSTs a PipelineRun
+  # of THIS pipeline through the Kubernetes API with the pod's service account
+  # token, passing the exact `output-image` that CI published -- the tag is the
+  # commit SHA, an immutable pointer to the source, SBOM and signatures, so the
+  # values file never references an image that was not just built and pushed.
   #
-  # WHY AN MR (AND WHY NO AUTO-MERGE). The gitops repo's default branch is
+  # WHY AN MR (AND WHY AUTO-MERGE). The gitops repo's default branch is
   # protected and the `scm-auth-gitops-secret` bot cannot push it directly --
-  # it CAN push a branch, open an MR, and accept it (Maintainer). The
-  # promotion is an MR that stays OPEN for review: main only ever moves
-  # through GitLab, the human merge IS the promotion decision, and Argo CD
-  # sees one atomic values.yaml change. Override with auto-merge="true" to
-  # merge immediately, the way dev-gitops-cd does.
+  # it CAN push a branch, open an MR, and accept it (Maintainer). So the
+  # promotion is
+  # an MR + immediate merge: main only ever moves through GitLab, every
+  # promotion is visible as a merge record with the CI run that caused it, and
+  # Argo CD sees one atomic values.yaml change. This pipeline deliberately
+  # auto-merges DEV only; promoting to qa/prod stays a human decision made by
+  # editing those values files (or a future pipeline with AUTO_MERGE="false").
   #
   # WHY NO WORKSPACES. The whole job is one clone-edit-push of a tiny repo, so
   # the task clones into a pod-local temp dir instead of a PVC workspace: no
   # PVC to bind, no cross-task uid problems, and the run can be started by a
-  # bare PipelineRun without workspace plumbing.
+  # bare PipelineRun from the finally task without workspace plumbing.
   params:
     - name: image
       type: string
       description: >-
-        Full image reference to promote (registry/org/component:<commit sha>) --
-        normally the output-image a ci-build-publish run already published, and
-        usually the same one dev-gitops-cd promoted to dev. Only the tag is
-        written to the values file; the full reference goes into the MR
-        description.
+        Full image reference published by ci-build-publish
+        (registry/org/component:<commit sha>). Only the tag is written to the
+        values file; the full reference goes into the MR description.
     - name: app-repo-url
       type: string
       description: Application repo the image was built from (MR context only).
@@ -68,11 +67,11 @@ spec:
     - name: values-path
       type: string
       description: Values file inside the gitops repo whose image.tag is bumped.
-      default: app/spring-boot-example/environments/qa/values.yaml
+      default: app/spring-boot-example/environments/dev/values.yaml
     - name: environment
       type: string
       description: Environment being promoted to (branch name + MR title).
-      default: qa
+      default: dev
     - name: base-branch
       type: string
       description: Branch of the gitops repo the MR targets.
@@ -80,9 +79,9 @@ spec:
     - name: auto-merge
       type: string
       description: >-
-        "false" leaves the promotion MR open for human review (the qa default);
-        "true" merges it immediately, the way dev-gitops-cd does.
-      default: "false"
+        "true" merges the promotion MR immediately (the dev default); "false"
+        leaves it open for review.
+      default: "true"
     - name: scm-secret-name
       type: string
       description: >-
@@ -91,8 +90,9 @@ spec:
         NOT the application repository's scm-auth-secret.
       default: scm-auth-gitops-secret
     # ---------------- runtime ----------------
-    # Needs git + glab. The agent image bundles both and is already pulled
-    # onto the nodes by the prewarm DaemonSet.
+    # Needs git + glab (+ curl/jq for the task that starts this pipeline).
+    # The agent image bundles all of them and is already pulled onto the nodes
+    # by the prewarm DaemonSet.
     - name: agent-image
       type: string
       description: >-

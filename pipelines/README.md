@@ -117,9 +117,9 @@ image build, SBOM upload, or RHTPA scan.
 | `pipelines/agentic-cve-analysis.yaml` | Same scan chain, but analyzes every fixable CVE and opens one issue per vulnerability (each carries the six-field decision) |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
-| `pipelines/dev-gitops-cd.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
-| `pipelines/qa-gitops-cd.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
-| `pipelines/prod-gitops-cd.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
+| `pipelines/gitops-cd-dev.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
+| `pipelines/gitops-cd-qa.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
+| `pipelines/gitops-cd-prod.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
 | `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation` (one EventListener + interceptors + a binding/template pair per command + RBAC + Route) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
@@ -143,7 +143,7 @@ image build, SBOM upload, or RHTPA scan.
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR — tests + CVE remediation (runs on the **agent image** — see note below) |
 | `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipeline |
 | `tasks/gitops-bump-image.yaml` | Bumps `image.tag` in a gitops values file and lands it as an (auto-merged) MR — used by the dev CD pipeline |
-| `tasks/start-dev-gitops-cd.yaml` | Creates a `dev-gitops-cd` PipelineRun through the Kubernetes API — run as a `finally` task of `ci-build-publish` |
+| `tasks/start-gitops-cd-dev.yaml` | Creates a `gitops-cd-dev` PipelineRun through the Kubernetes API — run as a `finally` task of `ci-build-publish` |
 | `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
 | `images/ai-agent-maven-aider/Dockerfile` | Agent runtime, **aider** flavor (ubi-minimal + JDK17 + Maven + Python/aider + git/glab/gh) |
 | `images/ai-python/Dockerfile` | CVE selection/analysis runtime (Anthropic + OpenAI Python SDKs) |
@@ -246,16 +246,16 @@ avoid the shared-`target/` race. It needs the `ai-agent-config`/`ai-agent-secret
 and `scm-auth-secret` objects (and the agent image), but not `tpa-secret`, RHTPA,
 or TAS.
 
-### `dev-gitops-cd` (dev image promotion)
+### `gitops-cd-dev` (dev image promotion)
 
 ```
-ci-build-publish (finally: start-dev-gitops-cd) → dev-gitops-cd → gitops-bump-image → MR (auto-merged)
+ci-build-publish (finally: start-gitops-cd-dev) → gitops-cd-dev → gitops-bump-image → MR (auto-merged)
 ```
 
-`ci-build-publish` ends with a `finally` task that starts `dev-gitops-cd`
+`ci-build-publish` ends with a `finally` task that starts `gitops-cd-dev`
 whenever `build-container` succeeded and `deploy-dev-gitops` is `"true"` (the
 default). Tekton has no native pipeline-to-pipeline chaining, so the finally
-task (`tasks/start-dev-gitops-cd.yaml`) creates the CD PipelineRun itself with
+task (`tasks/start-gitops-cd-dev.yaml`) creates the CD PipelineRun itself with
 a `curl` POST against the Kubernetes API, authenticated by the pod's service
 account token (it runs as `tekton-triggers-sa`, which already holds `create
 pipelineruns` from the trigger RBAC). It passes the exact `output-image` CI
@@ -285,16 +285,16 @@ plumbing.
 Run it manually the same way the finally task does:
 
 ```bash
-tkn -n tssc-app-ci pipeline start dev-gitops-cd \
+tkn -n tssc-app-ci pipeline start gitops-cd-dev \
   -p image=quay.apps.<domain>/tssc/spring-boot-example-application:<sha> \
   -p app-repo-url=https://… -p app-commit=<sha> --showlog
 ```
 
-### `qa-gitops-cd` / `prod-gitops-cd` (human-gated promotion)
+### `gitops-cd-qa` / `gitops-cd-prod` (human-gated promotion)
 
 ```
-dev-gitops-cd (auto) → qa-gitops-cd (human start) → MR (open for review) → human merges → Argo CD rolls qa
-                                        └────────── prod-gitops-cd (human start) → MR (open for review) → human merges → Argo CD rolls prod
+gitops-cd-dev (auto) → gitops-cd-qa (human start) → MR (open for review) → human merges → Argo CD rolls qa
+                                        └────────── gitops-cd-prod (human start) → MR (open for review) → human merges → Argo CD rolls prod
 ```
 
 The qa and prod pipelines are the same one-task `gitops-bump-image` flow as
@@ -316,7 +316,7 @@ behavior. Environment and values file are baked in as defaults
 needs nothing but the image:
 
 ```bash
-tkn -n tssc-app-ci pipeline start qa-gitops-cd \
+tkn -n tssc-app-ci pipeline start gitops-cd-qa \
   -p image=quay.apps.<domain>/tssc/spring-boot-example-application:<sha> --showlog
 # read the MR URL from the results, review it, merge it in GitLab
 ```
@@ -640,7 +640,7 @@ your own.
 | `ai-agent-config` | ConfigMap | all pipelines | The single backend switch. Apply `config/ai-agent-config.yaml`; pick `AI_PROVIDER`/`AI_AGENT`/`AI_MODEL` (+ `AI_BASE_URL` for gateway/openai). |
 | `ai-agent-secret` | Secret | all pipelines | Provider credential(s) for the chosen `AI_PROVIDER` (e.g. `ANTHROPIC_API_KEY`). From `secrets/ai-agent-secret.example.yaml`. |
 | `scm-auth-secret` | Secret | analysis (issues) + remediation + test-gen (PR step) | `username` + `token` with push + PR/MR-create scope, and issue-create for analysis (see below). From `secrets/scm-auth-secret.example.yaml`. (Name overridable via `scm-secret-name`.) |
-| `scm-auth-gitops-secret` | Secret | dev/qa/prod-gitops-cd | The gitops repository's own project access token — the `scm-secret-name` default of all three gitops CD pipelines. Separate from `scm-auth-secret` because a GitLab project bot cannot be shared across projects. From `secrets/scm-auth-gitops-secret.example.yaml`. |
+| `scm-auth-gitops-secret` | Secret | dev/qa/gitops-cd-prod | The gitops repository's own project access token — the `scm-secret-name` default of all three gitops CD pipelines. Separate from `scm-auth-secret` because a GitLab project bot cannot be shared across projects. From `secrets/scm-auth-gitops-secret.example.yaml`. |
 
 #### SCM token scopes (`scm-auth-secret`)
 

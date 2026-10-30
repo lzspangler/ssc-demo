@@ -72,7 +72,7 @@ gitlab:
 
   # Groups, repositories and projects created by the seeding job. This mirrors
   # the reference cluster: one group, one imported application repository, and
-  # the imported gitops repository dev-gitops-cd promotes into.
+  # the imported gitops repository gitops-cd-dev promotes into.
   groups:
     - name: development
       users: []
@@ -143,7 +143,7 @@ gitlab:
             # GitLab rejects an expiry more than 365 days out; stay inside it.
             expiresInDays: 364
 
-        # The gitops repository: what the dev-gitops-cd pipeline promotes into
+        # The gitops repository: what the gitops-cd-dev pipeline promotes into
         # (MR bumping image.tag in app/spring-boot-example/environments/dev/
         # values.yaml) and what the spring-boot-example-dev Argo CD Application
         # tracks. No labels, no webhooks -- nothing ever pushes here except the
@@ -154,7 +154,7 @@ gitlab:
 
           # Imported repos carry the cluster they were authored on: the chart's
           # base values hardcode a Quay host under quay.<domain>, and workshop
-          # clusters get a new domain on every rebuild. dev-gitops-cd only ever
+          # clusters get a new domain on every rebuild. gitops-cd-dev only ever
           # rewrites image.tag -- never repository -- so without this fix every
           # environment would pull from a registry that no longer exists. After
           # the import, the seeding job commits a one-line retarget of
@@ -170,7 +170,7 @@ gitlab:
           # CANNOT be added to another ("project bots cannot be added to other
           # groups / projects"), so the gitops repo needs its own bot. Minted
           # into the pipeline namespace as `scm-auth-gitops-secret`, which
-          # dev-gitops-cd reads via its `scm-secret-name` parameter.
+          # gitops-cd-dev reads via its `scm-secret-name` parameter.
           accessToken:
             enabled: true
             name: ssc-demo-pipeline-gitops

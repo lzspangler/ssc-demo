@@ -1,7 +1,7 @@
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: start-dev-gitops-cd
+  name: start-gitops-cd-dev
   labels:
     app.kubernetes.io/part-of: maven-build-ci
   annotations:
@@ -9,7 +9,7 @@ metadata:
     tekton.dev/tags: "tekton, pipelinerun"
 spec:
   description: >-
-    Start a dev-gitops-cd PipelineRun through the Kubernetes API. Tekton has no
+    Start a gitops-cd-dev PipelineRun through the Kubernetes API. Tekton has no
     built-in "run this pipeline when that one finishes", so ci-build-publish
     runs this as a finally task and creates the CD run directly: one POST of a
     PipelineRun manifest, authenticated with the pod's own service account
@@ -23,7 +23,7 @@ spec:
     - name: PIPELINE
       type: string
       description: CD pipeline to start.
-      default: dev-gitops-cd
+      default: gitops-cd-dev
     - name: IMAGE
       type: string
       description: Full image reference published by CI; forwarded to the CD pipeline.

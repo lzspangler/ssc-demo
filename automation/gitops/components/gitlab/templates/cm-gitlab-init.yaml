@@ -264,7 +264,7 @@ data:
         # ---- retarget the chart at this cluster's Quay ----------------------
         # The imported repository carries the Quay host of the cluster its
         # chart was authored on (workshop clusters get a new domain on every
-        # rebuild), and dev-gitops-cd only ever rewrites image.tag -- never
+        # rebuild), and gitops-cd-dev only ever rewrites image.tag -- never
         # repository. Left alone, every environment would pull from a registry
         # that does not exist here. One commit on {{ $branch }}, made as root
         # (the project Owner, who can commit to the protected default branch),
@@ -438,7 +438,7 @@ data:
         # ---- pipeline SCM credential ---------------------------------------
         # open-pr and open-cve-issues authenticate with `scm-auth-secret` (the
         # application repository's token) in the pipeline namespace;
-        # dev-gitops-cd's gitops-bump-image uses the gitops repository's own
+        # gitops-cd-dev's gitops-bump-image uses the gitops repository's own
         # `scm-auth-gitops-secret`. Minting them here is what lets the demo
         # come up without anyone pasting a PAT; one project access token per
         # repository (not the root PAT) keeps the blast radius to a single

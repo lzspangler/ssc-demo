@@ -6,18 +6,18 @@ metadata:
     pipelines.openshift.io/strategy: docker
     pipelines.openshift.io/used-by: build-cloud
     app.kubernetes.io/part-of: maven-build-ci
-  name: prod-gitops-cd
+  name: gitops-cd-prod
 spec:
   # Prod gitops CD: promote an image that has already been through dev (and
   # normally qa) into the prod environment of the gitops repository.
   #
-  #   prod-gitops-cd (started by a human) -> MR to
+  #   gitops-cd-prod (started by a human) -> MR to
   #   app/spring-boot-example/environments/prod/values.yaml -> left open for
   #   review -> a human merges it -> Argo CD picks the tag change up and
   #   rolls prod.
   #
   # HOW IT IS TRIGGERED. Deliberately NOT chained off ci-build-publish the way
-  # dev-gitops-cd is: dev auto-promotes on every publish, but a prod
+  # gitops-cd-dev is: dev auto-promotes on every publish, but a prod
   # promotion is a release decision, so this pipeline is started by hand with
   # the image reference to promote. Pass the tag that has earned the release --
   # the tag is the commit SHA, an immutable pointer to the source, SBOM and
@@ -41,8 +41,8 @@ spec:
       type: string
       description: >-
         Full image reference to promote (registry/org/component:<commit sha>) --
-        normally a tag ci-build-publish already published and dev-gitops-cd (and
-        usually qa-gitops-cd) already promoted. Only the tag is written to the
+        normally a tag ci-build-publish already published and gitops-cd-dev (and
+        usually gitops-cd-qa) already promoted. Only the tag is written to the
         values file; the full reference goes into the MR description.
     - name: app-repo-url
       type: string
@@ -80,7 +80,7 @@ spec:
       type: string
       description: >-
         "false" leaves the promotion MR open for human review (the prod
-        default); "true" merges it immediately, the way dev-gitops-cd does.
+        default); "true" merges it immediately, the way gitops-cd-dev does.
       default: "false"
     - name: scm-secret-name
       type: string

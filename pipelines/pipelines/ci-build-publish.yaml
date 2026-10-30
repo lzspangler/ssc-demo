@@ -20,7 +20,7 @@ spec:
   # fast and either produces a published image or fails.
   #
   # The one thing downstream of the build that IS here: a finally task starts
-  # the dev-gitops-cd pipeline after a successful build, promoting the freshly
+  # the gitops-cd-dev pipeline after a successful build, promoting the freshly
   # published image tag into the gitops repo's dev values file (MR + auto
   # merge). No vulnerability analysis, no Conforma gate, no AI, no issues --
   # those belong to the agentic pipelines, which run on their own cadence
@@ -153,7 +153,7 @@ spec:
     - name: deploy-dev-gitops
       type: string
       description: >-
-        "true" starts the dev-gitops-cd pipeline after a successful build (a
+        "true" starts the gitops-cd-dev pipeline after a successful build (a
         finally task creates its PipelineRun, which opens and auto-merges an MR
         bumping image.tag in the gitops repo's dev values file). Set "false" to
         build and publish without promoting to dev.
@@ -322,9 +322,9 @@ spec:
         - name: workspace
           workspace: workspace
 
-    # Dev gitops CD: after a successful build, start the dev-gitops-cd
+    # Dev gitops CD: after a successful build, start the gitops-cd-dev
     # pipeline, which opens and auto-merges an MR bumping image.tag in the
-    # gitops repo's dev values file (see pipelines/dev-gitops-cd.yaml).
+    # gitops repo's dev values file (see pipelines/gitops-cd-dev.yaml).
     #
     # Tekton has no "run this pipeline when that one finishes", so this finally
     # task creates the CD PipelineRun itself through the Kubernetes API. It
@@ -333,7 +333,7 @@ spec:
     # just built, signed and SBOM'd. Gated on build-container having succeeded
     # (a failed build must not promote anything) and on the deploy-dev-gitops
     # switch.
-    - name: start-dev-gitops-cd
+    - name: start-gitops-cd-dev
       params:
         - name: IMAGE
           value: $(params.output-image)
@@ -343,7 +343,7 @@ spec:
           value: $(tasks.clone-repository.results.commit)
       taskRef:
         kind: Task
-        name: start-dev-gitops-cd
+        name: start-gitops-cd-dev
       when:
         - input: "$(params.deploy-dev-gitops)"
           operator: in
@@ -360,7 +360,7 @@ spec:
   # stack, either apply that RBAC too or drop this override after verifying
   # `oc -n tssc-app-ci auth can-i create pipelineruns --as system:serviceaccount:tssc-app-ci:pipeline`.
   taskRunSpecs:
-    - pipelineTaskName: start-dev-gitops-cd
+    - pipelineTaskName: start-gitops-cd-dev
       serviceAccountName: tekton-triggers-sa
 
   workspaces:
