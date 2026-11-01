@@ -107,6 +107,10 @@ For each behavior worth covering, write a **new** `*FT.java` test:
 - Arrange data through the API (create the resource with POST), act, then
   assert on the response: status, headers, and body conformance to the
   documented schema
+- Use **unique identifiers** (e.g. a random suffix) for every resource a test
+  creates: the application's state persists across runs, so a fixed
+  identifier collides with data left by an earlier run and fails the test
+  regardless of the code under test
 - Also assert the documented error behavior — invalid input and
   unauthenticated requests — not just happy paths
 
@@ -137,8 +141,8 @@ behind a test you believe is broken.
   service interface is the only observation point.
 - Never depend on an external application, and never hardcode a host —
   `APP_BASE_URL` is the only address a test may target.
-- Each test is self-contained: it creates its own data via the API and
-  assumes nothing about prior tests or their order.
+- Each test is self-contained: it creates its own data via the API (with a
+  unique identifier) and assumes nothing about prior tests or their order.
 - Do not ask for files to be added to the chat; create test files directly.
 - Extra instructions in the task message refine the priorities above; follow
   them where they apply.

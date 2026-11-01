@@ -507,10 +507,20 @@ commands; each trigger's cel filter picks its command.
   `verify-commit: 'false'`, which is the default. Fix them in the pipeline files
   before turning commit verification on.
 * **`pipelineNamespace` is effectively fixed at `tssc-app-ci`.**
-  `pipelines/triggers/agentic-issue-triggers.yaml` hardcodes it as a
-  `ClusterRoleBinding` subject and plain-YAML Applications cannot template it.
-  `bootstrap-infra` fails the render with an explanation if you change one
-  without the other.
+  `pipelines/triggers/agentic-issue-triggers.yaml` **and**
+  `pipelines/tasks/deploy-app-under-test.yaml` (the ephemeral app-under-test
+  RBAC) hardcode it — as a `ClusterRoleBinding` subject and a namespaced
+  `Role`/`RoleBinding` respectively — and plain-YAML Applications cannot
+  template it. `bootstrap-infra` fails the render with an explanation if you
+  change one without the other.
+* **Ephemeral test resources can outlive a hard PipelineRun timeout.** The
+  functional test-generation pipeline deploys the app under test as ephemeral
+  Deployment/Service/ImageStream in `tssc-app-ci`; `cleanup-app-under-test`
+  removes them as a `finally` task (success or failure). But a PipelineRun
+  **timeout** cancels finally tasks too, so on that path they linger until the
+  PipelineRun object is deleted (ownerReference GC) — or sweep manually:
+  `oc -n tssc-app-ci delete deployment,service,imagestream -l
+  app.kubernetes.io/part-of=ephemeral-test-resources`.
 * **Everything has `selfHeal: true`.** An `oc edit` against any managed resource
   is reverted on the next reconcile — change the chart, or for the Tekton layer,
   the file in `pipelines/`, and push.

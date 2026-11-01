@@ -1,0 +1,49 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: reset-app-under-test
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "testing, ephemeral"
+spec:
+  description: >-
+    Reset the deployed application under test to a clean state: delete all of
+    its pods (the Deployment recreates them) and wait until the replacement
+    pods are ready. For an application with in-memory state (this demo's H2
+    `jdbc:h2:mem:` databases) a pod restart IS a state reset, with no data
+    left over from earlier test runs. Used to give the pipeline's re-run of the
+    generated functional tests the same fresh application the generation task
+    verified them against -- without it, a full-suite re-run against leftover
+    data fails on exactly the tests that create fixed-identifier resources.
+  params:
+    - name: APP_NAME
+      type: string
+      description: Value of the app.kubernetes.io/instance label scoping the app's pods.
+      default: app-under-test
+    - name: WAIT_TIMEOUT
+      type: string
+      description: Seconds to wait for the replacement pods to become ready.
+      default: "420"
+  steps:
+    - name: reset
+      image: registry.redhat.io/openshift/oc-cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+        APP_NAME="$(params.APP_NAME)"
+
+        # Delete every pod of the app; the Deployment's ReplicaSet replaces
+        # them immediately. `oc rollout status` then waits for that new rollout
+        # to finish -- and because the pod's readiness probe is the app's
+        # health endpoint, "rollout complete" means "serving again", not just
+        # "container running".
+        echo "Deleting pods of deployment/${APP_NAME} to reset application state..."
+        oc -n "${NS}" delete pod -l "app.kubernetes.io/instance=${APP_NAME}"
+
+        oc -n "${NS}" rollout status "deployment/${APP_NAME}" \
+          --timeout="$(params.WAIT_TIMEOUT)s"
+        echo "Application under test reset and healthy."
