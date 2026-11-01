@@ -24,7 +24,7 @@ re-syncing rather than installing.
 | Tekton | namespace `tssc-app-ci` | — |
 
 Plus: the `development/spring-boot-example-application` repository imported into
-GitLab with the CVE issue board, the `/remediate` and `/generate-tests` webhook,
+GitLab with the CVE issue board, the `/remediate` and `/generate-tests*` webhook,
 23 Tasks, 5 Pipelines, and every credential the pipelines need.
 
 Budget **2–3 hours of wall clock**, most of it unattended. RHTPA's first full
@@ -489,7 +489,10 @@ Lightwell backport.
 Then exercise the webhook: comment **`/remediate`** on one of those issues. The
 EventListener starts `agentic-cve-remediation`, which pushes a branch and opens
 a merge request. **`/generate-tests`** does the same through
-`agentic-test-generation`.
+`agentic-test-generation`, **`/generate-tests-functional`** through
+`agentic-test-generation-functional`, and **`/generate-tests-integration`**
+through `agentic-test-generation-integration` — one webhook, four slash
+commands; each trigger's cel filter picks its command.
 
 ## Known rough edges
 

@@ -5,7 +5,9 @@
 # matching pipeline:
 #
 #   /remediate       ->  agentic-cve-remediation   (reads a decision from the issue)
-#   /generate-tests  ->  agentic-test-generation   (no decision needed)
+#   /generate-tests  ->  agentic-test-generation   (unit tests; no decision needed)
+#   /generate-tests-functional   ->  agentic-test-generation-functional
+#   /generate-tests-integration  ->  agentic-test-generation-integration
 #
 # Flow:  GitLab issue comment  ->  webhook (Note Hook)  ->  EventListener
 #        ->  gitlab interceptor (validate X-Gitlab-Token, event type)
@@ -234,9 +236,13 @@ spec:
           #       secretName: git-auth
 ---
 # ---- /generate-tests ---------------------------------------------------------
-# The test-generation command carries no decision -- it only needs the repo
+# The test-generation commands carry no decision -- they only need the repo
 # coordinates (git-url from the payload, git-host + base-branch derived in cel),
-# so its binding/template are much simpler than the remediation pair above.
+# so their bindings/templates are much simpler than the remediation pair above.
+# All three (unit/functional/integration) share ONE TriggerBinding --
+# test-generation-issue-binding -- because it extracts nothing command-specific;
+# each command just gets its own TriggerTemplate (own PipelineRun shape) and its
+# own EventListener trigger (own cel filter).
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerBinding
 metadata:
@@ -322,6 +328,155 @@ spec:
           # has merged, the tree carries a Lightwell backport pin that does not
           # exist on Maven Central. See the remediation template above for the
           # full reasoning and the `oc create secret` command. The Secret MUST
+          # exist in this namespace or the pod hangs in PodInitializing.
+          - name: maven-settings
+            secret:
+              secretName: maven-settings
+          # git-auth intentionally NOT bound -- same reasoning as the remediation
+          # template above (optional workspace; a missing secret hangs the clone
+          # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
+---
+# ---- /generate-tests-functional ----------------------------------------------
+# Same shape as test-generation-issue-template above, pointing at the functional
+# pipeline. Shares test-generation-issue-binding (nothing command-specific in it).
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: test-generation-functional-issue-template
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  params:
+    - name: git-url
+    - name: git-host
+    - name: base-branch
+      default: main
+    - name: scm-provider
+      default: gitlab
+    - name: subdirectory
+      default: source
+    - name: issue-iid
+      default: ""
+    # Workspace backing -- override to match your cluster's storage/config.
+    - name: workspace-size
+      default: 2Gi
+    - name: scm-secret-name
+      default: scm-auth-secret
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: agentic-test-generation-functional-issue-
+        labels:
+          app.kubernetes.io/part-of: maven-build-ci
+          tekton.dev/pipeline: agentic-test-generation-functional
+          trigger: gitlab-issue
+      spec:
+        pipelineRef:
+          name: agentic-test-generation-functional
+        params:
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-host
+            value: $(tt.params.git-host)
+          - name: base-branch
+            value: $(tt.params.base-branch)
+          - name: scm-provider
+            value: $(tt.params.scm-provider)
+          - name: subdirectory
+            value: $(tt.params.subdirectory)
+          - name: scm-secret-name
+            value: $(tt.params.scm-secret-name)
+          - name: issue-iid
+            value: $(tt.params.issue-iid)
+        workspaces:
+          - name: workspace
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: $(tt.params.workspace-size)
+          # maven-settings: the functional task's agent adds TEST-SCOPED deps
+          # (REST Assured) that must resolve through the mirror, and it runs
+          # Maven itself (app package + verification builds). Same reasoning
+          # and same `oc create secret` command as the templates above. The
+          # Secret MUST exist in this namespace or the pod hangs in
+          # PodInitializing.
+          - name: maven-settings
+            secret:
+              secretName: maven-settings
+          # git-auth intentionally NOT bound -- same reasoning as the remediation
+          # template above (optional workspace; a missing secret hangs the clone
+          # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
+---
+# ---- /generate-tests-integration ---------------------------------------------
+# Same shape as test-generation-issue-template above, pointing at the integration
+# pipeline. Shares test-generation-issue-binding (nothing command-specific in it).
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: test-generation-integration-issue-template
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+spec:
+  params:
+    - name: git-url
+    - name: git-host
+    - name: base-branch
+      default: main
+    - name: scm-provider
+      default: gitlab
+    - name: subdirectory
+      default: source
+    - name: issue-iid
+      default: ""
+    # Workspace backing -- override to match your cluster's storage/config.
+    - name: workspace-size
+      default: 2Gi
+    - name: scm-secret-name
+      default: scm-auth-secret
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        generateName: agentic-test-generation-integration-issue-
+        labels:
+          app.kubernetes.io/part-of: maven-build-ci
+          tekton.dev/pipeline: agentic-test-generation-integration
+          trigger: gitlab-issue
+      spec:
+        pipelineRef:
+          name: agentic-test-generation-integration
+        params:
+          - name: git-url
+            value: $(tt.params.git-url)
+          - name: git-host
+            value: $(tt.params.git-host)
+          - name: base-branch
+            value: $(tt.params.base-branch)
+          - name: scm-provider
+            value: $(tt.params.scm-provider)
+          - name: subdirectory
+            value: $(tt.params.subdirectory)
+          - name: scm-secret-name
+            value: $(tt.params.scm-secret-name)
+          - name: issue-iid
+            value: $(tt.params.issue-iid)
+        workspaces:
+          - name: workspace
+            volumeClaimTemplate:
+              spec:
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: $(tt.params.workspace-size)
+          # maven-settings: the integration task's agent adds TEST-SCOPED deps
+          # (WireMock, Awaitility) that must resolve through the mirror, and it
+          # runs Maven itself (verification builds). Same reasoning and same
+          # `oc create secret` command as the templates above. The Secret MUST
           # exist in this namespace or the pod hangs in PodInitializing.
           - name: maven-settings
             secret:
@@ -454,11 +609,20 @@ spec:
             - name: eventTypes
               value:
                 - "Note Hook"
-        # 2) Only act on issue comments beginning with /generate-tests, and derive
-        #    the SCM coordinates. Both overlays read only `body`, so ONE cel
-        #    interceptor suffices -- unlike /remediate, nothing here depends on an
-        #    extension set by a sibling overlay (see the chaining gotcha above).
-        #    Overlay keys are BARE (key: git_host), not extensions.-prefixed.
+        # 2) Only act on issue comments beginning with the /generate-tests
+        #    command, and derive the SCM coordinates. Both overlays read only
+        #    `body`, so ONE cel interceptor suffices -- unlike /remediate,
+        #    nothing here depends on an extension set by a sibling overlay (see
+        #    the chaining gotcha above). Overlay keys are BARE (key: git_host),
+        #    not extensions.-prefixed.
+        #
+        #    The filter is WORD-BOUNDED, not a plain startsWith: the sibling
+        #    commands /generate-tests-functional and /generate-tests-integration
+        #    both also start with "/generate-tests", so a startsWith filter here
+        #    would match them too and start TWO pipelines off one comment. The
+        #    regex demands the command end at whitespace or end-of-string; its
+        #    explicit ^/$ anchors make it behave identically whether the cel
+        #    `matches` implementation is full-match or partial-match.
         - ref:
             name: cel
           params:
@@ -466,7 +630,7 @@ spec:
               value: >-
                 body.object_attributes.noteable_type == 'Issue' &&
                 body.object_attributes.system == false &&
-                body.object_attributes.note.startsWith('/generate-tests')
+                body.object_attributes.note.matches('^/generate-tests(\s|$)')
             - name: overlays
               value:
                 - key: git_host
@@ -484,6 +648,90 @@ spec:
         - ref: test-generation-issue-binding
       template:
         ref: test-generation-issue-template
+    - name: gitlab-issue-generate-tests-functional
+      interceptors:
+        # 1) Validate the shared secret token and that this is a comment event.
+        - ref:
+            name: gitlab
+          params:
+            - name: secretRef
+              value:
+                secretName: gitlab-webhook-secret
+                secretKey: secretToken
+            - name: eventTypes
+              value:
+                - "Note Hook"
+        # 2) Only act on issue comments beginning with /generate-tests-functional
+        #    (longest-prefix command, so startsWith is unambiguous here), and
+        #    derive the SCM coordinates. Same single-cel-interceptor structure
+        #    as gitlab-issue-generate-tests above.
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: >-
+                body.object_attributes.noteable_type == 'Issue' &&
+                body.object_attributes.system == false &&
+                body.object_attributes.note.startsWith('/generate-tests-functional')
+            - name: overlays
+              value:
+                - key: git_host
+                  expression: >-
+                    body.project.git_http_url.parseURL().host
+                - key: base_branch
+                  expression: >-
+                    (has(body.project.default_branch) && body.project.default_branch != null) ? body.project.default_branch : "main"
+                # The commented-on issue's project-scoped number (iid), as a string,
+                # so the opened MR can link back to it. Falls back to "" if absent.
+                - key: issue_iid
+                  expression: >-
+                    (has(body.issue) && has(body.issue.iid) && body.issue.iid != null) ? string(body.issue.iid) : ""
+      bindings:
+        - ref: test-generation-issue-binding
+      template:
+        ref: test-generation-functional-issue-template
+    - name: gitlab-issue-generate-tests-integration
+      interceptors:
+        # 1) Validate the shared secret token and that this is a comment event.
+        - ref:
+            name: gitlab
+          params:
+            - name: secretRef
+              value:
+                secretName: gitlab-webhook-secret
+                secretKey: secretToken
+            - name: eventTypes
+              value:
+                - "Note Hook"
+        # 2) Only act on issue comments beginning with /generate-tests-integration
+        #    (longest-prefix command, so startsWith is unambiguous here), and
+        #    derive the SCM coordinates. Same single-cel-interceptor structure
+        #    as gitlab-issue-generate-tests above.
+        - ref:
+            name: cel
+          params:
+            - name: filter
+              value: >-
+                body.object_attributes.noteable_type == 'Issue' &&
+                body.object_attributes.system == false &&
+                body.object_attributes.note.startsWith('/generate-tests-integration')
+            - name: overlays
+              value:
+                - key: git_host
+                  expression: >-
+                    body.project.git_http_url.parseURL().host
+                - key: base_branch
+                  expression: >-
+                    (has(body.project.default_branch) && body.project.default_branch != null) ? body.project.default_branch : "main"
+                # The commented-on issue's project-scoped number (iid), as a string,
+                # so the opened MR can link back to it. Falls back to "" if absent.
+                - key: issue_iid
+                  expression: >-
+                    (has(body.issue) && has(body.issue.iid) && body.issue.iid != null) ? string(body.issue.iid) : ""
+      bindings:
+        - ref: test-generation-issue-binding
+      template:
+        ref: test-generation-integration-issue-template
 ---
 # Expose the EventListener so GitLab can reach it. Point the GitLab webhook URL at
 # this Route's https:// host. (OpenShift-specific; drop if you expose it another way.)

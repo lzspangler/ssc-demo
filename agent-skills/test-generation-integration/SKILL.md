@@ -110,15 +110,26 @@ For each interaction worth covering, write a **new** `*IT.java` test:
 
 ### Step 3 — Verify
 
-After writing tests, run `mvn -B -q -Dstyle.color=never verify` (Failsafe
-runs the `*IT.java` tests) and iterate until the tests you added pass. If you
-cannot run the build yourself, leave verification to the pipeline — but never
-leave behind a test you believe is broken.
+After writing tests, run the verification command supplied in the task
+message and iterate until the tests you added pass. The pipeline invokes
+Failsafe directly —
+
+    mvn -B -q -Dstyle.color=never test-compile \
+        failsafe:integration-test failsafe:verify -Dit.test=<classes>
+
+— which runs the `*IT.java` tests whether or not the pom declares a failsafe
+binding; if the pom does declare one, plain `mvn verify` is equivalent. If
+you cannot run the build yourself, leave verification to the pipeline — but
+never leave behind a test you believe is broken.
 
 ## Constraints
 
 - NEVER modify files under `src/main` — functional code is off-limits.
 - NEVER modify, rename, or delete an existing test. Only ADD new test files.
+- You MAY add **test-scoped** dependencies and test-only build configuration
+  to `pom.xml` when this contract's tool stack requires them (WireMock,
+  Awaitility, a Failsafe binding) — never touch compile/runtime dependencies,
+  plugins, or properties that affect the shipped artifact.
 - Every dependency a test touches must be started and stopped by the test
   itself — an embedded implementation or a WireMock stub. Never point a test
   at a deployed or shared environment, and never hardcode a host.

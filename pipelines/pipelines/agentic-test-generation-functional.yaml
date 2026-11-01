@@ -1,0 +1,273 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.openshift.io/runtime: generic
+    pipelines.openshift.io/strategy: docker
+    pipelines.openshift.io/used-by: build-cloud
+  name: agentic-test-generation-functional
+spec:
+  # Linear chain: clone-repository -> verify-commit (optional) -> package
+  #   -> ai-generate-tests-functional -> re-run-tests -> open-pr
+  # The AI coding agent generates JUnit functional tests (*FT.java) per the
+  # test-generation-functional skill: black-box REST Assured tests against the
+  # application the ai-generate-tests-functional task builds, starts, and
+  # health-waits for. The re-run then re-verifies with spring-boot:start/stop in
+  # a single mvn invocation, and a PR/MR is opened with the generated tests
+  # plus any test-scoped pom additions. Triggered from a GitLab issue comment:
+  # /generate-tests-functional
+  params:
+    - description: Source Repository URL
+      name: git-url
+      type: string
+    - default: ""
+      description: Revision of the Source Repository
+      name: revision
+      type: string
+    - default: source
+      description: Project subdirectory within the source workspace (where pom.xml lives).
+      name: subdirectory
+      type: string
+    # ---------------- verify-commit (optional) ----------------
+    - name: verify-commit
+      type: string
+      default: 'false'
+    - name: certificate-identity
+      type: string
+      default: userX@demo.redhat.com
+    - name: oidc-issuer
+      type: string
+      default: https://sso.<domain>/realms/trusted-artifact-signer
+    - name: rekor-url
+      type: string
+      default: http://rekor-server.tssc-tas.svc
+    - name: tuf-mirror
+      type: string
+      default: http://tuf.tssc-tas.svc
+    # ---------------- SCM (open-pr) ----------------
+    - name: git-host
+      type: string
+      description: SCM host for opening the PR/MR, e.g. gitlab-gitlab.apps.cluster.example.com
+      default: ""
+    - name: scm-provider
+      type: string
+      description: gitlab | github
+      default: gitlab
+    - name: base-branch
+      type: string
+      default: master
+    - name: scm-secret-name
+      type: string
+      default: scm-auth-secret
+    - name: issue-iid
+      type: string
+      description: >-
+        SCM issue number to cross-reference from the opened MR/PR. Set by the
+        issue-comment trigger; leave empty (the default) for manual or other
+        triggers, in which case the PR carries no issue reference.
+      default: ""
+    # ---------------- agent runtime ----------------
+    - name: agent-image
+      type: string
+      description: >-
+        AI coding-agent runtime image (JDK17 + Maven + the agent CLI). Use the
+        flavor matching AI_AGENT: ai-agent-maven-claude for claude-code (default),
+        ai-agent-maven-aider for aider. Also used as open-pr's GIT_IMAGE (bundles
+        git/glab/gh).
+      default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+    # ---------------- application under test ----------------
+    - name: app-base-url
+      type: string
+      description: >-
+        Base URL of the application under test, as seen from the task pods
+        (the ai-generate-tests-functional task boots the app in its own pod;
+        re-run-tests boots it in its pod via spring-boot:start). Tests target
+        ONLY this URL.
+      default: http://localhost:8080
+    - name: app-username
+      type: string
+      description: >-
+        Username for the application's security layer, exported to the tests as
+        APP_USERNAME. Default matches spring-boot-example-application's
+        in-memory user.
+      default: user
+    - name: app-password
+      type: string
+      description: >-
+        Password for app-username, exported as APP_PASSWORD. Default matches
+        spring-boot-example-application's in-memory user (test credentials).
+      default: user123
+  results:
+    - name: CHAINS-GIT_URL
+      value: $(tasks.clone-repository.results.url)
+    - name: CHAINS-GIT_COMMIT
+      value: $(tasks.clone-repository.results.commit)
+    - name: TESTS_ADDED
+      value: $(tasks.ai-generate-tests-functional.results.TESTS_ADDED)
+    - name: PR_URL
+      value: $(tasks.open-pr.results.PR_URL)
+  tasks:
+    - name: clone-repository
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: workspace
+        - name: basic-auth
+          workspace: git-auth
+    - name: verify-commit
+      params:
+        - name: certificate-identity
+          value: $(params.certificate-identity)
+        - name: oidc-issuer
+          value: $(params.oidc-issuer)
+        - name: rekor-url
+          value: $(params.rekor-url)
+        - name: tuf-mirror
+          value: $(params.tuf-mirror)
+      runAfter:
+        - clone-repository
+      taskRef:
+        kind: Task
+        name: verify-commit
+      when:
+        - input: "$(params.verify-commit)"
+          operator: in
+          values: ["true"]
+      workspaces:
+        - name: repository
+          workspace: workspace
+    - name: package
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+      runAfter:
+        - verify-commit
+      taskRef:
+        name: maven
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: maven_settings
+          workspace: maven-settings
+    - name: ai-generate-tests-functional
+      runAfter:
+        - package
+      taskRef:
+        name: ai-generate-tests-functional
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: AGENT_IMAGE
+          value: $(params.agent-image)
+        - name: APP_BASE_URL
+          value: $(params.app-base-url)
+        - name: APP_USERNAME
+          value: $(params.app-username)
+        - name: APP_PASSWORD
+          value: $(params.app-password)
+      workspaces:
+        - name: source
+          workspace: workspace
+        # The agent runs Maven itself and the task verifies in a scratch copy,
+        # so it needs the mirror just as much as re-run-tests below -- a tree
+        # carrying a merged .rhlw pin will not resolve from Central.
+        - name: maven-settings
+          workspace: maven-settings
+
+    # Stop here if the agent produced no new/changed tests: nothing to verify or
+    # PR. Both re-run-tests and open-pr are guarded on TESTS_ADDED != "0" -- the
+    # guard is repeated on open-pr because Tekton still runs a runAfter successor
+    # when its parent is skipped by a when-expression.
+    - name: re-run-tests
+      runAfter:
+        - ai-generate-tests-functional
+      taskRef:
+        name: maven
+      when:
+        - input: $(tasks.ai-generate-tests-functional.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
+      params:
+        # The functional contract requires the tests to run against a RUNNING
+        # application, so the re-run boots one itself. spring-boot:start/stop
+        # MUST share this single mvn invocation with the test goals: each task
+        # step is its own pod, so an app started in one step is gone before the
+        # next -- there is no cross-step process. If the tests fail,
+        # spring-boot:stop never runs and the leaked fork dies with the pod.
+        # spring-boot:start blocks until the Spring context is genuinely ready
+        # (it polls SpringApplicationAdminClient.isReady() over JMX), so no
+        # separate health-wait is needed; maxAttempts is raised from the 60x500ms
+        # default (30s) to 240 (120s) for a cold CI boot with a cold ~/.m2.
+        # Failsafe is invoked DIRECTLY (not via `mvn verify`) because the repo's
+        # pom may not declare a failsafe binding or a functional profile yet,
+        # and without a binding `mvn verify` silently runs zero *FT.java tests.
+        # -Dit.test=*FT scopes the run to the generated functional suite; the
+        # unit suite already ran in the package task. APP_BASE_URL/credentials
+        # propagate to the forked JVM as system properties and environment.
+        - name: GOALS
+          value:
+            - spring-boot:start
+            - test-compile
+            - failsafe:integration-test
+            - failsafe:verify
+            - spring-boot:stop
+            - -Dit.test=*FT
+            - -DAPP_BASE_URL=$(params.app-base-url)
+            - -DAPP_USERNAME=$(params.app-username)
+            - -DAPP_PASSWORD=$(params.app-password)
+            - -Dspring-boot.start.maxAttempts=240
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: maven_settings
+          workspace: maven-settings
+
+    - name: open-pr
+      runAfter:
+        - re-run-tests
+      taskRef:
+        name: open-pr-tests
+      when:
+        - input: $(tasks.ai-generate-tests-functional.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: GIT_HOST
+          value: $(params.git-host)
+        - name: SCM_PROVIDER
+          value: $(params.scm-provider)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
+        - name: SCM_SECRET_NAME
+          value: $(params.scm-secret-name)
+        - name: ISSUE_IID
+          value: $(params.issue-iid)
+        # integration/functional MRs stage pom.xml alongside src/test: the
+        # generated tests may need the agent's test-scoped dependency additions
+        # to compile at all.
+        - name: TEST_CATEGORY
+          value: functional
+        # open-pr needs git + glab + gh; the default git-init image ships git only,
+        # so run it on the agent image, which bundles all three (both flavors do).
+        - name: GIT_IMAGE
+          value: $(params.agent-image)
+      workspaces:
+        - name: source
+          workspace: workspace
+  workspaces:
+    - name: workspace
+    - name: maven-settings
+    - name: git-auth
+      optional: true

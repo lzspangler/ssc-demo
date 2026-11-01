@@ -62,6 +62,12 @@ service interface**, without depending on external applications:
 - **`APP_USERNAME` / `APP_PASSWORD`** (or an equivalent token variable) —
   credentials for the application's security layer, when it has one
 
+Read these in the tests from the **environment first, falling back to the
+system property of the same name** (`System.getenv("APP_BASE_URL")`, then
+`System.getProperty("APP_BASE_URL")`). The pipeline supplies them as
+environment variables during generation but as `-D` system properties during
+the re-run, so a test that reads only one of the two breaks in the other.
+
 ## Available Tools
 
 The OpenAPI spec and the main sources are supplied as read-only context — do
@@ -106,16 +112,27 @@ For each behavior worth covering, write a **new** `*FT.java` test:
 
 ### Step 3 — Verify
 
-After writing tests, run `mvn -B -q -Dstyle.color=never -Pfunctional verify`
-with `APP_BASE_URL` pointing at the deployed application, and iterate until
-the tests you added pass. If you cannot run the build yourself, leave
-verification to the pipeline — but never leave behind a test you believe is
-broken.
+After writing tests, run the verification command supplied in the task
+message and iterate until the tests you added pass. The pipeline invokes
+Failsafe directly —
+
+    mvn -B -q -Dstyle.color=never test-compile \
+        failsafe:integration-test failsafe:verify -Dit.test=<classes>
+
+— with `APP_BASE_URL` pointing at the running application, so the `*FT.java`
+tests run whether or not the pom declares a functional profile; if the pom
+does declare one, `mvn -Pfunctional verify` is equivalent. If you cannot run
+the build yourself, leave verification to the pipeline — but never leave
+behind a test you believe is broken.
 
 ## Constraints
 
 - NEVER modify files under `src/main` — functional code is off-limits.
 - NEVER modify, rename, or delete an existing test. Only ADD new test files.
+- You MAY add **test-scoped** dependencies and test-only build configuration
+  to `pom.xml` when this contract's tool stack requires them (REST Assured, a
+  Failsafe binding, a `functional` profile) — never touch compile/runtime
+  dependencies, plugins, or properties that affect the shipped artifact.
 - Black box only: no database, actuator-internals, or log assertions — the
   service interface is the only observation point.
 - Never depend on an external application, and never hardcode a host —
