@@ -1,42 +1,45 @@
 # -----------------------------------------------------------------------------
-# Agent skill: coverage-gap-driven JUnit test generation.
+# Agent skill: coverage-gap-driven JUnit 5 unit test generation, per the
+# unit-test execution contract (test-generation-unit).
 #
 # Mounted read-only into the ai-generate-tests task at
-# /tekton/home/agent-skills/junit-regression-test-generation/ and handed to
-# the coding agent as context (aider: --read SKILL.md; claude-code:
+# /tekton/home/agent-skills/test-generation-unit/ and handed to the coding
+# agent as context (aider: --read SKILL.md; claude-code:
 # --append-system-prompt). The task prompt carries the run contract (evaluate
-# coverage, add gap-filling tests, verify); this skill carries the HOW:
-# surveying existing tests, judging coverage gaps, and writing tests that
-# fill them without touching existing tests or functional code.
+# coverage, add gap-filling tests, verify); this skill carries the HOW: the
+# unit-test execution contract and tool stack, surveying existing tests,
+# judging coverage gaps, and writing tests that fill them without touching
+# existing tests or functional code.
 #
-# CONTENT MIRRORS agent-skills/junit-regression-test-generation/ in this repo.
+# CONTENT MIRRORS agent-skills/test-generation-unit/ in this repo.
 # There is no way to share one file across the two sync roots
 # (ssc-tekton-config syncs this directory; agent-skills/ is not an Argo
 # root), so edit the file under agent-skills/ and regenerate this ConfigMap
 # from it, e.g.:
-#   oc create configmap agent-skills-junit-regression-test-generation \
-#     --from-file=SKILL.md=agent-skills/junit-regression-test-generation/SKILL.md \
+#   oc create configmap agent-skills-test-generation-unit \
+#     --from-file=SKILL.md=agent-skills/test-generation-unit/SKILL.md \
 #     --dry-run=client -o yaml > this-file   (then re-add this header + labels)
 # Synced by the ssc-tekton-config Application (pipelines/config/).
 # -----------------------------------------------------------------------------
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: agent-skills-junit-regression-test-generation
+  name: agent-skills-test-generation-unit
   labels:
     app.kubernetes.io/part-of: maven-build-ci
 data:
   SKILL.md: |
     ---
-    name: junit-regression-test-generation
+    name: test-generation-unit
     description: >
-      Coverage-gap-driven JUnit 5 test generation for the ai-generate-tests task.
-      Evaluate the tests already present in the Maven project for unit-test
-      coverage, then add new tests that fill the gaps found. Existing tests and
-      functional code are never modified; no gaps means no new tests.
+      Coverage-gap-driven JUnit 5 unit test generation, per the unit-test
+      execution contract. Evaluate the tests already present in the Maven project
+      for unit coverage of the main sources, then add new tests that fill the gaps
+      found. Existing tests and functional code are never modified; no gaps means
+      no new tests.
     ---
 
-    # JUnit Regression Test Generation
+    # Unit Test Generation
 
     ## Your Role
 
@@ -44,10 +47,43 @@ data:
     covers the main sources, and where coverage is thin, **add new tests** that
     fill the gaps — extending the regression safety net, not rewriting it.
 
+    ## Execution Contract
+
+    Unit tests verify individual classes or components **without a running
+    application or any external infrastructure**:
+
+    - **Naming / location:** new tests are `*Test.java` files under
+      `src/test/java`, mirroring the package layout of the class under test.
+      Maven Surefire picks them up on plain `mvn test` — no profile, no running
+      application.
+    - **Application state:** none. Do not boot a Spring context; a lightweight
+      slice (`@WebMvcTest`, `@DataJpaTest`) is acceptable only when plain
+      instantiation with Mockito doubles cannot express the behavior.
+    - **Infrastructure:** JVM only. No sockets, no database, no filesystem
+      outside `target/`.
+    - **Data:** constructed in the test; collaborators are Mockito doubles.
+    - **Determinism:** no network, no live database, no randomness, no sleeps or
+      wall-clock dependence, no ordering between tests.
+    - **Budget:** each test runs in milliseconds; the suite stays in low
+      single-digit minutes.
+
+    ## Tool Stack
+
+    All of it ships in `spring-boot-starter-test`:
+
+    - **JUnit 5** — the test API (`@Test`, `@ParameterizedTest`, assertions)
+    - **Mockito** — doubles for collaborators (`@Mock` / `@InjectMocks`, or plain
+      `Mockito.mock`)
+    - **AssertJ** — fluent assertions (`assertThat(...)`), preferred over raw
+      JUnit assertions for their failure messages
+    - **JaCoCo** — coverage measurement (the build reports it; you never invoke
+      it)
+
     ## Available Tools
 
     The main sources (`src/main/java`) are supplied as read-only context — do NOT
-    ask for more files to be added. If using aider, you also have these in-chat commands:
+    ask for more files to be added. If using aider, you also have these in-chat
+    commands:
 
     - `/read <file>` — view an existing test or source file read-only
     - `/ls` — list the repository tree
@@ -83,12 +119,11 @@ data:
     For each gap worth filling, write a **new** JUnit 5 test file:
 
     - Place it under `src/test/java`, mirroring the package layout of the class
-      under test
-    - Follow the conventions of the existing suite (naming like `FooTest`,
-      base classes, assertion and mocking style) so the new tests read as part of
-      it
-    - Keep tests deterministic and offline: no network, no live DB, no
-      randomness, no timing/sleep dependence
+      under test, named `FooTest.java`
+    - Follow the conventions of the existing suite (naming, base classes,
+      assertion and mocking style) so the new tests read as part of it
+    - Instantiate the class under test directly; replace its collaborators with
+      Mockito doubles
     - Scope each test to observable public behavior; do not test private
       internals
 
@@ -105,8 +140,8 @@ data:
     - NEVER modify, rename, or delete an existing test under `src/test`. Only
       ADD new test files.
     - If Step 1 finds no coverage gaps, generate NO tests.
-    - Tests must be deterministic — no network, live DB, randomness, or timing
-      dependence.
+    - Honor the execution contract: no network, no live database, no randomness,
+      no sleeps, no reliance on test order or shared state.
     - Do not ask for files to be added to the chat — the sources are already
       available; create test files directly.
     - Extra instructions in the task message refine the priorities above (for
