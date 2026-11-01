@@ -1,0 +1,76 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cleanup-app-under-test
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "testing, ephemeral, cleanup"
+spec:
+  description: >-
+    Delete the ephemeral application-under-test resources (Deployment, Service,
+    ImageStream) created by deploy-app-under-test. Runs as a PIPELINE FINALLY
+    task so it executes whether the run succeeded, failed, or was skipped
+    partway -- the ephemeral resources must never outlive their PipelineRun.
+    Deliberately never fails the run: a cleanup error after a successful test
+    generation should not turn the run red; it logs loudly instead so a human
+    can sweep up manually.
+
+    Two safety nets behind this task: every resource also carries an
+    ownerReference to the PipelineRun (Kubernetes GC removes it if the
+    PipelineRun object is ever deleted), and everything is labeled
+    app.kubernetes.io/part-of=ephemeral-test-resources, so a manual sweep for
+    anything this task missed is one command:
+      oc -n tssc-app-ci delete deployment,service,imagestream \
+        -l app.kubernetes.io/part-of=ephemeral-test-resources
+  params:
+    - name: APP_NAME
+      type: string
+      description: Value of the app.kubernetes.io/instance label scoping this run's resources.
+      default: app-under-test
+  steps:
+    - name: cleanup
+      image: registry.redhat.io/openshift/oc-cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail   # no -e: cleanup must never fail the run
+
+        NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+        APP_NAME="$(params.APP_NAME)"
+        failed=0
+
+        # Deployment deletion cascades to its pods; no need to delete pods
+        # separately. --ignore-not-found makes a re-run (or a run whose deploy
+        # step never got that far) a no-op instead of an error.
+        if ! oc -n "${NS}" delete deployment,service \
+             -l "app.kubernetes.io/instance=${APP_NAME}" --ignore-not-found; then
+          echo "WARN: failed to delete deployment/service for ${APP_NAME}." >&2
+          failed=1
+        fi
+
+        # The ImageStream is deleted by NAME: buildah's push auto-created it,
+        # so only the label applied afterwards (in the deploy task) ties it to
+        # this run -- keep the by-name delete primary and the by-label sweep as
+        # a fallback for the case where the name was overridden.
+        if ! oc -n "${NS}" delete imagestream "${APP_NAME}" --ignore-not-found; then
+          echo "WARN: failed to delete imagestream ${APP_NAME}." >&2
+          failed=1
+        fi
+
+        # Show whatever is left with this run's instance label, if anything.
+        leftover="$(oc -n "${NS}" get deployment,service,imagestream \
+          -l "app.kubernetes.io/instance=${APP_NAME}" --no-headers 2>/dev/null || true)"
+        if [ -n "${leftover}" ]; then
+          echo "WARN: ephemeral resources still present after cleanup:" >&2
+          echo "${leftover}" >&2
+          echo "(manual sweep: oc -n ${NS} delete deployment,service,imagestream -l app.kubernetes.io/part-of=ephemeral-test-resources)" >&2
+          failed=1
+        fi
+
+        if [ "${failed}" -ne 0 ]; then
+          echo "Cleanup finished WITH WARNINGS (run result is unaffected)." >&2
+        else
+          echo "Ephemeral application resources for ${APP_NAME} cleaned up."
+        fi
+        exit 0

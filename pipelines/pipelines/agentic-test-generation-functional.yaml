@@ -8,14 +8,23 @@ metadata:
   name: agentic-test-generation-functional
 spec:
   # Linear chain: clone-repository -> verify-commit (optional) -> package
-  #   -> ai-generate-tests-functional -> re-run-tests -> open-pr
+  #   -> deploy-app-under-test -> ai-generate-tests-functional
+  #   -> reset-app-under-test -> re-run-tests -> open-pr
+  #   finally: cleanup-app-under-test
   # The AI coding agent generates JUnit functional tests (*FT.java) per the
   # test-generation-functional skill: black-box REST Assured tests against the
-  # application the ai-generate-tests-functional task builds, starts, and
-  # health-waits for. The re-run then re-verifies with spring-boot:start/stop in
-  # a single mvn invocation, and a PR/MR is opened with the generated tests
-  # plus any test-scoped pom additions. Triggered from a GitLab issue comment:
-  # /generate-tests-functional
+  # application deployed AS EPHEMERAL NAMESPACED RESOURCES in this namespace
+  # (tssc-app-ci) by deploy-app-under-test -- an image built from the packaged
+  # boot jar, pushed to the integrated registry, running as a Deployment whose
+  # readiness probe is the app's health endpoint. The generation task resets
+  # that Deployment's pods before every verification run (a pod restart is a
+  # state reset for the app's in-memory database) and feeds the app's
+  # server-side logs back to the agent on failures. re-run-tests then
+  # re-verifies against the same deployed app after another state reset, and
+  # the finally task removes the ephemeral resources whether the run succeeded
+  # or failed (ownerReferences + the ephemeral-test-resources label are the
+  # safety nets if the run is killed so hard that finally tasks never run).
+  # Triggered from a GitLab issue comment: /generate-tests-functional
   params:
     - description: Source Repository URL
       name: git-url
@@ -76,14 +85,6 @@ spec:
         git/glab/gh).
       default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
     # ---------------- application under test ----------------
-    - name: app-base-url
-      type: string
-      description: >-
-        Base URL of the application under test, as seen from the task pods
-        (the ai-generate-tests-functional task boots the app in its own pod;
-        re-run-tests boots it in its pod via spring-boot:start). Tests target
-        ONLY this URL.
-      default: http://localhost:8080
     - name: app-username
       type: string
       description: >-
@@ -106,6 +107,8 @@ spec:
       value: $(tasks.ai-generate-tests-functional.results.TESTS_ADDED)
     - name: PR_URL
       value: $(tasks.open-pr.results.PR_URL)
+    - name: APP_BASE_URL
+      value: $(tasks.deploy-app-under-test.results.APP_BASE_URL)
   tasks:
     - name: clone-repository
       params:
@@ -155,9 +158,34 @@ spec:
           workspace: workspace
         - name: maven_settings
           workspace: maven-settings
-    - name: ai-generate-tests-functional
+
+    # Deploy the packaged application as ephemeral namespaced resources in THIS
+    # namespace: image from target/*.jar -> integrated registry, Deployment +
+    # Service gated on the health endpoint. APP_NAME is the PipelineRun's name
+    # (unique per run), so concurrent runs never collide and cleanup targets
+    # exactly this run's resources. The ownerReference makes Kubernetes GC
+    # remove the resources even if the run dies before the finally task runs.
+    - name: deploy-app-under-test
       runAfter:
         - package
+      taskRef:
+        name: deploy-app-under-test
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: APP_NAME
+          value: $(context.pipelineRun.name)
+        - name: OWNER_NAME
+          value: $(context.pipelineRun.name)
+        - name: OWNER_UID
+          value: $(context.pipelineRun.uid)
+      workspaces:
+        - name: source
+          workspace: workspace
+
+    - name: ai-generate-tests-functional
+      runAfter:
+        - deploy-app-under-test
       taskRef:
         name: ai-generate-tests-functional
       params:
@@ -165,8 +193,15 @@ spec:
           value: $(params.subdirectory)
         - name: AGENT_IMAGE
           value: $(params.agent-image)
+        # The deployed app's in-cluster Service URL, straight from the deploy
+        # task -- not a pipeline param: the app's address is an output of the
+        # run, not an input to it.
         - name: APP_BASE_URL
-          value: $(params.app-base-url)
+          value: $(tasks.deploy-app-under-test.results.APP_BASE_URL)
+        # Scope the K8s-API health-check/reset/log-fetch helpers to this run's
+        # ephemeral Deployment (same value the deploy task used for APP_NAME).
+        - name: APP_NAME
+          value: $(context.pipelineRun.name)
         - name: APP_USERNAME
           value: $(params.app-username)
         - name: APP_PASSWORD
@@ -181,12 +216,30 @@ spec:
           workspace: maven-settings
 
     # Stop here if the agent produced no new/changed tests: nothing to verify or
-    # PR. Both re-run-tests and open-pr are guarded on TESTS_ADDED != "0" -- the
-    # guard is repeated on open-pr because Tekton still runs a runAfter successor
-    # when its parent is skipped by a when-expression.
-    - name: re-run-tests
+    # PR. re-run-tests, open-pr AND this reset task are guarded on TESTS_ADDED
+    # != "0" -- the guard is repeated downstream because Tekton still runs a
+    # runAfter successor when its parent is skipped by a when-expression.
+    # The reset gives the re-run the same fresh application state the
+    # generation task verified its tests against: the generation loop's last
+    # verification run left test data in the app's in-memory database, and a
+    # re-run against it fails exactly the tests that create
+    # fixed-identifier resources.
+    - name: reset-app-under-test
       runAfter:
         - ai-generate-tests-functional
+      taskRef:
+        name: reset-app-under-test
+      when:
+        - input: $(tasks.ai-generate-tests-functional.results.TESTS_ADDED)
+          operator: notin
+          values: ["0"]
+      params:
+        - name: APP_NAME
+          value: $(context.pipelineRun.name)
+
+    - name: re-run-tests
+      runAfter:
+        - reset-app-under-test
       taskRef:
         name: maven
       when:
@@ -195,33 +248,28 @@ spec:
           values: ["0"]
       params:
         # The functional contract requires the tests to run against a RUNNING
-        # application, so the re-run boots one itself. spring-boot:start/stop
-        # MUST share this single mvn invocation with the test goals: each task
-        # step is its own pod, so an app started in one step is gone before the
-        # next -- there is no cross-step process. If the tests fail,
-        # spring-boot:stop never runs and the leaked fork dies with the pod.
-        # spring-boot:start blocks until the Spring context is genuinely ready
-        # (it polls SpringApplicationAdminClient.isReady() over JMX), so no
-        # separate health-wait is needed; maxAttempts is raised from the 60x500ms
-        # default (30s) to 240 (120s) for a cold CI boot with a cold ~/.m2.
-        # Failsafe is invoked DIRECTLY (not via `mvn verify`) because the repo's
-        # pom may not declare a failsafe binding or a functional profile yet,
-        # and without a binding `mvn verify` silently runs zero *FT.java tests.
-        # -Dit.test=*FT scopes the run to the generated functional suite; the
-        # unit suite already ran in the package task. APP_BASE_URL/credentials
-        # propagate to the forked JVM as system properties and environment.
+        # application -- the one deploy-app-under-test put in this namespace,
+        # via its in-cluster Service URL. No spring-boot:start/stop here: the
+        # app is a Deployment, not a forked JVM in this pod, so there is
+        # nothing to start or stop (reset-app-under-test handled state).
+        # Failsafe is invoked DIRECTLY (not via `mvn verify`) because the
+        # repo's pom may not declare a failsafe binding or a functional
+        # profile yet, and without a binding `mvn verify` silently runs zero
+        # *FT.java tests. -Dit.test=*FT scopes the run to the generated
+        # functional suite; the unit suite already ran in the package task.
+        # APP_BASE_URL/credentials propagate to the forked JVM as system
+        # properties (the skill makes the tests read them env-first with a
+        # system-property fallback, so this -D path works for the re-run while
+        # the generation task's env-var path worked for generation).
         - name: GOALS
           value:
-            - spring-boot:start
             - test-compile
             - failsafe:integration-test
             - failsafe:verify
-            - spring-boot:stop
             - -Dit.test=*FT
-            - -DAPP_BASE_URL=$(params.app-base-url)
+            - -DAPP_BASE_URL=$(tasks.deploy-app-under-test.results.APP_BASE_URL)
             - -DAPP_USERNAME=$(params.app-username)
             - -DAPP_PASSWORD=$(params.app-password)
-            - -Dspring-boot.start.maxAttempts=240
         - name: SUBDIRECTORY
           value: $(params.subdirectory)
       workspaces:
@@ -266,6 +314,43 @@ spec:
       workspaces:
         - name: source
           workspace: workspace
+
+  # Delete the ephemeral app under test whether the run succeeded, failed, or
+  # was skipped partway. Runs even when the deploy task itself failed after
+  # creating only some resources (--ignore-not-found makes that a no-op).
+  finally:
+    - name: cleanup-app-under-test
+      taskRef:
+        name: cleanup-app-under-test
+      params:
+        - name: APP_NAME
+          value: $(context.pipelineRun.name)
+
+  # Pin the ephemeral-resource and K8s-API-touching tasks to the `pipeline`
+  # service account: the deploy/reset/cleanup RBAC (Role
+  # app-under-test-lifecycle + system:image-builder, in
+  # tasks/deploy-app-under-test.yaml) is granted to it, and the generation
+  # task's health-check/reset/log-fetch helpers authenticate with the task
+  # pod's SA token. Pinning is deterministic: without taskRunSpecs the SA
+  # comes from the PipelineRun's subject, which manual runs, the webhook, and
+  # the console each set differently.
+  taskRunSpecs:
+    - pipelineTaskName: deploy-app-under-test
+      taskServiceSpecs:
+        taskPodTemplate:
+          serviceAccountName: pipeline
+    - pipelineTaskName: ai-generate-tests-functional
+      taskServiceSpecs:
+        taskPodTemplate:
+          serviceAccountName: pipeline
+    - pipelineTaskName: reset-app-under-test
+      taskServiceSpecs:
+        taskPodTemplate:
+          serviceAccountName: pipeline
+    - pipelineTaskName: cleanup-app-under-test
+      taskServiceSpecs:
+        taskPodTemplate:
+          serviceAccountName: pipeline
   workspaces:
     - name: workspace
     - name: maven-settings

@@ -23,11 +23,157 @@
 #-----------------------------------------------------------------------------
 apiVersion: v1
 data:
-  SKILL.md: "---\nname: test-generation-functional\ndescription: >\n  JUnit 5 + REST Assured functional test generation, per the functional-test\n  execution contract. Generate *FT.java tests that verify the behavior of the\n  DEPLOYED application (the built container image) through its service\n  interface, without depending on external applications and without\n  inspecting the application's internals. Existing tests and functional code\n  are never modified.\n---\n\n# Functional Test Generation\n\n## Your Role\n\nYou are a test engineer. Read the application's service interface — its\nOpenAPI specification — and write **new** functional tests that verify the\ndeployed application's behavior through that interface alone: request in,\nresponse out. These are black-box tests of the artifact that actually ships\n(the container image), so they catch what in-process tests cannot: a wrong\nport, broken runtime configuration, missing health wiring, packaging errors.\n\n## Execution Contract\n\nFunctional tests verify the behavior of a **deployed application through its\nservice interface**, without depending on external applications:\n\n- **Naming / location:** new tests are `*FT.java` files under `src/test/java`\n  (or a dedicated `functional-tests` module). Maven Failsafe runs them under\n  the `functional` profile: `mvn -Pfunctional verify`.\n- **Target:** the built container image, deployed and healthy — NOT the boot\n  jar and NOT an in-process `@SpringBootTest`. The pipeline deploys the\n  image, waits for `GET /actuator/health` to report UP, and hands the tests\n  the base URL.\n- **Dependencies:** the deployed application only. No test-managed stubs, and\n  no external applications — the deployed configuration must not require\n  them (an application that degrades gracefully when egress is unavailable\n  satisfies this by design).\n- **Black box:** arrange and assert through the service interface only. No\n  database assertions, no actuator state inspection (the health check itself\n  is the pipeline's job, not a test's), no white-box peeking at internals.\n- **Data:** each test creates the data it needs through the API (POST then\n  GET) and assumes nothing about other tests, their order, or leftover state.\n- **Budget:** minutes bounded by the deploy; each test itself stays in\n  seconds.\n\n## Tool Stack\n\n- **JUnit 5** — the test API (all test categories share it)\n- **REST Assured** — URL-driven API testing; a shared `RequestSpecBuilder`\n  sets the base URL and the authentication once for the whole suite\n- **JSONassert / OpenAPI schema validation** — response-body conformance\n  against the published contract\n- **Maven Failsafe** — the runner, under the `functional` profile\n\n## Inputs\n\n- The **OpenAPI specification** (`openapi.yaml`) — the machine-readable\n  service interface, supplied as read-only context\n- **`APP_BASE_URL`** — base URL of the deployed application, from the\n  environment; never hardcode a host\n- **`APP_USERNAME` / `APP_PASSWORD`** (or an equivalent token variable) —\n  credentials for the application's security layer, when it has one\n\nRead these in the tests from the **environment first, falling back to the\nsystem property of the same name** (`System.getenv(\"APP_BASE_URL\")`, then\n`System.getProperty(\"APP_BASE_URL\")`). The pipeline supplies them as\nenvironment variables during generation but as `-D` system properties during\nthe re-run, so a test that reads only one of the two breaks in the other.\n\n## Available Tools\n\nThe OpenAPI spec and the main sources are supplied as read-only context — do\nNOT ask for more files to be added. If using aider, you also have these\nin-chat commands:\n\n- `/read <file>` — view the spec, a source file, or an existing test\n  read-only\n- `/ls` — list the repository tree\n- `/run <command>` — run a shell command for inspection only; if the\n  application is reachable, read-only probes (e.g.\n  `curl -s \"$APP_BASE_URL/actuator/health\"`) help confirm response shapes —\n  never mutate application state from a probe\n- New test files are created\
-    \ by emitting a search/replace block against a\n  filename that does not exist yet — create files directly, never ask\n\n## Process\n\n### Step 1 — Read the service interface\n\n1. Read the OpenAPI spec: paths, operations, request/response schemas,\n   documented status codes, and security schemes.\n2. List existing `*FT.java` tests (if any) and map them against the spec's\n   operations.\n3. Identify behaviors worth covering: the core business operations, the\n   documented error responses (4xx), the security behavior (unauthenticated\n   access rejected), and representative schema conformance. If the meaningful\n   behaviors are already covered, stop and add nothing.\n\n### Step 2 — Generate functional tests\n\nFor each behavior worth covering, write a **new** `*FT.java` test:\n\n- Follow the existing suite's conventions (naming, base classes, spec setup)\n- Build requests with REST Assured against `APP_BASE_URL`, authenticating\n  with the credentials from the environment when the interface requires it\n- Arrange data through the API (create the resource with POST), act, then\n  assert on the response: status, headers, and body conformance to the\n  documented schema\n- Also assert the documented error behavior — invalid input and\n  unauthenticated requests — not just happy paths\n\n### Step 3 — Verify\n\nAfter writing tests, run the verification command supplied in the task\nmessage and iterate until the tests you added pass. The pipeline invokes\nFailsafe directly —\n\n    mvn -B -q -Dstyle.color=never test-compile \\\n        failsafe:integration-test failsafe:verify -Dit.test=<classes>\n\n— with `APP_BASE_URL` pointing at the running application, so the `*FT.java`\ntests run whether or not the pom declares a functional profile; if the pom\ndoes declare one, `mvn -Pfunctional verify` is equivalent. If you cannot run\nthe build yourself, leave verification to the pipeline — but never leave\nbehind a test you believe is broken.\n\n## Constraints\n\n- NEVER modify files under `src/main` — functional code is off-limits.\n- NEVER modify, rename, or delete an existing test. Only ADD new test files.\n- You MAY add **test-scoped** dependencies and test-only build configuration\n  to `pom.xml` when this contract's tool stack requires them (REST Assured, a\n  Failsafe binding, a `functional` profile) — never touch compile/runtime\n  dependencies, plugins, or properties that affect the shipped artifact.\n- Black box only: no database, actuator-internals, or log assertions — the\n  service interface is the only observation point.\n- Never depend on an external application, and never hardcode a host —\n  `APP_BASE_URL` is the only address a test may target.\n- Each test is self-contained: it creates its own data via the API and\n  assumes nothing about prior tests or their order.\n- Do not ask for files to be added to the chat; create test files directly.\n- Extra instructions in the task message refine the priorities above; follow\n  them where they apply.\n"
+  SKILL.md: |
+    ---
+    name: test-generation-functional
+    description: >
+      JUnit 5 + REST Assured functional test generation, per the functional-test
+      execution contract. Generate *FT.java tests that verify the behavior of the
+      DEPLOYED application (the built container image) through its service
+      interface, without depending on external applications and without
+      inspecting the application's internals. Existing tests and functional code
+      are never modified.
+    ---
+
+    # Functional Test Generation
+
+    ## Your Role
+
+    You are a test engineer. Read the application's service interface — its
+    OpenAPI specification — and write **new** functional tests that verify the
+    deployed application's behavior through that interface alone: request in,
+    response out. These are black-box tests of the artifact that actually ships
+    (the container image), so they catch what in-process tests cannot: a wrong
+    port, broken runtime configuration, missing health wiring, packaging errors.
+
+    ## Execution Contract
+
+    Functional tests verify the behavior of a **deployed application through its
+    service interface**, without depending on external applications:
+
+    - **Naming / location:** new tests are `*FT.java` files under `src/test/java`
+      (or a dedicated `functional-tests` module). Maven Failsafe runs them under
+      the `functional` profile: `mvn -Pfunctional verify`.
+    - **Target:** the built container image, deployed and healthy — NOT the boot
+      jar and NOT an in-process `@SpringBootTest`. The pipeline deploys the
+      image, waits for `GET /actuator/health` to report UP, and hands the tests
+      the base URL.
+    - **Dependencies:** the deployed application only. No test-managed stubs, and
+      no external applications — the deployed configuration must not require
+      them (an application that degrades gracefully when egress is unavailable
+      satisfies this by design).
+    - **Black box:** arrange and assert through the service interface only. No
+      database assertions, no actuator state inspection (the health check itself
+      is the pipeline's job, not a test's), no white-box peeking at internals.
+    - **Data:** each test creates the data it needs through the API (POST then
+      GET) and assumes nothing about other tests, their order, or leftover state.
+    - **Budget:** minutes bounded by the deploy; each test itself stays in
+      seconds.
+
+    ## Tool Stack
+
+    - **JUnit 5** — the test API (all test categories share it)
+    - **REST Assured** — URL-driven API testing; a shared `RequestSpecBuilder`
+      sets the base URL and the authentication once for the whole suite
+    - **JSONassert / OpenAPI schema validation** — response-body conformance
+      against the published contract
+    - **Maven Failsafe** — the runner, under the `functional` profile
+
+    ## Inputs
+
+    - The **OpenAPI specification** (`openapi.yaml`) — the machine-readable
+      service interface, supplied as read-only context
+    - **`APP_BASE_URL`** — base URL of the deployed application, from the
+      environment; never hardcode a host
+    - **`APP_USERNAME` / `APP_PASSWORD`** (or an equivalent token variable) —
+      credentials for the application's security layer, when it has one
+
+    Read these in the tests from the **environment first, falling back to the
+    system property of the same name** (`System.getenv("APP_BASE_URL")`, then
+    `System.getProperty("APP_BASE_URL")`). The pipeline supplies them as
+    environment variables during generation but as `-D` system properties during
+    the re-run, so a test that reads only one of the two breaks in the other.
+
+    ## Available Tools
+
+    The OpenAPI spec and the main sources are supplied as read-only context — do
+    NOT ask for more files to be added. If using aider, you also have these
+    in-chat commands:
+
+    - `/read <file>` — view the spec, a source file, or an existing test
+      read-only
+    - `/ls` — list the repository tree
+    - `/run <command>` — run a shell command for inspection only; if the
+      application is reachable, read-only probes (e.g.
+      `curl -s "$APP_BASE_URL/actuator/health"`) help confirm response shapes —
+      never mutate application state from a probe
+    - New test files are created by emitting a search/replace block against a
+      filename that does not exist yet — create files directly, never ask
+
+    ## Process
+
+    ### Step 1 — Read the service interface
+
+    1. Read the OpenAPI spec: paths, operations, request/response schemas,
+       documented status codes, and security schemes.
+    2. List existing `*FT.java` tests (if any) and map them against the spec's
+       operations.
+    3. Identify behaviors worth covering: the core business operations, the
+       documented error responses (4xx), the security behavior (unauthenticated
+       access rejected), and representative schema conformance. If the meaningful
+       behaviors are already covered, stop and add nothing.
+
+    ### Step 2 — Generate functional tests
+
+    For each behavior worth covering, write a **new** `*FT.java` test:
+
+    - Follow the existing suite's conventions (naming, base classes, spec setup)
+    - Build requests with REST Assured against `APP_BASE_URL`, authenticating
+      with the credentials from the environment when the interface requires it
+    - Arrange data through the API (create the resource with POST), act, then
+      assert on the response: status, headers, and body conformance to the
+      documented schema
+    - Use **unique identifiers** (e.g. a random suffix) for every resource a test
+      creates: the application's state persists across runs, so a fixed
+      identifier collides with data left by an earlier run and fails the test
+      regardless of the code under test
+    - Also assert the documented error behavior — invalid input and
+      unauthenticated requests — not just happy paths
+
+    ### Step 3 — Verify
+
+    After writing tests, run the verification command supplied in the task
+    message and iterate until the tests you added pass. The pipeline invokes
+    Failsafe directly —
+
+        mvn -B -q -Dstyle.color=never test-compile \
+            failsafe:integration-test failsafe:verify -Dit.test=<classes>
+
+    — with `APP_BASE_URL` pointing at the running application, so the `*FT.java`
+    tests run whether or not the pom declares a functional profile; if the pom
+    does declare one, `mvn -Pfunctional verify` is equivalent. If you cannot run
+    the build yourself, leave verification to the pipeline — but never leave
+    behind a test you believe is broken.
+
+    ## Constraints
+
+    - NEVER modify files under `src/main` — functional code is off-limits.
+    - NEVER modify, rename, or delete an existing test. Only ADD new test files.
+    - You MAY add **test-scoped** dependencies and test-only build configuration
+      to `pom.xml` when this contract's tool stack requires them (REST Assured, a
+      Failsafe binding, a `functional` profile) — never touch compile/runtime
+      dependencies, plugins, or properties that affect the shipped artifact.
+    - Black box only: no database, actuator-internals, or log assertions — the
+      service interface is the only observation point.
+    - Never depend on an external application, and never hardcode a host —
+      `APP_BASE_URL` is the only address a test may target.
+    - Each test is self-contained: it creates its own data via the API (with a
+      unique identifier) and assumes nothing about prior tests or their order.
+    - Do not ask for files to be added to the chat; create test files directly.
+    - Extra instructions in the task message refine the priorities above; follow
+      them where they apply.
 kind: ConfigMap
 metadata:
-  creationTimestamp: null
   name: agent-skills-test-generation-functional
   labels:
     app.kubernetes.io/part-of: maven-build-ci

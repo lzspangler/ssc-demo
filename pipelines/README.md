@@ -27,8 +27,8 @@ can be run on its own:
 6. **`agentic-test-generation-functional`** — same flow, but the agent
    generates **functional tests** (`*FT.java`, per the
    `test-generation-functional` skill: black-box REST Assured against the
-   application the task itself builds, starts, and health-waits for).
-   Triggered with `/generate-tests-functional`.
+   application deployed as **ephemeral namespaced resources** in the pipeline
+   namespace). Triggered with `/generate-tests-functional`.
 
 The CVE pipelines share one six-field decision contract
 (`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`):
@@ -63,9 +63,12 @@ This repo defines **six** pipelines that share the same tasks and images:
   suite; the MR stages `pom.xml` test-scoped additions alongside `src/test`.
 - **`pipelines/agentic-test-generation-functional.yaml`** — the same flow
   generating functional tests (`*FT.java`, black-box REST Assured). The
-  generation task builds and boots the application under test itself; the
-  re-run boots it with `spring-boot:start`/`stop` in a single `mvn`
-  invocation.
+  pipeline deploys the application under test as **ephemeral namespaced
+  resources** (image from the packaged jar → integrated registry → Deployment
+  + Service, health-gated) in `tssc-app-ci`, the generation task drives that
+  Deployment (state reset before every verification run, server-log tail in
+  failure feedback), and a `finally` task removes the resources whether the
+  run succeeded or failed.
 
 ### `agentic-cve-selection` steps
 
@@ -132,21 +135,23 @@ for what differs.
 
 ### `agentic-test-generation-integration` / `-functional` steps
 
-Same chain as `agentic-test-generation` (clone → verify-commit → package →
-generate → re-run → open-pr), with the differences below. Each generation task
-follows its own agent skill — `test-generation-integration` /
-`test-generation-functional` — which defines the category's execution contract
-and tool stack; the task prompt carries only the run contract.
+Same chain as `agentic-test-generation` (clone → verify-commit → package → … →
+re-run → open-pr), with the differences below. Each generation task follows its
+own agent skill — `test-generation-integration` / `test-generation-functional`
+— which defines the category's execution contract and tool stack; the task
+prompt carries only the run contract.
 
 | | `agentic-test-generation-integration` | `agentic-test-generation-functional` |
 |---|---|---|
 | Generation task | `ai-generate-tests-integration` | `ai-generate-tests-functional` |
 | Test category / naming | integration — `*IT.java` | functional — `*FT.java` |
-| What the agent generates | interactions between components and their dependencies, every dependency a **test-managed double** (embedded H2, WireMock stub; **no Testcontainers** — CI runners are dockerless) | black-box REST Assured tests of the **running application** through its service interface (OpenAPI spec as read-only context); no DB/actuator/log assertions, data self-arranged via the API |
-| App under test | none — doubles run inside the test JVM | the task itself builds (`-DskipTests package`) and boots the jar, health-waits on `/actuator/health`, and exports `APP_BASE_URL`/`APP_USERNAME`/`APP_PASSWORD` for the agent and the verification build |
-| `re-run-tests` goals | `test` + direct `failsafe:integration-test` + `failsafe:verify` (runs the whole `*IT.java` suite even without a pom failsafe binding) | `spring-boot:start` → `test-compile` → direct failsafe (scoped `-Dit.test=*FT`) → `spring-boot:stop`, all in **one** `mvn` invocation (each step is its own pod, so start/stop cannot span steps; start blocks until the Spring context is ready via JMX) |
+| What the agent generates | interactions between components and their dependencies, every dependency a **test-managed double** (embedded H2, WireMock stub; **no Testcontainers** — CI runners are dockerless) | black-box REST Assured tests of the **deployed application** through its service interface (OpenAPI spec as read-only context); no DB/actuator/log assertions, data self-arranged via the API with **unique identifiers** (the app's state persists across runs) |
+| App under test | none — doubles run inside the test JVM | `deploy-app-under-test` builds an image from the packaged boot jar, pushes it to the **integrated registry**, and creates a Deployment + Service in `tssc-app-ci` (named after the PipelineRun, so concurrent runs never collide); its readiness probe is the app's health endpoint, so the task only succeeds once the app genuinely serves. The generation task then drives that Deployment through the Kubernetes API with its own service-account token: **state reset** (delete the app's pods → fresh in-memory database) before every verification run, and the app's **server log tail** appended to the agent's failure feedback (the stack traces behind HTTP 5xx responses live there, not in the Maven output) |
+| `re-run-tests` goals | `test` + direct `failsafe:integration-test` + `failsafe:verify` (runs the whole `*IT.java` suite even without a pom failsafe binding) | `test-compile` → direct failsafe (scoped `-Dit.test=*FT`) → `failsafe:verify`, against the deployed app's Service URL (`-DAPP_BASE_URL` + credentials; no `spring-boot:start`/`stop` — the app is a Deployment, not a forked JVM in the pod). Preceded by `reset-app-under-test`, which deletes the app's pods so the re-run sees the same fresh state the generation task verified against |
 | MR contents | `src/test` + `pom.xml` (test-scoped additions such as WireMock/Awaitility) | `src/test` + `pom.xml` (test-scoped additions such as REST Assured) |
 | Why direct failsafe, not `mvn verify` | the pom may declare no failsafe binding (the agent is only *permitted* test-scoped changes), and without a binding `mvn verify` silently runs **zero** `*IT.java`/`*FT.java` tests — the re-run would go green while testing nothing | same |
+| Ephemeral resources / cleanup | none | Deployment + Service + ImageStream labeled `app.kubernetes.io/part-of=ephemeral-test-resources` and carrying an ownerReference to the PipelineRun; `cleanup-app-under-test` runs as a **`finally` task** (success *or* failure) and never fails the run. Hard-timeout caveat: a PipelineRun **timeout** cancels finally tasks too, so on that path the resources linger until the PipelineRun object is deleted (ownerReference GC) — or sweep manually: `oc -n tssc-app-ci delete deployment,service,imagestream -l app.kubernetes.io/part-of=ephemeral-test-resources` |
+| RBAC | none beyond the standard pipeline SA | `pipeline` SA gets the `app-under-test-lifecycle` Role (deployments/services/pods, pods/log, imagestreams — all in `tasks/deploy-app-under-test.yaml`) plus `system:image-builder` for the integrated registry push; the pipeline pins the ephemeral-resource tasks to that SA via `taskRunSpecs` |
 
 ## Files
 
@@ -157,7 +162,7 @@ and tool stack; the task prompt carries only the run contract.
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
 | `pipelines/agentic-test-generation-integration.yaml` | Same flow generating integration tests (`*IT.java`, embedded/WireMock doubles); re-run uses direct failsafe; MR stages test-scoped pom additions |
-| `pipelines/agentic-test-generation-functional.yaml` | Same flow generating functional tests (`*FT.java`, black-box REST Assured); task boots the app under test; re-run uses `spring-boot:start`/`stop` |
+| `pipelines/agentic-test-generation-functional.yaml` | Same flow generating functional tests (`*FT.java`, black-box REST Assured) against the app deployed as ephemeral namespaced resources; `finally` task guarantees cleanup; `taskRunSpecs` pin the ephemeral-resource tasks to the `pipeline` SA |
 | `pipelines/gitops-cd-dev.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
 | `pipelines/gitops-cd-qa.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
 | `pipelines/gitops-cd-prod.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
@@ -175,7 +180,10 @@ and tool stack; the task prompt carries only the run contract.
 | `secrets/gitlab-webhook-secret.example.yaml` | Example Secret — shared token validating the GitLab issue webhook |
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
 | `tasks/ai-generate-tests-integration.yaml` | AI generates + runs integration tests (`*IT.java`) per the `test-generation-integration` skill |
-| `tasks/ai-generate-tests-functional.yaml` | AI generates + runs functional tests (`*FT.java`) per the `test-generation-functional` skill; builds/boots/health-waits the app under test |
+| `tasks/ai-generate-tests-functional.yaml` | AI generates + runs functional tests (`*FT.java`) per the `test-generation-functional` skill, against the app **deployed** by `deploy-app-under-test`; health-checks it, resets its state (pod deletion) before every verification run, and feeds its server log tail back to the agent on failures |
+| `tasks/deploy-app-under-test.yaml` | Deploys the app under test as ephemeral namespaced resources (jar → image → integrated registry → health-gated Deployment + Service, owner-referenced to the PipelineRun); **also carries the RBAC** — Role `app-under-test-lifecycle` + `system:image-builder` RoleBinding for the `pipeline` SA (namespace hardcoded to `tssc-app-ci`; change it if the pipeline namespace moves) |
+| `tasks/reset-app-under-test.yaml` | Resets the deployed app to a clean state (delete its pods; the Deployment recreates them with a fresh in-memory database) and waits for readiness |
+| `tasks/cleanup-app-under-test.yaml` | `finally` task — deletes the run's ephemeral Deployment/Service/ImageStream whether the run succeeded or failed; never fails the run itself |
 | `tasks/rhtpa-vulnerability-analysis1.yaml` | Scans the SBOM's PURLs against RHTPA, then suppresses findings explicitly marked fixed/not_affected |
 | `tasks/rhtpa-remediation-report2.yaml` | Resolves a concrete fix version per (PURL, CVE) — `.fix_versions`, backports first |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
@@ -292,20 +300,35 @@ or TAS.
 ### `agentic-test-generation-integration` / `agentic-test-generation-functional`
 
 ```
-clone-repository → verify-commit → package → ai-generate-tests-{integration,functional} → re-run-tests → open-pr
-                                                                    (re-run-tests + open-pr only if TESTS_ADDED != "0")
+integration:
+clone-repository → verify-commit → package → ai-generate-tests-integration → re-run-tests → open-pr
+                                                       (re-run-tests + open-pr only if TESTS_ADDED != "0")
+
+functional:
+clone-repository → verify-commit → package → deploy-app-under-test → ai-generate-tests-functional → reset-app-under-test → re-run-tests → open-pr
+                                                                        (reset + re-run-tests + open-pr only if TESTS_ADDED != "0")
+  finally (always, success or failure): cleanup-app-under-test
 ```
 
-Identical chain and gating to `agentic-test-generation` above; the task-level
-differences (skill, verification goals, app lifecycle, MR contents) are in the
-steps table in the [Overview](#overview). Two things worth restating:
+Identical gating to `agentic-test-generation` above; the task-level differences
+(skill, verification goals, app lifecycle, MR contents, ephemeral resources and
+their cleanup) are in the steps table in the [Overview](#overview). Three
+things worth restating:
 
 - the agent's pom edits are **test-scoped only** (dependencies and test-only
   build config), enforced by the skill's constraints and the prompt, and those
   changes ride along in the MR via `open-pr-tests`' `TEST_CATEGORY` staging;
 - both re-runs invoke Failsafe **directly** rather than plain `mvn verify`,
   because a pom without a failsafe binding silently runs zero `*IT.java` /
-  `*FT.java` tests on `verify` — the re-run would pass while testing nothing.
+  `*FT.java` tests on `verify` — the re-run would pass while testing nothing;
+- the functional pipeline's app under test is **ephemeral**: it lives only for
+  the run (deploy after `package`, `cleanup-app-under-test` in `finally`), is
+  named after the PipelineRun so concurrent runs never collide, and is
+  owner-referenced to the PipelineRun so Kubernetes GC removes it even if the
+  run dies without running finally tasks. The one hole: a PipelineRun **hard
+  timeout** cancels finally tasks too, so on that path the resources linger
+  until the PipelineRun object is deleted — or sweep manually with
+  `oc -n tssc-app-ci delete deployment,service,imagestream -l app.kubernetes.io/part-of=ephemeral-test-resources`.
 
 ### `gitops-cd-dev` (dev image promotion)
 

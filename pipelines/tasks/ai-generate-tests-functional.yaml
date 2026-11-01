@@ -11,14 +11,18 @@ spec:
   description: >-
     Use an AI coding agent to generate JUnit functional tests (*FT.java) that
     exercise the DEPLOYED application through its service interface (REST
-    Assured against a running instance), per the functional-test execution
-    contract: black-box only, no external applications, data self-arranged
-    through the API. The task builds and starts the application itself, waits
-    for /actuator/health, and hands the agent APP_BASE_URL plus credentials.
-    The coding agent is selected by AI_AGENT (claude-code | aider); aider
-    drives OpenAI-compatible models such as gpt-oss and Granite. Backend
-    (provider/model/creds) is supplied via the ai-agent-config ConfigMap and
-    ai-agent-secret Secret. Swap the runtime by overriding AGENT_IMAGE.
+    Assured against the ephemeral Deployment/Service created by the
+    deploy-app-under-test task), per the functional-test execution contract:
+    black-box only, no external applications, data self-arranged through the
+    API. The task health-checks the deployed app, resets it to a clean state
+    before every verification run (pod deletion -- fresh in-memory database),
+    and feeds the application's server-side log tail back to the agent on
+    failures, because the stack traces behind HTTP 500s live there, not in the
+    Maven output. The coding agent is selected by AI_AGENT (claude-code |
+    aider); aider drives OpenAI-compatible models such as gpt-oss and Granite.
+    Backend (provider/model/creds) is supplied via the ai-agent-config
+    ConfigMap and ai-agent-secret Secret. Swap the runtime by overriding
+    AGENT_IMAGE.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -37,7 +41,10 @@ spec:
       default: >-
         Prioritize the core business operations from the OpenAPI spec, their
         documented error responses, and the security behavior (unauthenticated
-        requests rejected). Each test creates its own data through the API.
+        requests rejected). Each test creates its own data through the API
+        using unique identifiers (e.g. a random suffix) -- the application's
+        state persists across runs, so fixed identifiers collide with data
+        from earlier runs.
     - name: SOURCE_PATHS
       type: string
       description: >-
@@ -48,29 +55,39 @@ spec:
     - name: APP_BASE_URL
       type: string
       description: >-
-        Base URL of the application this task starts and leaves running for the
-        agent and the verification build. Tests target ONLY this URL.
-      default: http://localhost:8080
+        Base URL of the DEPLOYED application under test (normally the
+        deploy-app-under-test task's APP_BASE_URL result, an in-cluster Service
+        URL). The task health-checks it and fails loudly if it is unreachable.
+        Tests target ONLY this URL.
+      default: ""
+    - name: APP_NAME
+      type: string
+      description: >-
+        Value of the app.kubernetes.io/instance label scoping the deployed
+        app's pods. Used to reset the application to a clean state (delete its
+        pods -- the Deployment recreates them with a fresh in-memory database)
+        and to fetch its server-side logs for the agent's failure feedback.
+      default: app-under-test
     - name: APP_USERNAME
       type: string
       description: >-
         Username for the application's security layer, passed to the tests via
         the APP_USERNAME environment variable (the skill forbids hardcoding).
-        Default matches spring-boot-example-application's in-memory user.
+        Default matches this demo's in-memory user.
       default: user
     - name: APP_PASSWORD
       type: string
       description: >-
-        Password for APP_USERNAME. Default matches spring-boot-example-
-        application's in-memory user (test credentials, not a secret).
+        Password for APP_USERNAME. Default matches this demo's in-memory user
+        (test credentials, not a secret).
       default: user123
     - name: MAX_ATTEMPTS
       type: string
       description: >-
         How many times to (re)run the agent and verify the tests it generated.
-        On a failing verify, the Maven output is fed back into the next attempt's
-        prompt. If the generated tests still fail after the last attempt, the task
-        fails.
+        On a failing verify, the Maven output PLUS the application's server
+        log tail is fed back into the next attempt's prompt. If the generated
+        tests still fail after the last attempt, the task fails.
       default: "6"
   workspaces:
     - name: source
@@ -89,11 +106,12 @@ spec:
       description: Agent invocations actually run.
     - name: LAST_ERROR
       description: >-
-        Tail of the last failed Maven verify output (truncated to ~1 kB);
-        empty when the generated tests passed. Written so a cancelled run
-        still leaves evidence -- a timeout cancels AND deletes the pod, and
-        the step logs (including the agent tee) die with it. Results are the
-        only channel that survives.
+        Tail of the last failed Maven verify output plus the application's
+        server log tail (truncated to ~1 kB total); empty when the generated
+        tests passed. Written so a cancelled run still leaves evidence -- a
+        timeout cancels AND deletes the pod, and the step logs (including the
+        agent tee and the server logs) die with it. Results are the only
+        channel that survives.
   stepTemplate:
     envFrom:
       - configMapRef:
@@ -142,13 +160,19 @@ spec:
         MAX_ATTEMPTS="$(params.MAX_ATTEMPTS)"
         echo "Generating functional tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL} (up to ${MAX_ATTEMPTS} attempts)"
 
+        if [ -z "${APP_BASE_URL}" ]; then
+          echo "ERROR: APP_BASE_URL is empty. This task tests a DEPLOYED application;" \
+               "run the deploy-app-under-test task first and pass its APP_BASE_URL" \
+               "result (the pipeline does this automatically)." >&2
+          exit 1
+        fi
+
         # --- Point Maven at the internal mirror ------------------------------
         # EVERY mvn in this step has to resolve through the Artifactory virtual
-        # repo rather than Central: the app package build, the verification
-        # builds in the retry loop below, the agent's own `mvn` calls, and --
-        # specific to this task -- any TEST-SCOPED dependencies the agent adds
-        # to the pom (REST Assured), which must resolve on the first run after
-        # generation.
+        # repo rather than Central: the verification builds in the retry loop
+        # below, the agent's own `mvn` calls, and -- specific to this task --
+        # any TEST-SCOPED dependencies the agent adds to the pom (REST
+        # Assured), which must resolve on the first run after generation.
         #
         # Installed as ~/.m2/settings.xml rather than passed as `mvn -s` so that
         # one mechanism covers both callers; the agent's mvn invocations are
@@ -168,10 +192,9 @@ spec:
         # PVC directory. Two Maven builds sharing target/ collide -- overwriting a
         # file another task pod created fails with "Operation not permitted"
         # (maven-resources-plugin can't reset the mtime of a foreign-owned file).
-        # So build the app, run the agent, and run the verification build in a
-        # private, pod-local copy of the repo (excluding the foreign-owned
-        # target/; tar re-owns to our uid on extract) and merge only the
-        # generated tests back at the end.
+        # So run the agent and the verification build in a private, pod-local
+        # copy of the repo (excluding the foreign-owned target/; tar re-owns to
+        # our uid on extract) and merge only the generated tests back at the end.
         SCRATCH="/tekton/home/aitgt-work"
         rm -rf "${SCRATCH}"; mkdir -p "${SCRATCH}"
         tar -C "${WORKDIR}" --exclude=./target -cf - . | tar -C "${SCRATCH}" -xf -
@@ -180,18 +203,18 @@ spec:
         # --- Functional-test methodology skill ---------------------------------
         # Mounted read-only from the agent-skills-test-generation-functional
         # ConfigMap (pipelines/config/, synced by ssc-tekton-config). The task
-        # prompt below carries the WHAT (read the OpenAPI spec, add gap-filling
-        # *FT.java tests against the running app, verify); the skill carries
-        # the HOW (the functional execution contract and tool stack: deployed
-        # app only, black box, REST Assured, data self-arranged via the API).
-        # Fail loudly if it is missing: aider --read and claude
-        # --append-system-prompt would both silently continue with no methodology
-        # at all.
+        # prompt below carries the WHAT (read the OpenAPI spec, evaluate
+        # existing *FT.java coverage, add gap-filling tests against the running
+        # app, verify); the skill carries the HOW (the functional execution
+        # contract and tool stack: deployed app only, black box, REST Assured,
+        # data self-arranged via the API). Fail loudly if it is missing: aider
+        # --read and claude --append-system-prompt would both silently continue
+        # with no methodology at all.
         SKILL_DIR="${HOME}/agent-skills/test-generation-functional"
         if [ ! -f "${SKILL_DIR}/SKILL.md" ]; then
           echo "ERROR: ${SKILL_DIR}/SKILL.md is missing." \
                "Is the agent-skills-test-generation-functional ConfigMap applied" \
-               "(pipelines/config/agent-skills-test-generation-functional.yaml)?"
+               "(pipelines/config/agent-skills-test-generation-functional.yaml)?" >&2
           exit 1
         fi
 
@@ -207,8 +230,6 @@ spec:
         #      cannot finish, so the task fails on its OWN terms with results
         #      written rather than being cancelled by the pipeline timeout.
         #   3. The ATTEMPTS / LAST_ERROR results survive pod deletion.
-        # Declared BEFORE the app lifecycle below so app start/health-wait time
-        # counts against the budget.
         AGENT_TIMEOUT=900          # 15 min per agent invocation
         VERIFY_COST=360            # app-bound failsafe tests over HTTP; slower than unit mvn
         STEP_BUDGET=$((45 * 60))   # 45 min: headroom under the 1h run timeout
@@ -217,61 +238,105 @@ spec:
         LAST_ERROR_TEXT=""
         budget_stopped=0
 
-        # ---- Application under test --------------------------------------------
-        # The functional contract targets a RUNNING application, so this task
-        # boots one in the pod: package the boot jar, start it in the
-        # background, and health-wait. (The pipeline's re-run-tests step later
-        # re-verifies with spring-boot:start/stop -- same jar, same port.) This
-        # app exposes /actuator/health permitAll, so no credentials are needed
-        # for the health probe (curl is baked into the ai-agent images).
-        echo "Packaging the application under test..."
-        mvn -B -q -Dstyle.color=never -DskipTests package
-        APP_JAR="$(ls target/*.jar 2>/dev/null | grep -v '\.jar\.original' | head -1 || true)"
-        if [ -z "${APP_JAR}" ]; then
-          echo "ERROR: no boot jar found under target/ (spring-boot repackage produces" \
-               "target/*.jar alongside the *.jar.original thin jar)." >&2
-          exit 1
-        fi
-        echo "Starting ${APP_JAR}..."
-        nohup java -jar "${APP_JAR}" > /tekton/home/app-under-test.log 2>&1 &
-        APP_PID=$!
-        # App teardown on any exit path, including the error exits below --
-        # a leaked java process would hold the port until pod teardown.
-        trap 'kill "${APP_PID:-0}" 2>/dev/null || true' EXIT
-        app_healthy=0
-        for i in $(seq 1 60); do
-          if curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1; then
-            app_healthy=1
-            break
+        # ---- Application under test (deployed, not in-pod) ---------------------
+        # deploy-app-under-test built an image from the packaged boot jar and
+        # created a Deployment + Service in this namespace; this task targets
+        # it at APP_BASE_URL and drives its lifecycle through the Kubernetes
+        # API with THIS POD's service-account token (curl and jq are baked into
+        # the agent images; oc is not). RBAC comes from the
+        # app-under-test-lifecycle Role (see deploy-app-under-test.yaml): pods
+        # get/list/delete and pods/log get for the pipeline service account,
+        # which the pipeline pins this task to via taskRunSpecs.
+        #
+        # WHY the task drives the app at all:
+        #   - STATE RESET. The app's database is in-memory (H2 mem:), so its
+        #     state survives every request and every retry attempt. Verification
+        #     must run against a deterministic clean slate, or tests that create
+        #     fixed-identifier data fail on their SECOND run -- poisoning every
+        #     retry after the first (agentic-test-generation-functional-issue-
+        #     629f6 burned all 6 attempts this way). Deleting the app's pods
+        #     makes the Deployment recreate them with a fresh database.
+        #   - SERVER-SIDE EVIDENCE. An HTTP 500 from the app means an uncaught
+        #     RuntimeException; its stack trace is in the app's pod log, NOT in
+        #     the Maven output the feedback loop used to carry. Without the log
+        #     tail the agent sees "expected 200 but was 500" and can only guess
+        #     (same failed run: 6 blind iterations). The app's GlobalException-
+        #     Handler does put the exception message in the 500 response body,
+        #     but REST Assured's failure line does not print response bodies.
+        K8S_API="https://kubernetes.default.svc"
+        K8S_CA="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        K8S_TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || true)"
+        APP_NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo tssc-app-ci)"
+        APP_LABEL="app.kubernetes.io/instance=$(params.APP_NAME)"
+
+        k8s() {
+          curl -sS --cacert "${K8S_CA}" \
+            -H "Authorization: Bearer ${K8S_TOKEN}" "$@"
+        }
+
+        # Health-poll the deployed app. The deploy task already gated on the
+        # readiness probe, so this is normally instant; it exists to catch a
+        # crash-looping or restarted app before tests run against it.
+        wait_for_app_health() {
+          local timeout="${1:-300}" waited=0
+          while [ "${waited}" -lt "${timeout}" ]; do
+            curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1 && return 0
+            sleep 5; waited=$((waited + 5))
+          done
+          return 1
+        }
+
+        # Reset the app to a clean state: delete its pods, let the Deployment
+        # recreate them (fresh in-memory DB), and wait until they serve again.
+        # Best-effort: if the API/RBAC path is unavailable the task continues
+        # against existing state with a loud warning rather than failing a run
+        # that might still verify cleanly.
+        reset_app_state() {
+          if [ -z "${K8S_TOKEN}" ]; then
+            echo "WARN: no service-account token mounted; cannot reset the app." \
+                 "Verification will run against EXISTING application state." >&2
+            return 1
           fi
-          sleep 5
-        done
-        if [ "${app_healthy}" -ne 1 ]; then
-          echo "ERROR: application under test did not report healthy at" \
-               "${APP_BASE_URL}/actuator/health within 300s. Last 50 log lines:" >&2
-          tail -n 50 /tekton/home/app-under-test.log >&2 || true
+          echo "Resetting application state (deleting pods of ${APP_LABEL})..."
+          if ! k8s -X DELETE \
+              "${K8S_API}/api/v1/namespaces/${APP_NS}/pods?labelSelector=${APP_LABEL}" \
+              > /dev/null; then
+            echo "WARN: pod deletion failed (RBAC?); continuing against existing state." >&2
+            return 1
+          fi
+          if ! wait_for_app_health 300; then
+            echo "WARN: app did not return to healthy within 300s after reset." >&2
+            return 1
+          fi
+          echo "Application state reset; app healthy at ${APP_BASE_URL}."
+          return 0
+        }
+
+        # Tail of the app's server log -- where the stack traces behind 500s
+        # live. Best-effort: absent RBAC or a dead app yields empty output and
+        # the feedback falls back to the Maven tail alone.
+        fetch_app_log_tail() {
+          local lines="${1:-150}"
+          [ -n "${K8S_TOKEN}" ] || return 1
+          local pods
+          pods="$(k8s "${K8S_API}/api/v1/namespaces/${APP_NS}/pods?labelSelector=${APP_LABEL}" \
+                  | jq -r '.items[].metadata.name' 2>/dev/null || true)"
+          [ -n "${pods}" ] || return 1
+          local p
+          for p in ${pods}; do
+            echo "--- app pod ${p} (last ${lines} log lines) ---"
+            k8s "${K8S_API}/api/v1/namespaces/${APP_NS}/pods/${p}/log?container=app&tailLines=${lines}" || true
+          done
+        }
+
+        echo "Waiting for the deployed application at ${APP_BASE_URL} ..."
+        if ! wait_for_app_health 120; then
+          echo "ERROR: the deployed application is not healthy at ${APP_BASE_URL} within 120s." \
+               "Check the deployment: oc -n ${APP_NS} get pods -l ${APP_LABEL}" \
+               "(or: oc -n ${APP_NS} logs deployment/$(params.APP_NAME) -c app)." >&2
           exit 1
         fi
         echo "Application under test is healthy at ${APP_BASE_URL}"
-
-        # The app crashing mid-run (e.g. OOM) would otherwise surface as
-        # mysterious test failures; restart it between attempts instead.
-        ensure_app_running() {
-          if ! curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1; then
-            if ! kill -0 "${APP_PID:-0}" 2>/dev/null; then
-              echo "WARN: application under test died; restarting it."
-              nohup java -jar "${APP_JAR}" > /tekton/home/app-under-test.log 2>&1 &
-              APP_PID=$!
-            fi
-            for i in $(seq 1 60); do
-              curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1 && return 0
-              sleep 5
-            done
-            echo "WARN: application under test still unhealthy; tests this attempt will likely fail." >&2
-            return 1
-          fi
-          return 0
-        }
 
         # Invoke the configured agent with the given prompt. Non-zero exits are
         # tolerated (logged, not fatal) so the retry loop can still verify and
@@ -315,28 +380,33 @@ spec:
         }
 
         PROMPT="You are working in a Maven project at the current directory, and
-        the application it builds is RUNNING at ${APP_BASE_URL} (already
-        healthy -- do not try to start or restart it). Follow the
-        test-generation-functional skill supplied as read-only context: first
-        read the OpenAPI specification, then evaluate the existing functional
-        tests (*FT.java) for coverage of the spec's operations, then add new
-        JUnit 5 functional tests under src/test/java -- named *FT.java,
-        mirroring the package layout -- that fill the coverage gaps it
-        identifies, driving the running application through its service
-        interface with REST Assured exactly as the skill prescribes: target
-        APP_BASE_URL, authenticate with APP_USERNAME/APP_PASSWORD from the
-        environment, black-box assertions on responses only, each test
-        arranging its own data through the API, no external applications. You
-        may add TEST-SCOPED dependencies and test-only build configuration to
-        pom.xml when the skill's tool stack requires them (REST Assured, a
-        Failsafe binding, a functional profile); change nothing else in the
-        build. Do NOT modify application source under src/main, and do NOT
-        modify existing tests -- only add new test files (plus those
-        test-scoped pom additions). If the meaningful behaviors are already
-        covered, add no tests. After writing tests, run 'mvn -B -q
-        -Dstyle.color=never test-compile failsafe:integration-test
-        failsafe:verify -Dit.test=<your test classes>' and iterate until the
-        tests you added pass. ${TEST_INSTRUCTIONS}"
+        a DEPLOYED instance of the application it builds is running at
+        ${APP_BASE_URL} (deployed by the pipeline -- do not try to start,
+        stop, or restart it). Follow the test-generation-functional skill
+        supplied as read-only context: first read the OpenAPI specification,
+        then evaluate the existing functional tests (*FT.java) for coverage of
+        the spec's operations, then add new JUnit 5 functional tests under
+        src/test/java -- named *FT.java, mirroring the package layout -- that
+        fill the coverage gaps it identifies, driving the deployed application
+        through its service interface with REST Assured exactly as the skill
+        prescribes: target APP_BASE_URL, authenticate with
+        APP_USERNAME/APP_PASSWORD from the environment, black-box assertions
+        on responses only, each test arranging its own data through the API
+        with UNIQUE identifiers (e.g. a random suffix -- the application's
+        state persists across runs, and fixed identifiers collide with data
+        from earlier runs), no external applications. You may add TEST-SCOPED
+        dependencies and test-only build configuration to pom.xml when the
+        skill's tool stack requires them (REST Assured, a Failsafe binding, a
+        functional profile); change nothing else in the build. Do NOT modify
+        application source under src/main, and do NOT modify existing tests
+        -- only add new test files (plus those test-scoped pom additions). If
+        the meaningful behaviors are already covered, add no tests. After
+        writing tests, run 'mvn -B -q -Dstyle.color=never test-compile
+        failsafe:integration-test failsafe:verify -Dit.test=<your test
+        classes>' and iterate until the tests you added pass. When a test
+        fails with an HTTP 5xx, the application's exception stack trace is
+        included in the feedback you receive -- read it before changing the
+        test. ${TEST_INSTRUCTIONS}"
 
         # --- One-time setup for the configured coding agent ---
         case "${AGENT}" in
@@ -371,8 +441,9 @@ spec:
         # The TASK owns the retry loop rather than trusting the agent to self-
         # verify: aider is invoked without --auto-test and cannot run Maven, so on
         # its own its "iterate until tests pass" instruction never actually runs.
-        # Each attempt runs the agent, then compiles+runs ONLY the test classes it
-        # touched this run; on failure the Maven output is fed back into the next
+        # Each attempt runs the agent, then resets the app to a clean state and
+        # compiles+runs ONLY the test classes it touched this run; on failure the
+        # Maven output PLUS the app's server log tail is fed back into the next
         # attempt's prompt so the agent fixes (not rewrites) what it produced.
         attempt=1
         feedback=""
@@ -394,7 +465,14 @@ spec:
           fi
 
           echo "=== test-generation attempt ${attempt}/${MAX_ATTEMPTS} ==="
-          ensure_app_running || true
+
+          # The agent may have probed the running app (or crashed it) during
+          # the previous attempt; if it is no longer healthy, a state reset
+          # also brings it back (pod deletion -> Deployment recreates).
+          if ! curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1; then
+            echo "App unhealthy before attempt ${attempt}; resetting."
+            reset_app_state || true
+          fi
 
           prompt="${PROMPT}"
           if [ -n "${feedback}" ]; then
@@ -438,6 +516,12 @@ spec:
             break
           fi
 
+          # Fresh application state for EVERY verification run: the agent's
+          # probes and the previous attempts' tests left data behind (in-mem
+          # DB persists across pods of the app), and re-running data-creating
+          # tests against it fails them regardless of the tests' quality.
+          reset_app_state || echo "WARN: verifying against existing app state."
+
           # Verify ONLY the generated tests, so unrelated/pre-existing suite
           # failures can't fail this task. Failsafe is invoked DIRECTLY
           # (test-compile + failsafe:integration-test + failsafe:verify) rather
@@ -465,10 +549,22 @@ spec:
           fi
 
           echo "Generated tests failed on attempt ${attempt} (mvn rc=${rc})."
+          # Client-side evidence (assertion failures) + server-side evidence
+          # (the app's stack traces behind any 5xx) -- without the latter the
+          # agent iterates blind on "expected 200 but was 500".
           feedback="$(printf '%s\n' "${build_log}" | tail -n 120)"
+          app_log_tail="$(fetch_app_log_tail 150 || true)"
+          if [ -n "${app_log_tail}" ]; then
+            feedback="${feedback}
+
+        --- application server log (stack traces behind HTTP 5xx responses) ---
+        ${app_log_tail}"
+          fi
           # Tekton ships results through the container termination message,
-          # which is size-capped; ~1 kB keeps this inside it.
-          LAST_ERROR_TEXT="$(printf '%s\n' "${build_log}" | tail -c 1024)"
+          # which is size-capped; ~1 kB keeps this inside it. Both halves
+          # matter: the Maven tail names the failing test, the app log names
+          # the server-side cause.
+          LAST_ERROR_TEXT="$(printf '%s\n%s\n' "${build_log}" "${app_log_tail}" | tail -c 1024)"
           attempt=$((attempt+1))
         done
 

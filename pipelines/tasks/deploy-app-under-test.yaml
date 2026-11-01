@@ -1,0 +1,336 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-app-under-test
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "testing, deployment, ephemeral"
+spec:
+  description: >-
+    Deploy the application under test as ephemeral namespaced resources: build a
+    container image from the packaged boot jar (minimal ubi9/openjdk-17 image,
+    pushed to the cluster's integrated registry -- no external registry or
+    credentials needed), then create a Deployment + Service in this namespace.
+    The Deployment's readiness probe polls the app's health endpoint, so the
+    task only succeeds once the app is genuinely serving. Emits APP_BASE_URL
+    (the in-cluster Service URL) for the test tasks to target.
+
+    Everything created is labeled app.kubernetes.io/instance=$(APP_NAME) and
+    app.kubernetes.io/part-of=ephemeral-test-resources, and carries an
+    ownerReference to the PipelineRun when OWNER_NAME/OWNER_UID are passed, so
+    the finally-task cleanup (cleanup-app-under-test) -- or, if the run is
+    killed so hard that even finally tasks never run, garbage collection when
+    the PipelineRun object is eventually deleted -- removes it all.
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      description: Project subdirectory within the source workspace (where pom.xml / target/ live).
+      default: source
+    - name: APP_NAME
+      type: string
+      description: >-
+        Name of the Deployment/Service/ImageStream to create, and the value of
+        the app.kubernetes.io/instance label that scopes every ephemeral
+        resource of this run. Pass $(context.pipelineRun.name) from the
+        pipeline so concurrent runs never collide and cleanup can target this
+        run's resources exactly. Must be a valid DNS label (<= 63 chars).
+      default: app-under-test
+    - name: PORT
+      type: string
+      description: Container port the application listens on.
+      default: "8080"
+    - name: HEALTH_PATH
+      type: string
+      description: >-
+        Health endpoint the Deployment's readiness/liveness probes poll. The
+        functional-test contract requires it to be unauthenticated (this demo's
+        apps expose /actuator/health permitAll).
+      default: /actuator/health
+    - name: OWNER_NAME
+      type: string
+      description: >-
+        Name of the PipelineRun that should own the ephemeral resources (set
+        ownerReferences, so Kubernetes GC removes them if the PipelineRun is
+        ever deleted). Pass $(context.pipelineRun.name); empty skips it.
+      default: ""
+    - name: OWNER_UID
+      type: string
+      description: UID of the owning PipelineRun ($(context.pipelineRun.uid)); empty skips the ownerReference.
+      default: ""
+  workspaces:
+    - name: source
+      description: Workspace carrying the built application (target/*.jar from the package task).
+  results:
+    - name: APP_BASE_URL
+      description: In-cluster base URL of the deployed application's Service.
+    - name: APP_IMAGE
+      description: Full image reference pushed to the integrated registry.
+  steps:
+    - name: build-and-push
+      # Same image/conventions as buildah-rhtap: vfs storage driver, the
+      # SETFCap capability and the /var/lib/containers emptyDir below are what
+      # make buildah work under the Pipelines operator's SCC.
+      image: registry.access.redhat.com/ubi9/buildah@sha256:4b82b66a71857c5167abd344cd63bebe3b8026b04b1f35fde4789868dae0af8d
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      env:
+        - name: STORAGE_DRIVER
+          value: vfs
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+        REG="image-registry.openshift-image-registry.svc:5000"
+        IMAGE="${REG}/${NS}/$(params.APP_NAME):under-test"
+
+        # The boot jar produced by the package task. spring-boot repackage
+        # leaves the thin *.jar.original next to the executable fat jar --
+        # exclude it.
+        APP_JAR="$(ls target/*.jar 2>/dev/null | grep -v '\.jar\.original' | head -1 || true)"
+        if [ -z "${APP_JAR}" ]; then
+          echo "ERROR: no boot jar under target/ in $(pwd)." \
+               "The package task must run before deploy-app-under-test." >&2
+          exit 1
+        fi
+
+        # Minimal build context: the jar plus a generated Containerfile. Base
+        # image is ubi9/openjdk-17 (any 1.x tag works; it is only a JRE for the
+        # fat jar). This is an EPHEMERAL TEST image -- deliberately not the
+        # app's own Dockerfile/build, which stays the CI pipeline's job.
+        # The context lives under /tekton/home (pod-local), NOT under target/:
+        # the workingDir sits on the shared PVC and target/ is owned by the
+        # package task pod's uid, so creating a subdirectory there can fail
+        # with "Operation not permitted" (the same cross-pod ownership issue
+        # that pushes the generation task to scratch copies). Reading the
+        # foreign-owned jar is fine; writing next to it is not.
+        CTX="/tekton/home/ephemeral-image"
+        rm -rf "${CTX}"; mkdir -p "${CTX}"
+        cp "${APP_JAR}" "${CTX}/app.jar"
+        cat > "${CTX}/Containerfile" <<EOF
+        FROM registry.access.redhat.com/ubi9/openjdk-17:1.20
+        COPY app.jar /deployments/app.jar
+        EXPOSE $(params.PORT)
+        ENTRYPOINT ["java", "-jar", "/deployments/app.jar"]
+        EOF
+
+        buildah build \
+          --storage-driver vfs \
+          --ulimit nofile=4096:4096 \
+          -f "${CTX}/Containerfile" -t "${IMAGE}" "${CTX}"
+
+        # Auth against the integrated registry with THIS POD's service-account
+        # token; the app-under-test-image-builder RoleBinding below grants the
+        # pipeline service account system:image-builder in this namespace.
+        # --tls-verify=false because the registry's service endpoint serves a
+        # certificate from the cluster's service CA, which is not in the
+        # buildah image's trust store.
+        buildah login --tls-verify=false \
+          -u pipeline -p "$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+          "${REG}"
+
+        buildah push --tls-verify=false --retry=5 "${IMAGE}" "docker://${IMAGE}"
+        printf '%s' "${IMAGE}" > "$(results.APP_IMAGE.path)"
+        echo "Pushed ${IMAGE}"
+      securityContext:
+        capabilities:
+          add:
+            # needed so buildah can write to the mounted /var/lib/containers directory
+            - SETFCap
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+    - name: deploy
+      image: registry.redhat.io/openshift/oc-cli:latest
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+        REG="image-registry.openshift-image-registry.svc:5000"
+        IMAGE="${REG}/${NS}/$(params.APP_NAME):under-test"
+
+        # Optional ownerReference to the PipelineRun: if the run is destroyed
+        # so hard that even the finally-task cleanup never executes (a hard
+        # PipelineRun timeout cancels finally tasks too), Kubernetes GC still
+        # removes these resources once the PipelineRun object is deleted.
+        OWNER_REFS=""
+        if [ -n "$(params.OWNER_NAME)" ]; then
+          OWNER_REFS="  ownerReferences:
+          - apiVersion: tekton.dev/v1
+            kind: PipelineRun
+            name: $(params.OWNER_NAME)
+            uid: $(params.OWNER_UID)
+            blockOwnerDeletion: true"
+        fi
+
+        # ${OWNER_REFS} expands to nothing when unset; field order in YAML does
+        # not matter, so appending it at the end of metadata is safe either way.
+        cat <<EOF | oc apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: $(params.APP_NAME)
+          namespace: ${NS}
+          labels:
+            app.kubernetes.io/name: app-under-test
+            app.kubernetes.io/instance: $(params.APP_NAME)
+            app.kubernetes.io/part-of: ephemeral-test-resources
+            app.kubernetes.io/managed-by: tekton-pipelines
+        ${OWNER_REFS}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: $(params.APP_NAME)
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: app-under-test
+                app.kubernetes.io/instance: $(params.APP_NAME)
+            spec:
+              containers:
+                - name: app
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                    - name: http
+                      containerPort: $(params.PORT)
+                  readinessProbe:
+                    httpGet:
+                      path: $(params.HEALTH_PATH)
+                      port: $(params.PORT)
+                    initialDelaySeconds: 15
+                    periodSeconds: 5
+                    failureThreshold: 36
+                  livenessProbe:
+                    httpGet:
+                      path: $(params.HEALTH_PATH)
+                      port: $(params.PORT)
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    failureThreshold: 12
+                  resources:
+                    requests:
+                      cpu: 250m
+                      memory: 512Mi
+                    limits:
+                      memory: 1Gi
+              terminationGracePeriodSeconds: 10
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: $(params.APP_NAME)
+          namespace: ${NS}
+          labels:
+            app.kubernetes.io/name: app-under-test
+            app.kubernetes.io/instance: $(params.APP_NAME)
+            app.kubernetes.io/part-of: ephemeral-test-resources
+            app.kubernetes.io/managed-by: tekton-pipelines
+        spec:
+          selector:
+            app.kubernetes.io/instance: $(params.APP_NAME)
+          ports:
+            - name: http
+              port: $(params.PORT)
+              targetPort: $(params.PORT)
+        EOF
+
+        # The push in the previous step auto-created the ImageStream but could
+        # not label it (buildah has no oc). Label it so cleanup-by-label (and a
+        # manual sweep for anything the cleanup missed) covers it too.
+        oc -n "${NS}" label imagestream "$(params.APP_NAME)" --overwrite \
+          app.kubernetes.io/instance="$(params.APP_NAME)" \
+          app.kubernetes.io/part-of=ephemeral-test-resources
+
+        # Deployment "Available" only turns true once the readiness probe (the
+        # app's health endpoint) passes, so this wait means "genuinely
+        # serving", not just "pod running".
+        oc -n "${NS}" wait --for=condition=Available \
+          "deployment/$(params.APP_NAME)" --timeout=420s
+
+        printf 'http://%s.%s.svc.cluster.local:%s' \
+          "$(params.APP_NAME)" "${NS}" "$(params.PORT)" > "$(results.APP_BASE_URL.path)"
+        echo "Application under test deployed: $(cat "$(results.APP_BASE_URL.path)")"
+  volumes:
+    - name: varlibcontainers
+      emptyDir: {}
+---
+# -----------------------------------------------------------------------------
+# RBAC for the ephemeral app-under-test lifecycle.
+#
+# Grants the `pipeline` service account (the SA the functional test-generation
+# pipeline pins its ephemeral-resource tasks to, via taskRunSpecs) everything
+# needed to deploy, reset, inspect, and clean up the ephemeral application:
+#   - deploy-app-under-test: create/patch deployments+services, label
+#     imagestreams, wait on deployments
+#   - reset-app-under-test / the generation task's in-loop state reset: delete
+#     the app's pods (the Deployment recreates them with fresh in-mem state)
+#   - the generation task's failure feedback: read the app's pod logs (the
+#     server-side stack traces behind HTTP 500s live there)
+#   - cleanup-app-under-test: delete it all
+# Plus system:image-builder for pushing to the integrated registry.
+#
+# NOTE: the namespace is HARDCODED to tssc-app-ci, the same caveat as the
+# ClusterRoleBinding subject in triggers/agentic-issue-triggers.yaml -- plain
+# YAML Applications cannot template it. Change both if the pipeline namespace
+# moves.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: app-under-test-lifecycle
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["image.openshift.io"]
+    resources: ["imagestreams"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: app-under-test-lifecycle
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+subjects:
+  - kind: ServiceAccount
+    name: pipeline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: app-under-test-lifecycle
+---
+# Push access to the integrated registry for images in this namespace (what
+# lets the SA-token `buildah login` above actually push).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: app-under-test-image-builder
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+subjects:
+  - kind: ServiceAccount
+    name: pipeline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:image-builder
