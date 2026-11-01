@@ -84,7 +84,7 @@ spec:
       workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
       volumeMounts:
         - name: agent-skills
-          mountPath: /tekton/home/agent-skills/junit-regression-test-generation
+          mountPath: /tekton/home/agent-skills/test-generation-unit
           readOnly: true
       computeResources:
         requests:
@@ -144,7 +144,7 @@ spec:
         cd "${SCRATCH}"
 
         # --- Test-generation methodology skill ---------------------------------
-        # Mounted read-only from the agent-skills-junit-regression-test-generation
+        # Mounted read-only from the agent-skills-test-generation-unit
         # ConfigMap (pipelines/config/, synced by ssc-tekton-config). The task
         # prompt below carries the WHAT (evaluate coverage, add gap-filling
         # tests, verify); the skill carries the HOW (surveying existing tests,
@@ -152,16 +152,16 @@ spec:
         # existing tests or functional code). Fail loudly if it is missing:
         # aider --read and claude --append-system-prompt would both silently
         # continue with no methodology at all.
-        SKILL_DIR="${HOME}/agent-skills/junit-regression-test-generation"
+        SKILL_DIR="${HOME}/agent-skills/test-generation-unit"
         if [ ! -f "${SKILL_DIR}/SKILL.md" ]; then
           echo "ERROR: ${SKILL_DIR}/SKILL.md is missing." \
-               "Is the agent-skills-junit-regression-test-generation ConfigMap applied" \
-               "(pipelines/config/agent-skills-junit-regression-test-generation.yaml)?"
+               "Is the agent-skills-test-generation-unit ConfigMap applied" \
+               "(pipelines/config/agent-skills-test-generation-unit.yaml)?"
           exit 1
         fi
 
         PROMPT="You are working in a Quarkus/Maven project at the current directory.
-        Follow the junit-regression-test-generation skill supplied as read-only
+        Follow the test-generation-unit skill supplied as read-only
         context: first evaluate the existing JUnit tests for unit-test coverage of
         the main sources, then add new JUnit 5 tests under src/test/java (mirroring
         the package layout) that fill the coverage gaps it identifies. Do NOT
@@ -394,10 +394,10 @@ spec:
         : > "$(results.LAST_ERROR.path)"
         echo "Staged test file changes: ${COUNT}"
   # The test-generation methodology skill (SKILL.md), mounted read-only at
-  # ${HOME}/agent-skills/junit-regression-test-generation. Lives in
-  # pipelines/config/agent-skills-junit-regression-test-generation.yaml so it
+  # ${HOME}/agent-skills/test-generation-unit. Lives in
+  # pipelines/config/agent-skills-test-generation-unit.yaml so it
   # ships with the rest of the Tekton config and no image change is needed.
   volumes:
     - name: agent-skills
       configMap:
-        name: agent-skills-junit-regression-test-generation
+        name: agent-skills-test-generation-unit
