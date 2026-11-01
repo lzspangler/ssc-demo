@@ -19,6 +19,16 @@ can be run on its own:
 4. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
    **test-generation** flow (clone → build → generate tests → `mvn verify` →
    tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
+5. **`agentic-test-generation-integration`** — same flow, but the agent
+   generates **integration tests** (`*IT.java`, per the
+   `test-generation-integration` skill: test-managed embedded H2/WireMock
+   doubles, no Testcontainers) and the MR also carries any test-scoped
+   `pom.xml` additions. Triggered with `/generate-tests-integration`.
+6. **`agentic-test-generation-functional`** — same flow, but the agent
+   generates **functional tests** (`*FT.java`, per the
+   `test-generation-functional` skill: black-box REST Assured against the
+   application the task itself builds, starts, and health-waits for).
+   Triggered with `/generate-tests-functional`.
 
 The CVE pipelines share one six-field decision contract
 (`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`):
@@ -31,7 +41,7 @@ per-step detail.
 
 ## Overview
 
-This repo defines **four** pipelines that share the same tasks and images:
+This repo defines **six** pipelines that share the same tasks and images:
 
 - **`pipelines/agentic-cve-selection.yaml`** — self-contained CVE discovery,
   prioritization, and selection (build → SBOM → RHTPA scan → must-fix gate → AI
@@ -47,6 +57,15 @@ This repo defines **four** pipelines that share the same tasks and images:
 - **`pipelines/agentic-test-generation.yaml`** — a standalone AI
   **test-generation** flow (clone → build → generate tests → `mvn verify` →
   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
+- **`pipelines/agentic-test-generation-integration.yaml`** — the same flow
+  generating integration tests (`*IT.java`, embedded/WireMock doubles only);
+  re-runs the unit suite plus direct failsafe invocation of the `*IT.java`
+  suite; the MR stages `pom.xml` test-scoped additions alongside `src/test`.
+- **`pipelines/agentic-test-generation-functional.yaml`** — the same flow
+  generating functional tests (`*FT.java`, black-box REST Assured). The
+  generation task builds and boots the application under test itself; the
+  re-run boots it with `spring-boot:start`/`stop` in a single `mvn`
+  invocation.
 
 ### `agentic-cve-selection` steps
 
@@ -98,7 +117,9 @@ selection — those live in `agentic-cve-selection`.
 ### `agentic-test-generation` steps
 
 Every task runs unconditionally except **`verify-commit`** (optional). No `init`,
-image build, SBOM upload, or RHTPA scan.
+image build, SBOM upload, or RHTPA scan. The two sibling pipelines
+(`-integration`, `-functional`) have the identical shape — see the next section
+for what differs.
 
 | Step (`taskRef`) | Runs when | Description | External systems / endpoints |
 |------------------|-----------|-------------|------------------------------|
@@ -109,6 +130,24 @@ image build, SBOM upload, or RHTPA scan.
 | `re-run-tests` (`maven`) | always | Runs `mvn verify` (existing + generated tests) against the tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
 | `open-pr` (`open-pr-tests`) | always | Commits **only** the generated tests (`src/test`) to an `ai-tests/*` branch and opens a tests-only PR/MR (no CVE/fix wording; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger); no-ops if nothing changed. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
+### `agentic-test-generation-integration` / `-functional` steps
+
+Same chain as `agentic-test-generation` (clone → verify-commit → package →
+generate → re-run → open-pr), with the differences below. Each generation task
+follows its own agent skill — `test-generation-integration` /
+`test-generation-functional` — which defines the category's execution contract
+and tool stack; the task prompt carries only the run contract.
+
+| | `agentic-test-generation-integration` | `agentic-test-generation-functional` |
+|---|---|---|
+| Generation task | `ai-generate-tests-integration` | `ai-generate-tests-functional` |
+| Test category / naming | integration — `*IT.java` | functional — `*FT.java` |
+| What the agent generates | interactions between components and their dependencies, every dependency a **test-managed double** (embedded H2, WireMock stub; **no Testcontainers** — CI runners are dockerless) | black-box REST Assured tests of the **running application** through its service interface (OpenAPI spec as read-only context); no DB/actuator/log assertions, data self-arranged via the API |
+| App under test | none — doubles run inside the test JVM | the task itself builds (`-DskipTests package`) and boots the jar, health-waits on `/actuator/health`, and exports `APP_BASE_URL`/`APP_USERNAME`/`APP_PASSWORD` for the agent and the verification build |
+| `re-run-tests` goals | `test` + direct `failsafe:integration-test` + `failsafe:verify` (runs the whole `*IT.java` suite even without a pom failsafe binding) | `spring-boot:start` → `test-compile` → direct failsafe (scoped `-Dit.test=*FT`) → `spring-boot:stop`, all in **one** `mvn` invocation (each step is its own pod, so start/stop cannot span steps; start blocks until the Spring context is ready via JMX) |
+| MR contents | `src/test` + `pom.xml` (test-scoped additions such as WireMock/Awaitility) | `src/test` + `pom.xml` (test-scoped additions such as REST Assured) |
+| Why direct failsafe, not `mvn verify` | the pom may declare no failsafe binding (the agent is only *permitted* test-scoped changes), and without a binding `mvn verify` silently runs **zero** `*IT.java`/`*FT.java` tests — the re-run would go green while testing nothing | same |
+
 ## Files
 
 | File | Purpose |
@@ -117,10 +156,12 @@ image build, SBOM upload, or RHTPA scan.
 | `pipelines/agentic-cve-analysis.yaml` | Same scan chain, but analyzes every fixable CVE and opens one issue per vulnerability (each carries the six-field decision) |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
 | `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
+| `pipelines/agentic-test-generation-integration.yaml` | Same flow generating integration tests (`*IT.java`, embedded/WireMock doubles); re-run uses direct failsafe; MR stages test-scoped pom additions |
+| `pipelines/agentic-test-generation-functional.yaml` | Same flow generating functional tests (`*FT.java`, black-box REST Assured); task boots the app under test; re-run uses `spring-boot:start`/`stop` |
 | `pipelines/gitops-cd-dev.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
 | `pipelines/gitops-cd-qa.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
 | `pipelines/gitops-cd-prod.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
-| `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation` (one EventListener + interceptors + a binding/template pair per command + RBAC + Route) |
+| `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation`, `/generate-tests-functional` → `agentic-test-generation-functional`, `/generate-tests-integration` → `agentic-test-generation-integration` (one EventListener + interceptors + a binding/template per command + RBAC + Route; the three `/generate-tests*` commands share one TriggerBinding) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `ops/rhtpa-upload-advisory.sh` | Script — uploads/verifies/deletes a **single** advisory document (OSV/CSAF/…) in RHTPA, for records no importer covers |
@@ -133,6 +174,8 @@ image build, SBOM upload, or RHTPA scan.
 | `secrets/scm-auth-gitops-secret.example.yaml` | Example Secret — the gitops repository's own token for the gitops CD pipelines (a GitLab project bot cannot be shared across projects, so it is separate from `scm-auth-secret`) |
 | `secrets/gitlab-webhook-secret.example.yaml` | Example Secret — shared token validating the GitLab issue webhook |
 | `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
+| `tasks/ai-generate-tests-integration.yaml` | AI generates + runs integration tests (`*IT.java`) per the `test-generation-integration` skill |
+| `tasks/ai-generate-tests-functional.yaml` | AI generates + runs functional tests (`*FT.java`) per the `test-generation-functional` skill; builds/boots/health-waits the app under test |
 | `tasks/rhtpa-vulnerability-analysis1.yaml` | Scans the SBOM's PURLs against RHTPA, then suppresses findings explicitly marked fixed/not_affected |
 | `tasks/rhtpa-remediation-report2.yaml` | Resolves a concrete fix version per (PURL, CVE) — `.fix_versions`, backports first |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
@@ -141,7 +184,7 @@ image build, SBOM upload, or RHTPA scan.
 | `tasks/open-cve-issues.yaml` | Opens one GitLab/GitHub issue per rendered file, applying the base + per-CVE severity label (runs on the **agent image**) |
 | `tasks/ai-remediate-dependency.yaml` | AI bumps the dependency + verifies compile |
 | `tasks/open-pr.yaml` | Commits to a branch and opens the PR/MR — tests + CVE remediation (runs on the **agent image** — see note below) |
-| `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipeline |
+| `tasks/open-pr-tests.yaml` | Tests-only PR/MR (no CVE/fix context) — used by the test-generation pipelines; `TEST_CATEGORY` param (unit/integration/functional) controls whether the MR also stages test-scoped `pom.xml` additions |
 | `tasks/gitops-bump-image.yaml` | Bumps `image.tag` in a gitops values file and lands it as an (auto-merged) MR — used by the dev CD pipeline |
 | `tasks/start-gitops-cd-dev.yaml` | Creates a `gitops-cd-dev` PipelineRun through the Kubernetes API — run as a `finally` task of `ci-build-publish` |
 | `images/ai-agent-maven-claude/Dockerfile` | Agent runtime, **Claude Code** flavor (ubi-minimal + JDK17 + Maven + Node/Claude Code + git/glab/gh) |
@@ -245,6 +288,24 @@ the CVE pipelines the agent and `mvn verify` run in a pod-local scratch copy to
 avoid the shared-`target/` race. It needs the `ai-agent-config`/`ai-agent-secret`
 and `scm-auth-secret` objects (and the agent image), but not `tpa-secret`, RHTPA,
 or TAS.
+
+### `agentic-test-generation-integration` / `agentic-test-generation-functional`
+
+```
+clone-repository → verify-commit → package → ai-generate-tests-{integration,functional} → re-run-tests → open-pr
+                                                                    (re-run-tests + open-pr only if TESTS_ADDED != "0")
+```
+
+Identical chain and gating to `agentic-test-generation` above; the task-level
+differences (skill, verification goals, app lifecycle, MR contents) are in the
+steps table in the [Overview](#overview). Two things worth restating:
+
+- the agent's pom edits are **test-scoped only** (dependencies and test-only
+  build config), enforced by the skill's constraints and the prompt, and those
+  changes ride along in the MR via `open-pr-tests`' `TEST_CATEGORY` staging;
+- both re-runs invoke Failsafe **directly** rather than plain `mvn verify`,
+  because a pom without a failsafe binding silently runs zero `*IT.java` /
+  `*FT.java` tests on `verify` — the re-run would pass while testing nothing.
 
 ### `gitops-cd-dev` (dev image promotion)
 
@@ -386,12 +447,18 @@ a pipeline by **commenting a slash-command on a GitLab issue**:
 |---|---|---|
 | `/remediate` | `agentic-cve-remediation` | yes — reads the six-field decision from the issue |
 | `/generate-tests` | `agentic-test-generation` | no — only the repo coordinates |
+| `/generate-tests-functional` | `agentic-test-generation-functional` | no — only the repo coordinates |
+| `/generate-tests-integration` | `agentic-test-generation-integration` | no — only the repo coordinates |
 
-Both commands share a **single** EventListener, webhook, and Route — the wiring
-lives in `triggers/agentic-issue-triggers.yaml` (EventListener with
-two triggers + `gitlab`/`cel` interceptors + a TriggerBinding/TriggerTemplate pair
-per command + RBAC + Route). Each trigger's `cel` `filter` matches exactly one
-command, so a comment only starts the pipeline it names.
+All commands share a **single** EventListener, webhook, and Route — the wiring
+lives in `triggers/agentic-issue-triggers.yaml` (EventListener with four
+triggers + `gitlab`/`cel` interceptors + a TriggerBinding/TriggerTemplate
+per command + RBAC + Route; the three `/generate-tests*` commands share one
+TriggerBinding, since nothing in it is command-specific). Each trigger's `cel`
+`filter` matches exactly one command, so a comment only starts the pipeline it
+names — note the `/generate-tests` filter is **word-bounded**
+(`matches('^/generate-tests(\s|$)')`), because the two longer commands also
+*start with* `/generate-tests` and a plain `startsWith` would match them too.
 
 ### `/remediate`
 
@@ -454,17 +521,29 @@ own line:
 There's nothing to read from the issue body and nothing to override, so this
 trigger uses a single `cel` interceptor that only checks the command and derives
 `git-host` / `base-branch` from the payload. Only comments whose first characters
-are `/generate-tests`, on an **issue** (not an MR), that pass the webhook token
-check, start a run.
+are `/generate-tests` **as a whole word** (the filter demands whitespace or
+end-of-string after it, so `/generate-tests-functional` and
+`/generate-tests-integration` fall through to their own triggers), on an
+**issue** (not an MR), that pass the webhook token check, start a run.
+
+### `/generate-tests-functional` and `/generate-tests-integration`
+
+Same wiring as `/generate-tests` (same EventListener, same shared
+TriggerBinding; their own TriggerTemplates and cel filters, each a plain
+`startsWith` since these are the longest forms). They kick off
+`agentic-test-generation-functional` / `agentic-test-generation-integration`:
+the agent evaluates whether new functional / integration tests are needed and
+generates them per the matching agent skill (`test-generation-functional` /
+`test-generation-integration`), the pipeline re-verifies, and the MR carries the
+new tests plus any test-scoped `pom.xml` additions.
 
 ### Cluster setup for the issue-comment triggers
 
 Everything the cluster needs, in order. Steps 1–2 are usually already true from
-the [One-time setup](#one-time-setup); steps 3–5 are trigger-specific. Both
-`/remediate` and `/generate-tests` are served by the **same** EventListener and
-webhook, so this setup enables both at once — the only extra requirement for
-`/generate-tests` is that the `agentic-test-generation` Pipeline and its Tasks are
-applied (step 2).
+the [One-time setup](#one-time-setup); steps 3–5 are trigger-specific. All four
+commands are served by the **same** EventListener and webhook, so this setup
+enables them all at once — the only extra requirement for a given command is
+that the Pipeline and Tasks it names are applied (step 2).
 
 **1. Operators / interceptors (cluster-level).** The Red Hat OpenShift Pipelines
 operator must be installed **with** the Tekton Triggers stack, which provides the
@@ -475,10 +554,15 @@ oc get clusterinterceptors      # expect at least: cel, gitlab
 
 **2. The pipelines + their tasks must already be applied.** Each trigger only
 creates a PipelineRun that references its Pipeline (`agentic-cve-remediation` for
-`/remediate`, `agentic-test-generation` for `/generate-tests`); those Pipelines and
-every Task they use must exist in the namespace (your normal `oc apply` of
-`pipelines/` and `tasks/`). Apply only the pipeline(s) whose command you intend to
-enable.
+`/remediate`, `agentic-test-generation` for `/generate-tests`,
+`agentic-test-generation-functional` for `/generate-tests-functional`,
+`agentic-test-generation-integration` for `/generate-tests-integration`); those
+Pipelines and every Task they use must exist in the namespace (your normal
+`oc apply` of `pipelines/` and `tasks/`). The test-generation tasks also need
+their **agent-skill ConfigMaps** (`pipelines/config/agent-skills-test-generation-*.yaml`)
+— a missing one fails the generation step loudly rather than letting the agent
+run without its methodology. Apply only the pipeline(s) whose command you intend
+to enable.
 
 **3. Secrets & configs the run mounts** (in the pipeline namespace — the
 `TriggerTemplate` wires these in, so the names must match or you override the
@@ -1101,13 +1185,19 @@ many lookups failed so a degraded run is visible rather than merely quieter.
    oc -n tssc-app-ci create -f secrets/scm-auth-secret.example.yaml   # after editing REPLACE_ME
    ```
 
-5. **Apply the tasks + pipelines** (apply all three, or just the ones you use):
+5. **Apply the tasks + agent-skill ConfigMaps + pipelines** (apply everything,
+   or just the ones you use):
    ```
    oc -n tssc-app-ci apply -f tasks/
+   oc -n tssc-app-ci apply -f config/agent-skills-test-generation-unit.yaml
+   oc -n tssc-app-ci apply -f config/agent-skills-test-generation-integration.yaml
+   oc -n tssc-app-ci apply -f config/agent-skills-test-generation-functional.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-selection.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-analysis.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-remediation.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-test-generation.yaml
+   oc -n tssc-app-ci apply -f pipelines/agentic-test-generation-integration.yaml
+   oc -n tssc-app-ci apply -f pipelines/agentic-test-generation-functional.yaml
    ```
 
 6. **Egress:** the cluster must allow the selected provider's endpoint
@@ -1120,8 +1210,8 @@ many lookups failed so a degraded run is visible rather than merely quieter.
 There is no single on/off gate anymore — you **start whichever pipeline** does the
 job. A typical CVE run is two steps: `agentic-cve-selection` to decide, then
 `agentic-cve-remediation` with that decision as params (see
-[Hand-off](#hand-off-selection--remediation)). `agentic-test-generation` runs
-independently.
+[Hand-off](#hand-off-selection--remediation)). `agentic-test-generation` (and its
+`-integration` / `-functional` siblings) run independently.
 
 The pipelines that open a PR/MR (`agentic-cve-remediation`,
 `agentic-test-generation`) need the SCM params set on the PipelineRun (or in the

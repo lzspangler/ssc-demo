@@ -9,11 +9,14 @@ metadata:
     tekton.dev/tags: "git, pull-request, gitlab, github, testing"
 spec:
   description: >-
-    Tests-only variant of open-pr: commit the AI-generated unit tests (src/test)
-    to a new branch and open a PR/MR back to the application repo. Unlike open-pr
+    Tests-only variant of open-pr: commit the AI-generated tests (src/test) to
+    a new branch and open a PR/MR back to the application repo. Unlike open-pr
     it carries no CVE/dependency-remediation context -- it only submits the
-    generated tests. Supports GitLab (glab) and GitHub (gh). Auth comes from the
-    SCM_SECRET_NAME secret (keys: token, username).
+    generated tests. TEST_CATEGORY selects which pipeline's output is being
+    submitted: unit stages src/test only, while integration/functional also
+    stage pom.xml (their contracts let the agent add TEST-SCOPED dependencies
+    such as WireMock or REST Assured). Supports GitLab (glab) and GitHub (gh).
+    Auth comes from the SCM_SECRET_NAME secret (keys: token, username).
   params:
     - name: SUBDIRECTORY
       type: string
@@ -42,6 +45,16 @@ spec:
     - name: SCM_SECRET_NAME
       type: string
       default: scm-auth-secret
+    - name: TEST_CATEGORY
+      type: string
+      description: >-
+        Which test category the generated tests belong to: unit | integration |
+        functional. Affects what gets staged and the MR/PR wording: unit stages
+        src/test only; integration/functional also stage pom.xml, because their
+        skills permit TEST-SCOPED dependency additions (WireMock, Awaitility,
+        REST Assured) that the MR must carry or the tests won't compile for the
+        reviewer.
+      default: unit
     - name: GIT_IMAGE
       type: string
       description: >-
@@ -82,6 +95,8 @@ spec:
           value: $(params.BASE_BRANCH)
         - name: ISSUE_IID
           value: $(params.ISSUE_IID)
+        - name: TEST_CATEGORY
+          value: $(params.TEST_CATEGORY)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
@@ -129,6 +144,19 @@ spec:
         for ps in src/test '*/src/test'; do
           git add -A -- "${ps}" 2>/dev/null || true
         done
+        # integration/functional runs may also carry TEST-SCOPED pom.xml
+        # additions (WireMock, Awaitility, REST Assured, a Failsafe binding)
+        # from the agent. Stage the pom(s) for those categories only: a unit
+        # run never changes pom.xml, and staging it unconditionally would
+        # sweep unrelated build changes into a tests-only MR.
+        case "${TEST_CATEGORY}" in
+          integration|functional)
+            for ps in pom.xml '*/pom.xml'; do
+              git add -A -- "${ps}" 2>/dev/null || true
+            done
+            ;;
+          unit|*) : ;;
+        esac
         if git diff --cached --quiet; then
           echo "No generated test changes to submit after filtering; skipping PR."
           printf '' > "$(results.PR_URL.path)"
@@ -137,7 +165,7 @@ spec:
 
         BRANCH="ai-tests/generated-$(date +%s)"
         git checkout -b "${BRANCH}"
-        git commit -m "test: add AI-generated unit tests
+        git commit -m "test: add AI-generated ${TEST_CATEGORY} tests
 
         Automated by the maven-build-ci AI test-generation pipeline."
 
@@ -146,8 +174,8 @@ spec:
         PUSH_URL="https://${USERNAME}:${TOKEN}@${GIT_HOST}/${REPO_PATH}.git"
         git push "${PUSH_URL}" "${BRANCH}"
 
-        TITLE="Add AI-generated unit tests"
-        BODY="Automated unit-test generation from the maven-build-ci pipeline.
+        TITLE="Add AI-generated ${TEST_CATEGORY} tests"
+        BODY="Automated ${TEST_CATEGORY}-test generation from the maven-build-ci pipeline.
 
         Includes AI-generated JUnit tests under src/test. Please review before merging."
 

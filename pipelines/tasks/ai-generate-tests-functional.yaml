@@ -1,0 +1,529 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ai-generate-tests-functional
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "ai, testing, maven"
+spec:
+  description: >-
+    Use an AI coding agent to generate JUnit functional tests (*FT.java) that
+    exercise the DEPLOYED application through its service interface (REST
+    Assured against a running instance), per the functional-test execution
+    contract: black-box only, no external applications, data self-arranged
+    through the API. The task builds and starts the application itself, waits
+    for /actuator/health, and hands the agent APP_BASE_URL plus credentials.
+    The coding agent is selected by AI_AGENT (claude-code | aider); aider
+    drives OpenAI-compatible models such as gpt-oss and Granite. Backend
+    (provider/model/creds) is supplied via the ai-agent-config ConfigMap and
+    ai-agent-secret Secret. Swap the runtime by overriding AGENT_IMAGE.
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      description: Project subdirectory within the source workspace (where pom.xml lives).
+      default: source
+    - name: AGENT_IMAGE
+      type: string
+      description: >-
+        Container image providing the AI agent runtime (JDK17 + Maven + the agent
+        CLI). Use the flavor matching AI_AGENT: ai-agent-maven-claude for
+        claude-code (default), ai-agent-maven-aider for aider.
+      default: quay.io/REPLACE_ME/ai-agent-maven-claude:v1.0.0
+    - name: TEST_INSTRUCTIONS
+      type: string
+      description: Extra natural-language guidance for the test-generation agent.
+      default: >-
+        Prioritize the core business operations from the OpenAPI spec, their
+        documented error responses, and the security behavior (unauthenticated
+        requests rejected). Each test creates its own data through the API.
+    - name: SOURCE_PATHS
+      type: string
+      description: >-
+        Space-separated paths given to the agent as read-only context. Defaults
+        to the main sources plus the OpenAPI specification, which IS the service
+        interface under test. Only affects the aider (OpenAI-compatible) path.
+      default: src/main/java openapi/openapi.yaml
+    - name: APP_BASE_URL
+      type: string
+      description: >-
+        Base URL of the application this task starts and leaves running for the
+        agent and the verification build. Tests target ONLY this URL.
+      default: http://localhost:8080
+    - name: APP_USERNAME
+      type: string
+      description: >-
+        Username for the application's security layer, passed to the tests via
+        the APP_USERNAME environment variable (the skill forbids hardcoding).
+        Default matches spring-boot-example-application's in-memory user.
+      default: user
+    - name: APP_PASSWORD
+      type: string
+      description: >-
+        Password for APP_USERNAME. Default matches spring-boot-example-
+        application's in-memory user (test credentials, not a secret).
+      default: user123
+    - name: MAX_ATTEMPTS
+      type: string
+      description: >-
+        How many times to (re)run the agent and verify the tests it generated.
+        On a failing verify, the Maven output is fed back into the next attempt's
+        prompt. If the generated tests still fail after the last attempt, the task
+        fails.
+      default: "6"
+  workspaces:
+    - name: source
+      description: Workspace containing the application source (shared PVC).
+    - name: maven-settings
+      optional: true
+      description: >-
+        Secret/ConfigMap holding a settings.xml that mirrors dependency
+        resolution through the internal artifact repository. Optional so the
+        task still runs without one, but a tree carrying a Lightwell backport
+        pin cannot build without it -- see the note in the step script.
+  results:
+    - name: TESTS_ADDED
+      description: Number of new/changed test files staged by the agent.
+    - name: ATTEMPTS
+      description: Agent invocations actually run.
+    - name: LAST_ERROR
+      description: >-
+        Tail of the last failed Maven verify output (truncated to ~1 kB);
+        empty when the generated tests passed. Written so a cancelled run
+        still leaves evidence -- a timeout cancels AND deletes the pod, and
+        the step logs (including the agent tee) die with it. Results are the
+        only channel that survives.
+  stepTemplate:
+    envFrom:
+      - configMapRef:
+          name: ai-agent-config
+      - secretRef:
+          name: ai-agent-secret
+    env:
+      - name: HOME
+        value: /tekton/home
+  steps:
+    - name: generate-and-run
+      image: $(params.AGENT_IMAGE)
+      workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
+      volumeMounts:
+        - name: agent-skills
+          mountPath: /tekton/home/agent-skills/test-generation-functional
+          readOnly: true
+      computeResources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      env:
+        - name: TEST_INSTRUCTIONS
+          value: $(params.TEST_INSTRUCTIONS)
+        - name: SOURCE_PATHS
+          value: $(params.SOURCE_PATHS)
+        # Exported so the agent's read-only probes, its generated tests, and
+        # the verification mvn (a forked JVM) all see the same target and
+        # credentials -- the skill forbids hardcoding any of them.
+        - name: APP_BASE_URL
+          value: $(params.APP_BASE_URL)
+        - name: APP_USERNAME
+          value: $(params.APP_USERNAME)
+        - name: APP_PASSWORD
+          value: $(params.APP_PASSWORD)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        WORKDIR="$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+
+        AGENT="${AI_AGENT:-claude-code}"
+        MODEL="${AI_MODEL:-claude-opus-5}"
+        MAX_ATTEMPTS="$(params.MAX_ATTEMPTS)"
+        echo "Generating functional tests with agent=${AGENT} provider=${AI_PROVIDER:-anthropic} model=${MODEL} (up to ${MAX_ATTEMPTS} attempts)"
+
+        # --- Point Maven at the internal mirror ------------------------------
+        # EVERY mvn in this step has to resolve through the Artifactory virtual
+        # repo rather than Central: the app package build, the verification
+        # builds in the retry loop below, the agent's own `mvn` calls, and --
+        # specific to this task -- any TEST-SCOPED dependencies the agent adds
+        # to the pom (REST Assured), which must resolve on the first run after
+        # generation.
+        #
+        # Installed as ~/.m2/settings.xml rather than passed as `mvn -s` so that
+        # one mechanism covers both callers; the agent's mvn invocations are
+        # built by the agent and we cannot add flags to them.
+        if [ "$(workspaces.maven-settings.bound)" = "true" ] \
+           && [ -f "$(workspaces.maven-settings.path)/settings.xml" ]; then
+          mkdir -p "${HOME}/.m2"
+          cp "$(workspaces.maven-settings.path)/settings.xml" "${HOME}/.m2/settings.xml"
+          echo "Maven resolution: using settings.xml from the maven-settings workspace."
+        else
+          echo "WARNING: no maven-settings workspace bound. Maven will resolve from" \
+               "Central only, and a Lightwell .rhlw backport will NOT resolve."
+        fi
+
+        # This task forks off clone-repository and runs in parallel with the
+        # build/scan chain's Maven build, which writes target/ in this same shared
+        # PVC directory. Two Maven builds sharing target/ collide -- overwriting a
+        # file another task pod created fails with "Operation not permitted"
+        # (maven-resources-plugin can't reset the mtime of a foreign-owned file).
+        # So build the app, run the agent, and run the verification build in a
+        # private, pod-local copy of the repo (excluding the foreign-owned
+        # target/; tar re-owns to our uid on extract) and merge only the
+        # generated tests back at the end.
+        SCRATCH="/tekton/home/aitgt-work"
+        rm -rf "${SCRATCH}"; mkdir -p "${SCRATCH}"
+        tar -C "${WORKDIR}" --exclude=./target -cf - . | tar -C "${SCRATCH}" -xf -
+        cd "${SCRATCH}"
+
+        # --- Functional-test methodology skill ---------------------------------
+        # Mounted read-only from the agent-skills-test-generation-functional
+        # ConfigMap (pipelines/config/, synced by ssc-tekton-config). The task
+        # prompt below carries the WHAT (read the OpenAPI spec, add gap-filling
+        # *FT.java tests against the running app, verify); the skill carries
+        # the HOW (the functional execution contract and tool stack: deployed
+        # app only, black box, REST Assured, data self-arranged via the API).
+        # Fail loudly if it is missing: aider --read and claude
+        # --append-system-prompt would both silently continue with no methodology
+        # at all.
+        SKILL_DIR="${HOME}/agent-skills/test-generation-functional"
+        if [ ! -f "${SKILL_DIR}/SKILL.md" ]; then
+          echo "ERROR: ${SKILL_DIR}/SKILL.md is missing." \
+               "Is the agent-skills-test-generation-functional ConfigMap applied" \
+               "(pipelines/config/agent-skills-test-generation-functional.yaml)?"
+          exit 1
+        fi
+
+        # ---- Time budgets -----------------------------------------------------
+        # The PipelineRun has a 1h timeout, and on timeout Tekton cancels AND
+        # deletes the pod -- the step logs (including the agent tee) vanish, so
+        # a hung run leaves nothing to diagnose. Three defenses:
+        #   1. AGENT_TIMEOUT caps each agent invocation (a stalled model
+        #      endpoint otherwise holds a call for the OpenAI client's full
+        #      10-min timeout x retries; agentic-test-generation-issue-{nrjs5,
+        #      fv6fs,mqpfm} all burned the whole hour that way).
+        #   2. A step budget stops the retry loop from starting an attempt it
+        #      cannot finish, so the task fails on its OWN terms with results
+        #      written rather than being cancelled by the pipeline timeout.
+        #   3. The ATTEMPTS / LAST_ERROR results survive pod deletion.
+        # Declared BEFORE the app lifecycle below so app start/health-wait time
+        # counts against the budget.
+        AGENT_TIMEOUT=900          # 15 min per agent invocation
+        VERIFY_COST=360            # app-bound failsafe tests over HTTP; slower than unit mvn
+        STEP_BUDGET=$((45 * 60))   # 45 min: headroom under the 1h run timeout
+        STEP_START="$(date +%s)"
+        ATTEMPTS_RAN=0
+        LAST_ERROR_TEXT=""
+        budget_stopped=0
+
+        # ---- Application under test --------------------------------------------
+        # The functional contract targets a RUNNING application, so this task
+        # boots one in the pod: package the boot jar, start it in the
+        # background, and health-wait. (The pipeline's re-run-tests step later
+        # re-verifies with spring-boot:start/stop -- same jar, same port.) This
+        # app exposes /actuator/health permitAll, so no credentials are needed
+        # for the health probe (curl is baked into the ai-agent images).
+        echo "Packaging the application under test..."
+        mvn -B -q -Dstyle.color=never -DskipTests package
+        APP_JAR="$(ls target/*.jar 2>/dev/null | grep -v '\.jar\.original' | head -1 || true)"
+        if [ -z "${APP_JAR}" ]; then
+          echo "ERROR: no boot jar found under target/ (spring-boot repackage produces" \
+               "target/*.jar alongside the *.jar.original thin jar)." >&2
+          exit 1
+        fi
+        echo "Starting ${APP_JAR}..."
+        nohup java -jar "${APP_JAR}" > /tekton/home/app-under-test.log 2>&1 &
+        APP_PID=$!
+        # App teardown on any exit path, including the error exits below --
+        # a leaked java process would hold the port until pod teardown.
+        trap 'kill "${APP_PID:-0}" 2>/dev/null || true' EXIT
+        app_healthy=0
+        for i in $(seq 1 60); do
+          if curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1; then
+            app_healthy=1
+            break
+          fi
+          sleep 5
+        done
+        if [ "${app_healthy}" -ne 1 ]; then
+          echo "ERROR: application under test did not report healthy at" \
+               "${APP_BASE_URL}/actuator/health within 300s. Last 50 log lines:" >&2
+          tail -n 50 /tekton/home/app-under-test.log >&2 || true
+          exit 1
+        fi
+        echo "Application under test is healthy at ${APP_BASE_URL}"
+
+        # The app crashing mid-run (e.g. OOM) would otherwise surface as
+        # mysterious test failures; restart it between attempts instead.
+        ensure_app_running() {
+          if ! curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1; then
+            if ! kill -0 "${APP_PID:-0}" 2>/dev/null; then
+              echo "WARN: application under test died; restarting it."
+              nohup java -jar "${APP_JAR}" > /tekton/home/app-under-test.log 2>&1 &
+              APP_PID=$!
+            fi
+            for i in $(seq 1 60); do
+              curl -sf "${APP_BASE_URL}/actuator/health" > /dev/null 2>&1 && return 0
+              sleep 5
+            done
+            echo "WARN: application under test still unhealthy; tests this attempt will likely fail." >&2
+            return 1
+          fi
+          return 0
+        }
+
+        # Invoke the configured agent with the given prompt. Non-zero exits are
+        # tolerated (logged, not fatal) so the retry loop can still verify and
+        # retry. `timeout` wraps only the agent binary: on expiry it SIGTERMs
+        # the agent and the pipe closes behind it, so a killed attempt shows up
+        # downstream as "no test changes" (or partial changes, which the verify
+        # step judges on their own merits) rather than as a special error.
+        run_agent() {
+          local prompt="$1"
+          set +e
+          case "${AGENT}" in
+            aider)
+              timeout "${AGENT_TIMEOUT}" aider \
+                --model "${AIDER_MODEL}" \
+                --yes-always --no-auto-commits --no-check-update --no-gitignore \
+                --no-show-model-warnings \
+                --map-tokens 1024 --subtree-only \
+                --read "${SKILL_DIR}/SKILL.md" \
+                ${READ_ARGS} \
+                --message "${prompt}" \
+                2>&1 | tee /tekton/home/aider-generate-tests.log
+              ;;
+            claude-code|*)
+              # Headless, non-interactive run. --allowedTools limits what runs
+              # without prompting; acceptEdits lets it write files unattended.
+              # curl is allowed alongside mvn so the agent can probe the
+              # running application's responses (read-only) as the skill
+              # suggests.
+              timeout "${AGENT_TIMEOUT}" claude -p "${prompt}" \
+                --model "${ANTHROPIC_MODEL}" \
+                --append-system-prompt "$(cat "${SKILL_DIR}/SKILL.md")" \
+                --permission-mode acceptEdits \
+                --allowedTools "Read,Write,Edit,Glob,Grep,Bash(mvn:*),Bash(curl:*)" \
+                --output-format json | tee /tekton/home/claude-generate-tests.json
+              ;;
+          esac
+          local rc=$?
+          set -e
+          [ "${rc}" -ne 0 ] && echo "WARN: agent exited ${rc}; continuing to verification."
+          return 0
+        }
+
+        PROMPT="You are working in a Maven project at the current directory, and
+        the application it builds is RUNNING at ${APP_BASE_URL} (already
+        healthy -- do not try to start or restart it). Follow the
+        test-generation-functional skill supplied as read-only context: first
+        read the OpenAPI specification, then evaluate the existing functional
+        tests (*FT.java) for coverage of the spec's operations, then add new
+        JUnit 5 functional tests under src/test/java -- named *FT.java,
+        mirroring the package layout -- that fill the coverage gaps it
+        identifies, driving the running application through its service
+        interface with REST Assured exactly as the skill prescribes: target
+        APP_BASE_URL, authenticate with APP_USERNAME/APP_PASSWORD from the
+        environment, black-box assertions on responses only, each test
+        arranging its own data through the API, no external applications. You
+        may add TEST-SCOPED dependencies and test-only build configuration to
+        pom.xml when the skill's tool stack requires them (REST Assured, a
+        Failsafe binding, a functional profile); change nothing else in the
+        build. Do NOT modify application source under src/main, and do NOT
+        modify existing tests -- only add new test files (plus those
+        test-scoped pom additions). If the meaningful behaviors are already
+        covered, add no tests. After writing tests, run 'mvn -B -q
+        -Dstyle.color=never test-compile failsafe:integration-test
+        failsafe:verify -Dit.test=<your test classes>' and iterate until the
+        tests you added pass. ${TEST_INSTRUCTIONS}"
+
+        # --- One-time setup for the configured coding agent ---
+        case "${AGENT}" in
+          aider)
+            # OpenAI-compatible coding agent (gpt-oss, Granite, any vLLM/RHOAI/
+            # Ollama/watsonx endpoint). litellm reads OPENAI_API_BASE/OPENAI_API_KEY.
+            [ -n "${AI_BASE_URL:-}" ] && export OPENAI_API_BASE="${AI_BASE_URL}"
+            export OPENAI_API_KEY="${OPENAI_API_KEY:-placeholder}"
+            case "${MODEL}" in */*) AIDER_MODEL="${MODEL}";; *) AIDER_MODEL="openai/${MODEL}";; esac
+            # Pass the main sources and the OpenAPI spec as read-only reference
+            # (the spec IS the service interface under test); --map-tokens
+            # bounds the repo-map context and --subtree-only keeps aider scoped
+            # to this project dir. --no-show-model-warnings silences litellm's
+            # registry lookup for self-hosted models (gpt-oss/Granite aren't in
+            # its cost table).
+            READ_ARGS=""
+            for p in ${SOURCE_PATHS:-src/main/java openapi/openapi.yaml}; do READ_ARGS="${READ_ARGS} --read ${p}"; done
+            ;;
+          claude-code|*)
+            # Configure Claude Code auth from ai-agent-config / ai-agent-secret.
+            case "${AI_PROVIDER:-anthropic}" in
+              bedrock) export CLAUDE_CODE_USE_BEDROCK=1 ;;
+              vertex)  export CLAUDE_CODE_USE_VERTEX=1 ;;
+              gateway) export ANTHROPIC_BASE_URL="${AI_BASE_URL:?AI_BASE_URL required for gateway provider}" ;;
+              anthropic|*) : ;;
+            esac
+            export ANTHROPIC_MODEL="${MODEL}"
+            ;;
+        esac
+
+        # ---- Bounded generate -> verify -> retry loop ----
+        # The TASK owns the retry loop rather than trusting the agent to self-
+        # verify: aider is invoked without --auto-test and cannot run Maven, so on
+        # its own its "iterate until tests pass" instruction never actually runs.
+        # Each attempt runs the agent, then compiles+runs ONLY the test classes it
+        # touched this run; on failure the Maven output is fed back into the next
+        # attempt's prompt so the agent fixes (not rewrites) what it produced.
+        attempt=1
+        feedback=""
+        passed=0
+        tests_csv=""
+        while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
+          # Elapsed-time guard: do not start an attempt we cannot finish. One
+          # attempt costs up to AGENT_TIMEOUT (agent) + VERIFY_COST (mvn); if
+          # less than that remains of the step budget, stop here so the task
+          # terminates on its own terms -- with results written and logs
+          # flushed -- instead of being cancelled mid-attempt by the 1h
+          # PipelineRun timeout.
+          elapsed=$(( $(date +%s) - STEP_START ))
+          if [ $((elapsed + AGENT_TIMEOUT + VERIFY_COST)) -gt "${STEP_BUDGET}" ]; then
+            echo "Step time budget nearly exhausted (${elapsed}s of ${STEP_BUDGET}s" \
+                 "elapsed); stopping after ${ATTEMPTS_RAN} completed attempt(s)."
+            budget_stopped=1
+            break
+          fi
+
+          echo "=== test-generation attempt ${attempt}/${MAX_ATTEMPTS} ==="
+          ensure_app_running || true
+
+          prompt="${PROMPT}"
+          if [ -n "${feedback}" ]; then
+            prompt="${PROMPT}
+
+        Your previous attempt left FAILING tests. Do NOT start over -- fix the tests
+        you already wrote under src/test so they compile and pass. Here is the tail
+        of the Maven output from that attempt:
+        ${feedback}"
+          fi
+          run_agent "${prompt}"
+          ATTEMPTS_RAN=$((ATTEMPTS_RAN+1))
+
+          # Which files did the agent add/change this run? git status
+          # --porcelain emits "XY <path>"; strip the 3-char status prefix.
+          # pom.xml is watched alongside src/test: the functional contract
+          # lets the agent add TEST-SCOPED dependencies (REST Assured), and
+          # those changes must reach verification, the merge-back, and the
+          # MR exactly like the test files do.
+          git add -A 2>/dev/null || true
+          changed="$(git status --porcelain -- 'src/test' pom.xml 2>/dev/null | cut -c4-)"
+          if [ -z "${changed}" ]; then
+            echo "Agent produced no test changes on attempt ${attempt}."
+            attempt=$((attempt+1))
+            continue
+          fi
+
+          # Derive failsafe -Dit.test class names from the changed test sources.
+          tests_csv=""
+          while IFS= read -r f; do
+            [ -z "${f}" ] && continue
+            case "${f}" in
+              *Test.java|*Tests.java|*TestCase.java|Test*.java|*IT.java|*FT.java)
+                cls="$(basename "${f}" .java)"
+                tests_csv="${tests_csv:+${tests_csv},}${cls}" ;;
+            esac
+          done <<< "${changed}"
+
+          if [ -z "${tests_csv}" ]; then
+            echo "Changed files under src/test but none are recognizable test classes; nothing to verify."
+            break
+          fi
+
+          # Verify ONLY the generated tests, so unrelated/pre-existing suite
+          # failures can't fail this task. Failsafe is invoked DIRECTLY
+          # (test-compile + failsafe:integration-test + failsafe:verify) rather
+          # than through the lifecycle's `verify` phase, because the application
+          # repo's pom may not declare a failsafe binding (or a functional
+          # profile) yet -- and without a binding, plain `mvn verify` silently
+          # runs NO *FT.java tests at all. Direct invocation runs them
+          # regardless, which is also exactly what the skill's Step 3 tells
+          # the agent to run. -Dit.test selects the generated classes, and
+          # APP_BASE_URL/APP_USERNAME/APP_PASSWORD propagate from this step's
+          # environment into the forked surefire/failsafe JVM.
+          echo "Verifying generated functional tests: ${tests_csv}"
+          set +e
+          build_log="$(mvn -B -q -Dstyle.color=never \
+              -Dit.test="${tests_csv}" \
+              -Dsurefire.failIfNoSpecifiedTests=false \
+              -Dit.failIfNoSpecifiedTests=false \
+              test-compile failsafe:integration-test failsafe:verify 2>&1)"
+          rc=$?
+          set -e
+          printf '%s\n' "${build_log}"
+          if [ "${rc}" -eq 0 ]; then
+            passed=1
+            break
+          fi
+
+          echo "Generated tests failed on attempt ${attempt} (mvn rc=${rc})."
+          feedback="$(printf '%s\n' "${build_log}" | tail -n 120)"
+          # Tekton ships results through the container termination message,
+          # which is size-capped; ~1 kB keeps this inside it.
+          LAST_ERROR_TEXT="$(printf '%s\n' "${build_log}" | tail -c 1024)"
+          attempt=$((attempt+1))
+        done
+
+        # No verifiable tests were produced across all attempts -> nothing to PR;
+        # skip gracefully (the pipeline guards re-run-tests/open-pr on TESTS_ADDED).
+        if [ -z "${tests_csv}" ]; then
+          printf '0' > "$(results.TESTS_ADDED.path)"
+          printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+          printf '%s' "${LAST_ERROR_TEXT}" > "$(results.LAST_ERROR.path)"
+          if [ "${budget_stopped}" -ne 0 ]; then
+            # Not the graceful "behaviors already covered" outcome: the step
+            # budget ran out before any passing tests existed (e.g. a stalled
+            # model endpoint burning attempts). Fail loud rather than report a
+            # green run that produced nothing.
+            echo "ERROR: step time budget exhausted with no passing tests" \
+                 "(${ATTEMPTS_RAN} attempt(s) run; last agent attempts produced" \
+                 "no verifiable changes)." >&2
+            exit 1
+          fi
+          echo "No test classes were generated; nothing to add."
+          exit 0
+        fi
+
+        # Tests were generated but never passed within the retry budget: fail loud
+        # so the run is visible, rather than opening a PR with broken tests.
+        if [ "${passed}" -ne 1 ]; then
+          printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+          printf '%s' "${LAST_ERROR_TEXT}" > "$(results.LAST_ERROR.path)"
+          echo "ERROR: generated tests still failing after ${ATTEMPTS_RAN} attempt(s)." >&2
+          exit 1
+        fi
+
+        # Merge the passing generated test files (and the test-scoped pom
+        # additions, if any) back onto the shared workspace so re-run-tests and
+        # open-pr pick them up. Only touch src/test and pom.xml.
+        git add -A 2>/dev/null || true
+        CHANGED="$(git status --porcelain -- 'src/test' pom.xml 2>/dev/null | cut -c4-)"
+        COUNT=0
+        if [ -n "${CHANGED}" ]; then
+          while IFS= read -r f; do
+            [ -z "${f}" ] && continue
+            mkdir -p "${WORKDIR}/$(dirname "${f}")"
+            cp -f "${SCRATCH}/${f}" "${WORKDIR}/${f}"
+            COUNT=$((COUNT+1))
+          done <<< "${CHANGED}"
+        fi
+        printf '%s' "${COUNT}" > "$(results.TESTS_ADDED.path)"
+        printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+        : > "$(results.LAST_ERROR.path)"
+        echo "Staged test file changes: ${COUNT}"
+  # The functional-test methodology skill (SKILL.md), mounted read-only at
+  # ${HOME}/agent-skills/test-generation-functional. Lives in
+  # pipelines/config/agent-skills-test-generation-functional.yaml so it
+  # ships with the rest of the Tekton config and no image change is needed.
+  volumes:
+    - name: agent-skills
+      configMap:
+        name: agent-skills-test-generation-functional

@@ -109,7 +109,10 @@ gitlab:
           # webhooks and the Tekton GitLab interceptors always agree without a
           # secret ever living in git. Both hooks use the same token.
           webhooks:
-            # `/remediate` and `/generate-tests` in an issue comment.
+            # `/remediate`, `/generate-tests`, `/generate-tests-functional`,
+            # and `/generate-tests-integration` in an issue comment. One hook
+            # (Note Hook only) feeds the agentic-issue-commands EventListener;
+            # each trigger's cel filter picks its command.
             - name: agentic-issue-commands
               # Leave empty to derive the EventListener Route hostname,
               # `<name>-<pipeline namespace>.<subdomain>`.
