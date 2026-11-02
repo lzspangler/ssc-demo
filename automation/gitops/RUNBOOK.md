@@ -41,6 +41,48 @@ oc get storageclass                            # one must be (default)
 oc get storagecluster -A                       # ODF — see below
 ```
 
+**Grant the Argo CD controller cluster-admin before anything else.** On a
+fresh cluster the application-controller's service account has no write
+rights outside its own namespace — the first Application (Artifactory, §1)
+stalls with `cannot patch resource ... in the namespace "artifactory"`
+against every kind except ConfigMaps. The demo genuinely needs the grant, not
+just this Application: the app-of-apps syncs namespaces (`CreateNamespace`),
+SCCs (`artifactory-scc`), ClusterRoleBindings (trigger RBAC, GitLab seeding
+jobs) and OLM Operators (Pipelines, RHTPA) through the same controller. It
+must be re-done if the GitOps instance is ever recreated:
+
+```sh
+oc adm policy add-cluster-role-to-user cluster-admin \
+  system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller
+oc auth can-i patch services -n artifactory \
+  --as=system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller   # must print yes
+```
+
+**Raise the Argo CD application-controller's memory limit before §5.** The
+default `openshift-gitops` instance ships the controller with a 2Gi limit —
+not enough to reconcile this app-of-apps. The initial all-at-once bootstrap
+(GitLab + Quay + RHTAS + RHTPA + Tekton charts, plus a full cluster's worth
+of watched objects) OOM-kills it repeatedly, and the failure looks nothing
+like a memory problem: Applications sit `OutOfSync`/`Running` with
+`waiting for healthy state of ...` messages naming trivially-healthy
+resources (a ConfigMap, a Namespace, a ServiceAccount), later-wave resources
+show `Missing`, GitLab never deploys a single pod (so anything tracking the
+GitLab-hosted gitops repo stays `Unknown` with a 503), and progress only
+inches forward between crashes. Check for the signature first:
+
+```sh
+oc -n openshift-gitops get pod openshift-gitops-application-controller-0 \
+  -o jsonpath='{"restarts="}{.status.containerStatuses[0].restartCount}{" "}{.status.containerStatuses[0].lastState}{"\n"}'
+# restarts>0 with {"exitCode":137,"reason":"OOMKilled"} means yes
+```
+
+Fix (4–8Gi is comfortable; the operator updates the StatefulSet in place):
+
+```sh
+oc -n openshift-gitops patch argocd openshift-gitops --type=merge \
+  -p '{"spec":{"controller":{"resources":{"requests":{"memory":"2Gi"},"limits":{"memory":"8Gi"}}}}}'
+```
+
 **ODF is a hard requirement** for two components: RHTPA's default `s3` storage
 and Quay's managed object storage both raise an `ObjectBucketClaim` against
 NooBaa in `openshift-storage`.
@@ -307,6 +349,12 @@ Expected behaviour while you wait:
 * **Quay takes ~15 minutes** and its `quay-noobaa` Job runs first, patching
   ODF's default BackingStore from 256Mi to 1Gi. Below ~400Mi the NooBaa agent
   pod is rejected and no bucket is ever provisioned.
+
+If many Applications are stuck at once — each `Running` with a
+`waiting for healthy state of ...` message that never resolves — suspect the
+controller before the components: check the application-controller pod's
+restart count and `lastState` (see the §0 note; OOMKilled there stalls every
+in-flight sync at once).
 
 If something is stuck, the Application's `.status.operationState.message` and
 then the Job logs are where the answer is:
