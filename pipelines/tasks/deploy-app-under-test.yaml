@@ -23,6 +23,14 @@ spec:
     the finally-task cleanup (cleanup-app-under-test) -- or, if the run is
     killed so hard that even finally tasks never run, garbage collection when
     the PipelineRun object is eventually deleted -- removes it all.
+
+    SCC notes: the generated Deployment is restricted-v3-compatible by
+    construction (user namespace via hostUsers: false, non-root with an
+    admission-assigned uid, all capabilities dropped, seccomp runtime/default)
+    -- it needs no special SCC. The build-and-push step of THIS task's pod,
+    however, adds SETFCAP for buildah and therefore runs under the Pipelines
+    operator's pipelines-scc (granted to the `pipeline` service account),
+    exactly like the buildah-rhtap CI task.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -70,7 +78,7 @@ spec:
   steps:
     - name: build-and-push
       # Same image/conventions as buildah-rhtap: vfs storage driver, the
-      # SETFCap capability and the /var/lib/containers emptyDir below are what
+      # SETFCAP capability and the /var/lib/containers emptyDir below are what
       # make buildah work under the Pipelines operator's SCC.
       image: registry.access.redhat.com/ubi9/buildah@sha256:4b82b66a71857c5167abd344cd63bebe3b8026b04b1f35fde4789868dae0af8d
       workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
@@ -136,8 +144,16 @@ spec:
       securityContext:
         capabilities:
           add:
-            # needed so buildah can write to the mounted /var/lib/containers directory
-            - SETFCap
+            # Needed so buildah can set file capabilities when extracting image
+            # layers into the mounted /var/lib/containers directory (same as
+            # buildah-rhtap). MUST be spelled SETFCAP, all caps: OpenShift's SCC
+            # capability matching is case-sensitive, and pipelines-scc -- the
+            # Pipelines operator SCC that admits this pod for the `pipeline`
+            # service account -- allows exactly "SETFCAP". The Tekton-catalog
+            # spelling "SETFCap" is rejected by every SCC on the cluster
+            # (agentic-test-generation-functional-issue-94tc5 failed exactly
+            # that way: "capability may not be added" against all ~20 SCCs).
+            - SETFCAP
       volumeMounts:
         - mountPath: /var/lib/containers
           name: varlibcontainers
@@ -191,10 +207,32 @@ spec:
                 app.kubernetes.io/name: app-under-test
                 app.kubernetes.io/instance: $(params.APP_NAME)
             spec:
+              # restricted-v3-clean pod (the cluster's most restrictive SCC must
+              # be able to run the app under test):
+              #   - hostUsers: false -- REQUIRED by restricted-v3 (it mandates a
+              #     user namespace; leaving it null is a validation error there)
+              #   - runAsNonRoot with NO pinned runAsUser -- the restricted SCCs
+              #     enforce MustRunAsRange 1000-65534 and admission assigns a uid
+              #     in that range. The ubi9/openjdk-17 image's nominal user 185
+              #     is BELOW that minimum, so pinning it would be rejected.
+              #   - seccomp runtime/default, all capabilities dropped, no
+              #     privilege escalation.
+              # Any assigned uid works: the jar is COPY'd world-readable, and the
+              # app's state is in-memory (H2 mem:) so it writes nothing.
+              hostUsers: false
+              securityContext:
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
               containers:
                 - name: app
                   image: ${IMAGE}
                   imagePullPolicy: IfNotPresent
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    capabilities:
+                      drop:
+                        - ALL
                   ports:
                     - name: http
                       containerPort: $(params.PORT)
