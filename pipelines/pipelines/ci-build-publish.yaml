@@ -352,16 +352,12 @@ spec:
           operator: in
           values: ["succeeded"]
 
-  # The finally task above talks to the Kubernetes API to create a PipelineRun.
-  # It runs as tekton-triggers-sa (the same SA the EventListeners use, whose
-  # RBAC lives in triggers/agentic-issue-triggers.yaml) because that SA already
-  # holds create-pipelineruns in this namespace; the run's default `pipeline`
-  # SA is not guaranteed to. If you apply ci-build-publish without the trigger
-  # stack, either apply that RBAC too or drop this override after verifying
-  # `oc -n tssc-app-ci auth can-i create pipelineruns --as system:serviceaccount:tssc-app-ci:pipeline`.
-  taskRunSpecs:
-    - pipelineTaskName: start-gitops-cd-dev
-      serviceAccountName: tekton-triggers-sa
+  # NOTE: the finally task start-gitops-cd-dev is pinned to tekton-triggers-sa
+  # via `taskRunSpecs` on the PipelineRun, in triggers/ci-build-triggers.yaml.
+  # taskRunSpecs is a PipelineRun-only field: no Tekton Pipeline CRD declares
+  # it, so the API server silently prunes it from here (syncs "succeed" but
+  # Argo CD stays OutOfSync forever). See the note there for the RBAC
+  # reasoning -- the trigger stack must be applied for that SA to exist.
 
   workspaces:
     - name: workspace

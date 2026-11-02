@@ -13,9 +13,16 @@ repo, on a brand-new OpenShift cluster. Run from this directory
 - **`oc` logged in as cluster-admin.** Required: the custom SCC is cluster-scoped,
   and you create a cluster-scoped Argo CD Application.
 - **OpenShift GitOps (Argo CD) installed** and the default `openshift-gitops`
-  Argo CD instance running. Its application-controller has cluster-admin by
-  default, which it needs to apply the SCC. Verify:
+  Argo CD instance running, **with its application-controller granted
+  cluster-admin** (see RUNBOOK §0 — on a fresh cluster the controller has no
+  write rights outside its own namespace, and this Application stalls with
+  `cannot patch resource ... in the namespace "artifactory"` on everything
+  except ConfigMaps). Grant and verify:
   ```sh
+  oc adm policy add-cluster-role-to-user cluster-admin \
+    system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller
+  oc auth can-i patch services -n artifactory \
+    --as=system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller
   oc -n openshift-gitops get pods | grep application-controller   # Running
   ```
 - **A default StorageClass with RWO volumes.** The reference cluster uses

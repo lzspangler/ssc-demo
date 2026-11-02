@@ -326,31 +326,11 @@ spec:
         - name: APP_NAME
           value: $(context.pipelineRun.name)
 
-  # Pin the ephemeral-resource and K8s-API-touching tasks to the `pipeline`
-  # service account: the deploy/reset/cleanup RBAC (Role
-  # app-under-test-lifecycle + system:image-builder, in
-  # tasks/deploy-app-under-test.yaml) is granted to it, and the generation
-  # task's health-check/reset/log-fetch helpers authenticate with the task
-  # pod's SA token. Pinning is deterministic: without taskRunSpecs the SA
-  # comes from the PipelineRun's subject, which manual runs, the webhook, and
-  # the console each set differently.
-  taskRunSpecs:
-    - pipelineTaskName: deploy-app-under-test
-      taskServiceSpecs:
-        taskPodTemplate:
-          serviceAccountName: pipeline
-    - pipelineTaskName: ai-generate-tests-functional
-      taskServiceSpecs:
-        taskPodTemplate:
-          serviceAccountName: pipeline
-    - pipelineTaskName: reset-app-under-test
-      taskServiceSpecs:
-        taskPodTemplate:
-          serviceAccountName: pipeline
-    - pipelineTaskName: cleanup-app-under-test
-      taskServiceSpecs:
-        taskPodTemplate:
-          serviceAccountName: pipeline
+  # NOTE: the deploy/reset/cleanup/generation tasks are pinned to the `pipeline`
+  # service account via `taskRunSpecs` on the PipelineRun, in
+  # triggers/agentic-issue-triggers.yaml. taskRunSpecs is a PipelineRun-only
+  # field: no Tekton Pipeline CRD declares it, so the API server silently
+  # prunes it from here (syncs "succeed" but Argo CD stays OutOfSync forever).
   workspaces:
     - name: workspace
     - name: maven-settings
