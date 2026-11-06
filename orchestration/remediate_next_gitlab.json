@@ -1,0 +1,148 @@
+{
+  "schema_version": "2.0.0",
+  "name": "Remediate Next Gitlab",
+  "description": "New workflow",
+  "triggers": [
+    {
+      "id": "activity_92cd47c8_b8ad_4854_8d14_89ec7d2334e4",
+      "type": "manual_trigger",
+      "name": "Manually Trigger",
+      "parameters": {},
+      "position": {
+        "x": 0,
+        "y": 318
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "id": "activity_2311105a_d50f_4f6b_b2e0_b3c1ba2bc702",
+      "type": "http_request",
+      "name": "Comment /remediate on selected Issue",
+      "parameters": {
+        "method": "POST",
+        "url": "${activity_c9bacf41_52b9_46f1_9d2f_06c1bd0f404c.result.content}",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "body": "/remediate"
+        },
+        "credential_id": "b06d0f27-9afb-48f9-8e90-2b336d3c5657"
+      },
+      "settings": {},
+      "position": {
+        "x": 1920,
+        "y": -3
+      }
+    },
+    {
+      "id": "activity_7f617cb7_f02d_462c_82dd_60d2dbc507e0",
+      "type": "script",
+      "name": "Output rejected URL",
+      "parameters": {
+        "language": "bash",
+        "code": "echo ${activity_c9bacf41_52b9_46f1_9d2f_06c1bd0f404c.result.content} was rejected"
+      },
+      "settings": {},
+      "position": {
+        "x": 1920,
+        "y": 384
+      }
+    },
+    {
+      "id": "activity_de63a31a_41b4_4acc_8a50_aa70cb7b4242",
+      "type": "http_request",
+      "name": "GET Open Issues from Gitlab",
+      "parameters": {
+        "method": "GET",
+        "url": "https://gitlab-gitlab.apps.cluster-jz4hr.dyn.redhatworkshops.io/api/v4/projects/1/issues?state=opened",
+        "credential_id": "b06d0f27-9afb-48f9-8e90-2b336d3c5657"
+      },
+      "settings": {},
+      "position": {
+        "x": 360,
+        "y": 172.5
+      }
+    },
+    {
+      "id": "activity_4e7518e4_8b44_45c9_b983_7f3fea28bd08",
+      "type": "script",
+      "name": "Pull out Title, Desc, URL from Gitlab Issues",
+      "parameters": {
+        "language": "python",
+        "code": "import json\r\n\r\nissues = ${activity_de63a31a_41b4_4acc_8a50_aa70cb7b4242.body}\r\n\r\nresult = [\r\n    {\r\n        \"title\": issue.get(\"title\"),\r\n        \"description\": issue.get(\"description\"),\r\n        \"notes_link\": issue.get(\"_links\", {}).get(\"notes\"),\r\n    }\r\n    for issue in issues\r\n]\r\n\r\nprint(json.dumps(result, indent=2, ensure_ascii=False))"
+      },
+      "settings": {},
+      "position": {
+        "x": 720,
+        "y": 256
+      }
+    },
+    {
+      "id": "activity_c9bacf41_52b9_46f1_9d2f_06c1bd0f404c",
+      "type": "agentic",
+      "name": "Select Next Gitlab Issue to Remediate",
+      "parameters": {
+        "prompt": "Read this list of CVE issues and select the next most important one to remediate. Output a url in the format https://GITLAB_URL/api/v4/projects/PROJECT_ID/issues/ISSUE_ID/notes where ISSUE_ID is the chosen issue to remediate. Do not output anything other than this url with the VARIABLES replaced. \n\n${activity_4e7518e4_8b44_45c9_b983_7f3fea28bd08.stdout}",
+        "llm_model_id": "becdade7-8cb8-458f-8d2e-1ef7a0ef8251",
+        "tool_selection_strategy": "NONE",
+        "credential_id": "90b61910-b67b-4469-84dd-3c248c1c0cbf"
+      },
+      "settings": {},
+      "position": {
+        "x": 1080,
+        "y": 266.5
+      }
+    },
+    {
+      "id": "activity_1e8d0fc8_d284_448d_bcaa_546984a7ee7f",
+      "type": "approval",
+      "name": "Human Validation of Issue URL Choice",
+      "parameters": {
+        "approver_users": [
+          "admin"
+        ],
+        "approver_groups": [
+          "users",
+          "admins"
+        ],
+        "prompt": "Verify ${activity_c9bacf41_52b9_46f1_9d2f_06c1bd0f404c.result.content} is a valid url to a project and issue that you want to remediate",
+        "fallback_decision": "reject"
+      },
+      "settings": {},
+      "position": {
+        "x": 1560,
+        "y": 258.5
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "activity_1e8d0fc8_d284_448d_bcaa_546984a7ee7f",
+      "to": "activity_7f617cb7_f02d_462c_82dd_60d2dbc507e0",
+      "from_port": "rejected"
+    },
+    {
+      "from": "activity_92cd47c8_b8ad_4854_8d14_89ec7d2334e4",
+      "to": "activity_de63a31a_41b4_4acc_8a50_aa70cb7b4242"
+    },
+    {
+      "from": "activity_de63a31a_41b4_4acc_8a50_aa70cb7b4242",
+      "to": "activity_4e7518e4_8b44_45c9_b983_7f3fea28bd08"
+    },
+    {
+      "from": "activity_4e7518e4_8b44_45c9_b983_7f3fea28bd08",
+      "to": "activity_c9bacf41_52b9_46f1_9d2f_06c1bd0f404c"
+    },
+    {
+      "from": "activity_1e8d0fc8_d284_448d_bcaa_546984a7ee7f",
+      "to": "activity_2311105a_d50f_4f6b_b2e0_b3c1ba2bc702",
+      "from_port": "approved"
+    },
+    {
+      "from": "activity_c9bacf41_52b9_46f1_9d2f_06c1bd0f404c",
+      "to": "activity_1e8d0fc8_d284_448d_bcaa_546984a7ee7f"
+    }
+  ]
+}
