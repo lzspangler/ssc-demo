@@ -28,7 +28,10 @@ spec:
       default: "420"
   steps:
     - name: reset
-      image: registry.redhat.io/openshift/oc-cli:latest
+      # In-cluster `cli` ImageStream -- registry.redhat.io has no `openshift/
+      # oc-cli` repo, so that reference always fails with "unauthorized"
+      # (see deploy-app-under-test.yaml for the full note).
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
