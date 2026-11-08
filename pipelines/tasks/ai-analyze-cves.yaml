@@ -508,11 +508,39 @@ spec:
         # Wrap every model call so a provider throttle (429 / RESOURCE_EXHAUSTED)
         # or a dropped connection backs off and retries instead of crashing the
         # task and losing the batches already analyzed.
+        #
+        # A call that fails AFTER already running for minutes is different: it
+        # hit the ~300s hard per-request connection cut the network path to
+        # the AI gateway enforces (reproduced 2026-11-08: streamed and
+        # non-streamed calls alike are cut at 300-302s whenever the shared
+        # gateway is slow enough that generation needs longer). Retrying the
+        # identical request can never succeed, so surface a distinct signal
+        # and let analyze_batch shrink the request instead.
+        class CallCutDeadline(Exception):
+            pass
+        SLOW_CALL_SECS = float(os.environ.get("AI_SLOW_CALL_SECS", "240"))
+        # Timestamps of recent connection cuts, cleared by any successful
+        # call. Two cuts with no success between them means a gateway
+        # BROWNOUT -- the shared workshop gateway stops serving requests of
+        # any size for minutes at a time (observed 2026-11-08: every request,
+        # down to single-CVE prompts of a few hundred chars, cut at 300-302s
+        # for ~30 minutes). analyze_batch's pre-flight check uses this to
+        # stop burning 300s per doomed attempt.
+        cut_times = []
         def _call_with_backoff(user):
             for attempt in range(1, MODEL_MAX_RETRIES + 1):
+                t0 = time.time()
                 try:
-                    return call_model(user)
+                    result = call_model(user)
+                    cut_times.clear()
+                    return result
                 except RETRYABLE as e:
+                    if time.time() - t0 > SLOW_CALL_SECS:
+                        cut_times.append(time.time())
+                        raise CallCutDeadline(
+                            "%s after the call had already run %.0fs (past the "
+                            "~300s per-request connection cut)"
+                            % (type(e).__name__, time.time() - t0))
                     if attempt == MODEL_MAX_RETRIES:
                         print("model call failed after %d attempts: %s"
                               % (attempt, e), file=sys.stderr)
@@ -564,7 +592,30 @@ spec:
         if not isinstance(mustfix_arr, list):
             mustfix_arr = []
 
+        # CVEs whose analysis died on the connection cut during a gateway
+        # brownout. The main batch loop drops nothing on the spot: these get
+        # re-analyzed in end-of-run passes (see the deferred loop below),
+        # because the gateway's throughput oscillates on minute scales -- a
+        # batch that is un-winnable now often completes ten minutes later.
+        cut_failing = []
+
         def analyze_batch(items, tag):
+            # Brownout pre-flight: if the last two calls were both cut with no
+            # success between them, the gateway is not serving ANYTHING right
+            # now -- during the sustained brownouts observed on the workshop
+            # cluster (2026-11-08, ~30 min at a time), requests down to
+            # single-CVE prompts of a few hundred chars die at the ~300s cut,
+            # so splitting further is futile. Don't burn another 300s
+            # discovering that; defer this batch straight to the end-of-run
+            # passes, which run after a pause long enough for the gateway to
+            # recover. Any successful call clears cut_times, so a healthy
+            # gateway never sees this path.
+            if len(cut_times) >= 2:
+                print("%s: gateway brownout (last %d calls cut); deferring "
+                      "%d CVE(s) without trying" % (tag, len(cut_times), len(items)),
+                      file=sys.stderr)
+                cut_failing.extend(items)
+                return []
             batch_ids = set(filter(None, (_id_of(x) for x in items)))
             vuln_b = _cap(_trim_vuln(vuln_raw, batch_ids), VULN_CHAR_BUDGET)
             mf_b = json.dumps(items)
@@ -572,16 +623,46 @@ spec:
             print("%s: %d CVEs, prompt chars mustfix=%d vuln=%d report=%d"
                   % (tag, len(items), len(mf_b), len(vuln_b), len(report)), file=sys.stderr)
             last = ""
-            for attempt in (1, 2):
-                t0 = time.time()
-                last = _call_with_backoff(user_b)
+            try:
+                for attempt in (1, 2):
+                    t0 = time.time()
+                    last = _call_with_backoff(user_b)
+                    decs = _extract_decisions(last)
+                    if decs:
+                        print("%s: %d decisions in %.0fs" % (tag, len(decs),
+                                                             time.time() - t0), file=sys.stderr)
+                        return decs
+                    print("%s attempt %d: no decisions (raw len=%d)" % (tag, attempt, len(last)),
+                          file=sys.stderr)
+            except CallCutDeadline as e:
+                if len(items) > 1:
+                    # This batch's combined output cannot be generated within
+                    # the per-request deadline at the gateway's current speed.
+                    # Halve it and recurse: each half asks for roughly half the
+                    # output tokens, so the calls eventually fit under the cut.
+                    # At healthy gateway speeds this never triggers.
+                    mid = (len(items) + 1) // 2
+                    print("%s: %s; splitting into %d+%d CVEs"
+                          % (tag, e, mid, len(items) - mid), file=sys.stderr)
+                    return (analyze_batch(items[:mid], tag + "a")
+                            + analyze_batch(items[mid:], tag + "b"))
+                # A single-CVE call cut at the deadline: the gateway is too
+                # slow for even one decision right now. Give it one more
+                # backoff cycle (the gateway's speed oscillates minute to
+                # minute); if that fails too, defer the CVE to the end-of-run
+                # passes instead of dropping it outright.
+                print("%s: %s; single-CVE batch, one more try" % (tag, e),
+                      file=sys.stderr)
+                try:
+                    last = _call_with_backoff(user_b)
+                except Exception as e2:
+                    print("%s: deferring %d CVE(s) to the end-of-run pass (%s)"
+                          % (tag, len(items), type(e2).__name__), file=sys.stderr)
+                    cut_failing.extend(items)
+                    return []
                 decs = _extract_decisions(last)
                 if decs:
-                    print("%s: %d decisions in %.0fs" % (tag, len(decs),
-                                                         time.time() - t0), file=sys.stderr)
                     return decs
-                print("%s attempt %d: no decisions (raw len=%d)" % (tag, attempt, len(last)),
-                      file=sys.stderr)
             print("%s: giving up after retries; raw:\n%s" % (tag, last[:2000]), file=sys.stderr)
             return []
 
@@ -596,10 +677,41 @@ spec:
                 if i > 1 and BATCH_PAUSE_SECS > 0:
                     time.sleep(BATCH_PAUSE_SECS)
                 decisions_in += analyze_batch(b, "batch %d/%d" % (i, len(batches)))
+            # Deferred passes: re-analyze everything that died on the
+            # connection cut. Two passes with a pause between them -- the
+            # gateway's brownouts observed on the workshop cluster last
+            # tens of minutes, so the pause is minutes too; a batch that
+            # could not get through during the main loop often sails through
+            # here. Each pass resets the brownout detector (cut_times) so it
+            # gets a fresh detection budget; CVEs cut again during a deferred
+            # pass get one more; whatever still fails after that is genuinely
+            # gone (the decision validation below dedupes by CVE, so a CVE
+            # recovered here can never be double-counted).
+            for retry_pass in (1, 2):
+                if not cut_failing:
+                    break
+                time.sleep(float(os.environ.get("AI_DEFER_PAUSE_SECS", "300")))
+                pending = cut_failing[:]
+                cut_failing.clear()
+                cut_times.clear()
+                dbatches = [pending[k:k + BATCH_SIZE]
+                            for k in range(0, len(pending), BATCH_SIZE)]
+                print("deferred pass %d: retrying %d CVEs in %d batch(es)"
+                      % (retry_pass, len(pending), len(dbatches)), file=sys.stderr)
+                for j, db in enumerate(dbatches, 1):
+                    if BATCH_PAUSE_SECS > 0:
+                        time.sleep(BATCH_PAUSE_SECS)
+                    decisions_in += analyze_batch(
+                        db, "deferred pass %d batch %d/%d"
+                            % (retry_pass, j, len(dbatches)))
         else:
             # Must-fix wasn't a JSON array we could split; try one whole-list call.
             vuln_all = _cap(_trim_vuln(vuln_raw, ids), VULN_CHAR_BUDGET)
-            decisions_in = _extract_decisions(_call_with_backoff(build_user(mustfix, vuln_all)))
+            try:
+                decisions_in = _extract_decisions(
+                    _call_with_backoff(build_user(mustfix, vuln_all)))
+            except CallCutDeadline:
+                decisions_in = []
 
         if not decisions_in:
             print("No decisions returned by the model for any batch.", file=sys.stderr)
