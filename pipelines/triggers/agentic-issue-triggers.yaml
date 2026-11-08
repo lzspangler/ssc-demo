@@ -5,7 +5,7 @@
 # matching pipeline:
 #
 #   /remediate       ->  agentic-cve-remediation   (reads a decision from the issue)
-#   /generate-tests  ->  agentic-test-generation   (unit tests; no decision needed)
+#   /generate-tests-unit        ->  agentic-test-generation          (unit tests)
 #   /generate-tests-functional   ->  agentic-test-generation-functional
 #   /generate-tests-integration  ->  agentic-test-generation-integration
 #
@@ -235,7 +235,7 @@ spec:
           #     secret:
           #       secretName: git-auth
 ---
-# ---- /generate-tests ---------------------------------------------------------
+# ---- /generate-tests-unit -----------------------------------------------------
 # The test-generation commands carry no decision -- they only need the repo
 # coordinates (git-url from the payload, git-host + base-branch derived in cel),
 # so their bindings/templates are much simpler than the remediation pair above.
@@ -623,7 +623,7 @@ spec:
         - ref: cve-remediation-issue-binding
       template:
         ref: cve-remediation-issue-template
-    - name: gitlab-issue-generate-tests
+    - name: gitlab-issue-generate-tests-unit
       interceptors:
         # 1) Validate the shared secret token and that this is a comment event.
         - ref:
@@ -636,20 +636,20 @@ spec:
             - name: eventTypes
               value:
                 - "Note Hook"
-        # 2) Only act on issue comments beginning with the /generate-tests
-        #    command, and derive the SCM coordinates. Both overlays read only
-        #    `body`, so ONE cel interceptor suffices -- unlike /remediate,
-        #    nothing here depends on an extension set by a sibling overlay (see
-        #    the chaining gotcha above). Overlay keys are BARE (key: git_host),
+        # 2) Only act on issue comments beginning with /generate-tests-unit,
+        #    and derive the SCM coordinates. Both overlays read only `body`,
+        #    so ONE cel interceptor suffices -- unlike /remediate, nothing
+        #    here depends on an extension set by a sibling overlay (see the
+        #    chaining gotcha above). Overlay keys are BARE (key: git_host),
         #    not extensions.-prefixed.
         #
-        #    The filter is WORD-BOUNDED, not a plain startsWith: the sibling
-        #    commands /generate-tests-functional and /generate-tests-integration
-        #    both also start with "/generate-tests", so a startsWith filter here
-        #    would match them too and start TWO pipelines off one comment. The
-        #    regex demands the command end at whitespace or end-of-string; its
-        #    explicit ^/$ anchors make it behave identically whether the cel
-        #    `matches` implementation is full-match or partial-match.
+        #    All three /generate-tests-* commands use a plain startsWith on
+        #    their full command name -- every command name is unique, so no
+        #    word-boundary regex is needed. (This trigger was previously the
+        #    bare /generate-tests with a word-boundary regex, whose \s escape
+        #    broke the CEL parser outright: CEL string literals have no \s,
+        #    so the filter failed to parse and the command silently never
+        #    fired. Keep backslash escapes out of cel filters.)
         - ref:
             name: cel
           params:
@@ -657,7 +657,7 @@ spec:
               value: >-
                 body.object_attributes.noteable_type == 'Issue' &&
                 body.object_attributes.system == false &&
-                body.object_attributes.note.matches('^/generate-tests(\s|$)')
+                body.object_attributes.note.startsWith('/generate-tests-unit')
             - name: overlays
               value:
                 - key: git_host
@@ -689,9 +689,10 @@ spec:
               value:
                 - "Note Hook"
         # 2) Only act on issue comments beginning with /generate-tests-functional
-        #    (longest-prefix command, so startsWith is unambiguous here), and
-        #    derive the SCM coordinates. Same single-cel-interceptor structure
-        #    as gitlab-issue-generate-tests above.
+        #    (every /generate-tests-* command name is unique, so startsWith is
+        #    unambiguous), and derive the SCM coordinates. Same
+        #    single-cel-interceptor structure as gitlab-issue-generate-tests-unit
+        #    above.
         - ref:
             name: cel
           params:
@@ -731,9 +732,10 @@ spec:
               value:
                 - "Note Hook"
         # 2) Only act on issue comments beginning with /generate-tests-integration
-        #    (longest-prefix command, so startsWith is unambiguous here), and
-        #    derive the SCM coordinates. Same single-cel-interceptor structure
-        #    as gitlab-issue-generate-tests above.
+        #    (every /generate-tests-* command name is unique, so startsWith is
+        #    unambiguous), and derive the SCM coordinates. Same
+        #    single-cel-interceptor structure as gitlab-issue-generate-tests-unit
+        #    above.
         - ref:
             name: cel
           params:

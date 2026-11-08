@@ -18,7 +18,8 @@ can be run on its own:
    scanning of its own.
 4. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
    **test-generation** flow (clone → build → generate tests → `mvn verify` →
-   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
+   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation. Triggered
+   with `/generate-tests-unit`.
 5. **`agentic-test-generation-integration`** — same flow, but the agent
    generates **integration tests** (`*IT.java`, per the
    `test-generation-integration` skill: test-managed embedded H2/WireMock
@@ -167,7 +168,7 @@ prompt carries only the run contract.
 | `pipelines/gitops-cd-dev.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
 | `pipelines/gitops-cd-qa.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
 | `pipelines/gitops-cd-prod.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
-| `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests` → `agentic-test-generation`, `/generate-tests-functional` → `agentic-test-generation-functional`, `/generate-tests-integration` → `agentic-test-generation-integration` (one EventListener + interceptors + a binding/template per command + RBAC + Route; the three `/generate-tests*` commands share one TriggerBinding) |
+| `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests-unit` → `agentic-test-generation`, `/generate-tests-functional` → `agentic-test-generation-functional`, `/generate-tests-integration` → `agentic-test-generation-integration` (one EventListener + interceptors + a binding/template per command + RBAC + Route; the three `/generate-tests*` commands share one TriggerBinding) |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
 | `config/rhtpa-enable-importers-job.yaml` | Job — idempotently enables + forces the RHTPA Red Hat SBOM/CSAF importers |
 | `ops/rhtpa-upload-advisory.sh` | Script — uploads/verifies/deletes a **single** advisory document (OSV/CSAF/…) in RHTPA, for records no importer covers |
@@ -470,7 +471,7 @@ a pipeline by **commenting a slash-command on a GitLab issue**:
 | Comment | Starts | Needs a decision? |
 |---|---|---|
 | `/remediate` | `agentic-cve-remediation` | yes — reads the six-field decision from the issue |
-| `/generate-tests` | `agentic-test-generation` | no — only the repo coordinates |
+| `/generate-tests-unit` | `agentic-test-generation` | no — only the repo coordinates |
 | `/generate-tests-functional` | `agentic-test-generation-functional` | no — only the repo coordinates |
 | `/generate-tests-integration` | `agentic-test-generation-integration` | no — only the repo coordinates |
 
@@ -480,9 +481,8 @@ triggers + `gitlab`/`cel` interceptors + a TriggerBinding/TriggerTemplate
 per command + RBAC + Route; the three `/generate-tests*` commands share one
 TriggerBinding, since nothing in it is command-specific). Each trigger's `cel`
 `filter` matches exactly one command, so a comment only starts the pipeline it
-names — note the `/generate-tests` filter is **word-bounded**
-(`matches('^/generate-tests(\s|$)')`), because the two longer commands also
-*start with* `/generate-tests` and a plain `startsWith` would match them too.
+names — each `/generate-tests-*` filter is a plain `startsWith` on the full
+command name, so the three can never match each other's comments.
 
 ### `/remediate`
 
@@ -532,29 +532,26 @@ remediate. If the merged `SELECTED` is `"0"`, the pipeline clones and then no-op
 `/remediate`, on an **issue** (not an MR), and that pass the webhook token check
 start a run.
 
-### `/generate-tests`
+### `/generate-tests-unit`
 
 Kicks off `agentic-test-generation` (add JUnit tests, run them, open a PR). Unlike
 `/remediate` it carries **no decision** — the comment is just the command on its
 own line:
 
 ```
-/generate-tests
+/generate-tests-unit
 ```
 
 There's nothing to read from the issue body and nothing to override, so this
 trigger uses a single `cel` interceptor that only checks the command and derives
 `git-host` / `base-branch` from the payload. Only comments whose first characters
-are `/generate-tests` **as a whole word** (the filter demands whitespace or
-end-of-string after it, so `/generate-tests-functional` and
-`/generate-tests-integration` fall through to their own triggers), on an
-**issue** (not an MR), that pass the webhook token check, start a run.
+are `/generate-tests-unit`, on an **issue** (not an MR), that pass the webhook
+token check, start a run.
 
 ### `/generate-tests-functional` and `/generate-tests-integration`
 
-Same wiring as `/generate-tests` (same EventListener, same shared
-TriggerBinding; their own TriggerTemplates and cel filters, each a plain
-`startsWith` since these are the longest forms). They kick off
+Same wiring as `/generate-tests-unit` (same EventListener, same shared
+TriggerBinding; their own TriggerTemplates and cel filters). They kick off
 `agentic-test-generation-functional` / `agentic-test-generation-integration`:
 the agent evaluates whether new functional / integration tests are needed and
 generates them per the matching agent skill (`test-generation-functional` /
@@ -578,7 +575,7 @@ oc get clusterinterceptors      # expect at least: cel, gitlab
 
 **2. The pipelines + their tasks must already be applied.** Each trigger only
 creates a PipelineRun that references its Pipeline (`agentic-cve-remediation` for
-`/remediate`, `agentic-test-generation` for `/generate-tests`,
+`/remediate`, `agentic-test-generation` for `/generate-tests-unit`,
 `agentic-test-generation-functional` for `/generate-tests-functional`,
 `agentic-test-generation-integration` for `/generate-tests-integration`); those
 Pipelines and every Task they use must exist in the namespace (your normal
