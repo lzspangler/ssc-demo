@@ -320,7 +320,8 @@ spec:
         family = "openai" if provider == "openai" else "anthropic"
         if family == "openai":
             from openai import (OpenAI, RateLimitError, APIConnectionError,
-                                APITimeoutError, InternalServerError)
+                                APITimeoutError, InternalServerError,
+                                APIStatusError)
             oai = OpenAI(
                 base_url=(os.environ.get("AI_BASE_URL") or None),
                 api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
@@ -435,8 +436,27 @@ spec:
 
         def call_model(user):
             if family == "openai":
+                # STREAM every call, with a read-timeout watchdog.
+                # A non-streaming completion is a fully idle TCP connection for
+                # the entire generation, and the network path from this
+                # cluster's pods to the workshop AI gateway kills idle
+                # connections at ~300s: any generation slower than that dies
+                # with APIConnectionError no matter how healthy the gateway
+                # is. Reproduced 2026-11-08 against run r1ng5h's own workspace
+                # (236 must-fix CVEs): every model call was cut at 300-302s --
+                # the json_schema attempt, then each json_object retry -- while
+                # identical non-streaming calls from outside the cluster
+                # completed in 43-70s and a streamed 8k-token generation
+                # completed in 70s from inside it. Streaming keeps bytes
+                # flowing (no idle cut), and the per-request read timeout
+                # turns a stalled stream into APITimeoutError (already in
+                # RETRYABLE) after AI_STREAM_READ_SECS instead of a 300s hang.
+                import httpx
+                READ_SECS = float(os.environ.get("AI_STREAM_READ_SECS", "120"))
+                REQ_TIMEOUT = httpx.Timeout(connect=15.0, read=READ_SECS,
+                                            write=120.0, pool=15.0)
                 def openai_call(response_format):
-                    return oai.chat.completions.create(
+                    stream = oai.chat.completions.create(
                         model=model,
                         max_tokens=MAX_TOKENS,
                         response_format=response_format,
@@ -444,17 +464,33 @@ spec:
                             {"role": "system", "content": system},
                             {"role": "user", "content": user},
                         ],
+                        stream=True,
+                        timeout=REQ_TIMEOUT,
                     )
+                    parts = []
+                    for chunk in stream:
+                        if chunk.choices:
+                            delta = chunk.choices[0].delta
+                            if delta is not None and delta.content:
+                                parts.append(delta.content)
+                    return "".join(parts)
                 try:
-                    resp = openai_call({
+                    return openai_call({
                         "type": "json_schema",
                         "json_schema": {"name": "cve_analysis", "schema": schema, "strict": True},
                     })
-                except Exception as e:
-                    print("json_schema not supported (%s); retrying with json_object" % e,
+                except APIStatusError as e:
+                    # Fall back to json_object only when the gateway genuinely
+                    # rejects the schema (a 4xx other than 429). Connection
+                    # errors and timeouts must propagate to _call_with_backoff:
+                    # the old catch-all fallback treated the 300s idle-cut as
+                    # "json_schema not supported", so every doomed retry burned
+                    # json_schema 300s + json_object 300s before giving up.
+                    if e.status_code >= 500 or e.status_code == 429:
+                        raise
+                    print("json_schema rejected (%s); retrying with json_object" % e,
                           file=sys.stderr)
-                    resp = openai_call({"type": "json_object"})
-                return resp.choices[0].message.content or ""
+                    return openai_call({"type": "json_object"})
             resp = client.messages.create(
                 model=model,
                 max_tokens=MAX_TOKENS,
@@ -537,9 +573,12 @@ spec:
                   % (tag, len(items), len(mf_b), len(vuln_b), len(report)), file=sys.stderr)
             last = ""
             for attempt in (1, 2):
+                t0 = time.time()
                 last = _call_with_backoff(user_b)
                 decs = _extract_decisions(last)
                 if decs:
+                    print("%s: %d decisions in %.0fs" % (tag, len(decs),
+                                                         time.time() - t0), file=sys.stderr)
                     return decs
                 print("%s attempt %d: no decisions (raw len=%d)" % (tag, attempt, len(last)),
                       file=sys.stderr)
