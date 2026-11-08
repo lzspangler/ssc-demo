@@ -52,7 +52,7 @@ spec:
         On a failing verify, the Maven output is fed back into the next attempt's
         prompt. If the generated tests still fail after the last attempt, the task
         fails.
-      default: "6"
+      default: "12"
   workspaces:
     - name: source
       description: Workspace containing the application source (shared PVC).
@@ -166,9 +166,11 @@ spec:
         fi
 
         # ---- Time budgets -----------------------------------------------------
-        # The PipelineRun has a 1h timeout, and on timeout Tekton cancels AND
-        # deletes the pod -- the step logs (including the agent tee) vanish, so
-        # a hung run leaves nothing to diagnose. Three defenses:
+        # The PipelineRun has a 2h timeout (set in the issue TriggerTemplate;
+        # the Tekton default is 1h, which manual runs get unless they set it
+        # themselves), and on timeout Tekton cancels AND deletes the pod --
+        # the step logs (including the agent tee) vanish, so a hung run
+        # leaves nothing to diagnose. Three defenses:
         #   1. AGENT_TIMEOUT caps each agent invocation (a stalled model
         #      endpoint otherwise holds a call for the OpenAI client's full
         #      10-min timeout x retries; agentic-test-generation-issue-{nrjs5,
@@ -179,7 +181,7 @@ spec:
         #   3. The ATTEMPTS / LAST_ERROR results survive pod deletion.
         AGENT_TIMEOUT=900          # 15 min per agent invocation
         VERIFY_COST=300            # test-compile + failsafe of the touched classes
-        STEP_BUDGET=$((45 * 60))   # 45 min: headroom under the 1h run timeout
+        STEP_BUDGET=$((90 * 60))   # 90 min: headroom under the 2h run timeout for 12 attempts
         STEP_START="$(date +%s)"
         ATTEMPTS_RAN=0
         LAST_ERROR_TEXT=""
