@@ -32,9 +32,32 @@ oc get clusterinterceptors        # expect at least: cel, gitlab
 | `subscription.yaml` | the Subscription, into `openshift-operators` |
 | `namespace.yaml` | the `lightwell-tasks` namespace, gated on the three flags below — renders nothing here |
 | `userinfo.yaml` | `demo-userinfo-pipelines` ConfigMap — orientation text for workshop UIs, no runtime effect |
+| `chains-job.yaml` / `chains-rbac.yaml` | post-install Job: generates the cosign keypair into `signing-secrets` (if still empty) and merge-patches `TektonConfig .spec.chain` for image signing + SLSA provenance |
+| `platform-config-job.yaml` | post-install Job: merge-patches operator-owned cluster CRs the demo needs — see below |
 
 No OperatorGroup: `openshift-operators` ships with one, and a second in the
 same namespace puts every operator in it into an error state.
+
+## Post-install platform defaults (`platform-config-job.yaml`)
+
+Two settings the demo needs that no operator sets on its own, applied by an
+idempotent Job (runs on every Argo sync, waits for the operator's TektonConfig
+to appear, merge-patches only the fields it owns — Argo cannot own these CRs
+wholesale without fighting the operators that curate them):
+
+1. **`TektonConfig .spec.pipeline.default-timeout-minutes: 180`** — Tekton's
+   default PipelineRun timeout. The API server materializes it into
+   `spec.timeouts.pipeline` of every run created *without* an explicit
+   timeout, which is every console-started agentic run. The stock 60m times
+   out `agentic-cve-analysis`: ~40 min of upstream RHTPA tasks (the
+   remediation report grows with the advisory corpus) plus ~45–90 min of
+   model-gated analysis. Pipelines that pin their own timeout are unaffected.
+2. **`console.operator/cluster .spec.plugins += pipelines-console-plugin`** —
+   on OCP 4.15+ the web console only shows the Pipelines nav when the plugin
+   is listed there; installing the operator alone never adds it.
+
+Both are gated from `values.yaml` (`platformDefaults.defaultTimeoutMinutes`,
+`platformDefaults.consolePlugin.enabled`).
 
 ## Two fixes worth knowing about
 
@@ -70,3 +93,7 @@ on your cluster.
 | `operator.source` | `redhat-operators` |
 | `deployer.domain` / `apiUrl` | cosmetic, into the ConfigMap; set by `bootstrap-infra` |
 | `userInfo.enabled` | set `false` to skip the ConfigMap entirely |
+| `chains.enabled` | the signing bootstrap Job + RBAC |
+| `chains.jobImage` | the stdlib-Python image both bootstrap Jobs run on |
+| `platformDefaults.defaultTimeoutMinutes` | TektonConfig default PipelineRun timeout (180; 0 = leave the operator default) |
+| `platformDefaults.consolePlugin.enabled` | patch the Pipelines nav plugin into `console.operator/cluster` |
