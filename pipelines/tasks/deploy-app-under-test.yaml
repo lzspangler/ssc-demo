@@ -158,7 +158,14 @@ spec:
         - mountPath: /var/lib/containers
           name: varlibcontainers
     - name: deploy
-      image: registry.redhat.io/openshift/oc-cli:latest
+      # The in-cluster `cli` ImageStream (shipped with the cluster payload), not
+      # registry.redhat.io: there is no `openshift/oc-cli` repo there -- the
+      # pull fails with "unauthorized" even though the cluster's registry auth
+      # works for every other image (TaskRunImagePullFailed on cluster-b7zgr).
+      # The ImageStream tag resolves to the OCP release payload's oc image, so
+      # it always matches the cluster's own version and needs no external
+      # registry access at all.
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
       workingDir: $(workspaces.source.path)/$(params.SUBDIRECTORY)
       script: |
         #!/usr/bin/env bash
