@@ -536,7 +536,7 @@ Lightwell backport.
 
 Then exercise the webhook: comment **`/remediate`** on one of those issues. The
 EventListener starts `agentic-cve-remediation`, which pushes a branch and opens
-a merge request. **`/generate-tests`** does the same through
+a merge request. **`/generate-tests-unit`** does the same through
 `agentic-test-generation`, **`/generate-tests-functional`** through
 `agentic-test-generation-functional`, and **`/generate-tests-integration`**
 through `agentic-test-generation-integration` — one webhook, four slash
