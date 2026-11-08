@@ -545,7 +545,27 @@ spec:
           rc=$?
           set -e
           printf '%s\n' "${build_log}"
+
+          # App-source guard, same as the integration task: the merge-back
+          # propagates ONLY src/test and pom.xml, so a pass riding on an
+          # src/main patch is silently discarded and re-run-tests then fails
+          # against the unpatched app with no hint why. Almost always means
+          # the generated test exposed a REAL application bug.
+          main_changed="$(git status --porcelain -- src/main 2>/dev/null | cut -c4-)"
           if [ "${rc}" -eq 0 ]; then
+            if [ -n "${main_changed}" ]; then
+              printf '%s' "${ATTEMPTS_RAN}" > "$(results.ATTEMPTS.path)"
+              printf '%s' "tests pass only via out-of-scope app change: ${main_changed}" \
+                > "$(results.LAST_ERROR.path)"
+              echo "ERROR: the agent modified APPLICATION SOURCE to make the tests pass:" >&2
+              printf '%s\n' "${main_changed}" >&2
+              echo "That change is out of scope (only src/test and pom.xml reach the" >&2
+              echo "workspace and the MR), so re-run-tests would fail against the" >&2
+              echo "unpatched app. It almost always means the generated test exposed a" >&2
+              echo "REAL application bug -- fix it in the application repo, then re-run" >&2
+              echo "this pipeline." >&2
+              exit 1
+            fi
             passed=1
             break
           fi
@@ -561,6 +581,16 @@ spec:
 
         --- application server log (stack traces behind HTTP 5xx responses) ---
         ${app_log_tail}"
+          fi
+          if [ -n "${main_changed}" ]; then
+            feedback="${feedback}
+
+        OUT OF SCOPE: your previous attempt also modified application source
+        under src/main:
+        ${main_changed}
+        Those changes are discarded and will NOT reach the MR. Revert them
+        (git checkout -- src/main) and make the tests pass against the
+        application as it is."
           fi
           # Tekton ships results through the container termination message,
           # which is size-capped; ~1 kB keeps this inside it. Both halves
