@@ -292,7 +292,7 @@ spec:
         # are reached. Everything else uses the Anthropic Messages API.
         family = "openai" if provider == "openai" else "anthropic"
         if family == "openai":
-            from openai import OpenAI
+            from openai import OpenAI, APIStatusError
             oai = OpenAI(
                 base_url=(os.environ.get("AI_BASE_URL") or None),
                 api_key=os.environ.get("OPENAI_API_KEY", "placeholder"),
@@ -391,8 +391,19 @@ spec:
             # OpenAI-compatible Chat Completions. Prefer strict json_schema
             # (vLLM/RHOAI guided decoding, OpenAI); fall back to json_object for
             # servers that don't support schema-constrained output (older Ollama).
+            # STREAM every call: a non-streaming completion is a fully idle TCP
+            # connection for the whole generation, and this cluster's egress
+            # path to the AI gateway kills idle connections at ~300s -- any
+            # slower generation dies with APIConnectionError however healthy
+            # the gateway is (reproduced 2026-11-08; see ai-analyze-cves for
+            # the full story). Streaming keeps bytes flowing; the read timeout
+            # turns a stalled stream into a fast retryable APITimeoutError.
+            import httpx
+            READ_SECS = float(os.environ.get("AI_STREAM_READ_SECS", "120"))
+            REQ_TIMEOUT = httpx.Timeout(connect=15.0, read=READ_SECS,
+                                        write=120.0, pool=15.0)
             def openai_call(response_format):
-                return oai.chat.completions.create(
+                stream = oai.chat.completions.create(
                     model=model,
                     max_tokens=4000,
                     response_format=response_format,
@@ -400,16 +411,31 @@ spec:
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
+                    stream=True,
+                    timeout=REQ_TIMEOUT,
                 )
+                parts = []
+                for chunk in stream:
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        if delta is not None and delta.content:
+                            parts.append(delta.content)
+                return "".join(parts)
             try:
-                resp = openai_call({
+                text = openai_call({
                     "type": "json_schema",
                     "json_schema": {"name": "cve_selection", "schema": schema, "strict": True},
                 })
-            except Exception as e:
-                print(f"json_schema not supported ({e}); retrying with json_object", file=sys.stderr)
-                resp = openai_call({"type": "json_object"})
-            text = resp.choices[0].message.content or "{}"
+            except APIStatusError as e:
+                # json_object fallback ONLY for a genuine 4xx rejection of the
+                # schema. Connection errors/timeouts must propagate to the
+                # caller's retry loop: the old catch-all treated the 300s
+                # idle-cut as "json_schema not supported" and doubled every
+                # doomed retry.
+                if e.status_code >= 500 or e.status_code == 429:
+                    raise
+                print(f"json_schema rejected ({e}); retrying with json_object", file=sys.stderr)
+                text = openai_call({"type": "json_object"})
         else:
             resp = client.messages.create(
                 model=model,
