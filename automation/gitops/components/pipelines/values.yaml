@@ -14,6 +14,9 @@ pipelines:
     # After the operator, because the Job patches the TektonConfig the operator
     # creates. The Job waits for it rather than assuming it is already there.
     chains: "4"
+    # Same reasoning as chains: patches operator-owned cluster CRs, and waits
+    # for the TektonConfig the operator creates rather than assuming it.
+    platformConfig: "4"
 
 # -----------------------------------------------------------------------------
 # Tekton Chains -- image signing + SLSA provenance attestations.
@@ -52,6 +55,39 @@ chains:
   cosignImage: registry.redhat.io/rhtas/cosign-rhel9@sha256:6fa39582a3d62a2aa5404397bb638fdd0960f9392db659d033d7bacf70bddfb1
   # Pure-stdlib Python against the API; no oc, no runtime pip install.
   jobImage: registry.access.redhat.com/ubi9/python-39:latest
+
+# -----------------------------------------------------------------------------
+# Post-install platform defaults (Job "pipelines-defaults").
+#
+# Both targets are operator-owned, cluster-scoped and heavily defaulted CRs:
+# Argo cannot own them wholesale without fighting the operator that curates
+# them, so the Job merge-patches just these fields on every sync -- the same
+# approach as the Chains bootstrap above.
+# -----------------------------------------------------------------------------
+platformDefaults:
+  # Where the Job, its ConfigMap and its ServiceAccount live. Fixed by the
+  # operator, like chains.namespace.
+  namespace: openshift-pipelines
+  # Tekton's DEFAULT PipelineRun timeout, in minutes. The API server
+  # materializes it into spec.timeouts.pipeline of every run created WITHOUT
+  # an explicit timeout (verified with a server-side dry-run) -- including
+  # every console-started agentic run, which submits none.
+  #
+  # The stock 60m no longer fits the agentic pipelines: the cve-analysis
+  # upstream tasks alone eat ~40 min at current advisory scale (the RHTPA
+  # remediation report grew from 69s to ~29 min as the must-fix set reached
+  # 236 CVEs), and the model-gated analysis needs another ~45-90 min
+  # depending on gateway speed. Runs that pin their own timeout are
+  # unaffected (ci-build-publish: 1h; test-generation issue runs: 2h).
+  # Set 0 to leave the operator default alone.
+  defaultTimeoutMinutes: 180
+  # OCP 4.15+: the web console shows the Pipelines nav only when
+  # `pipelines-console-plugin` is listed in console.operator/cluster
+  # .spec.plugins -- installing the operator alone never adds it. The Job
+  # merge-patches it in, preserving the plugins already present (a
+  # merge-patch replaces the array, so it sends the full merged list).
+  consolePlugin:
+    enabled: true
 
 # OLM install into openshift-operators (AllNamespaces; OperatorGroup already exists)
 operator:

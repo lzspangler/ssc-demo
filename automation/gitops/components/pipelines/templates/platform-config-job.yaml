@@ -1,0 +1,196 @@
+{{- if .Values.pipelines.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipelines-defaults
+  namespace: {{ .Values.platformDefaults.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.platformConfig | quote }}
+data:
+  bootstrap.py: |
+    # Post-install platform defaults the operators cannot set themselves.
+    #
+    # Idempotent, because this runs on every Argo sync:
+    #   1. TektonConfig spec.pipeline.default-timeout-minutes -- the DEFAULT
+    #      PipelineRun timeout. The API server materializes it into
+    #      spec.timeouts.pipeline of every run created WITHOUT an explicit one
+    #      (verified with a server-side dry-run), which includes every
+    #      console-started agentic run. The stock 60m no longer fits: the
+    #      cve-analysis upstream tasks alone eat ~40 min at current advisory
+    #      scale, and the model-gated analysis needs another ~45-90 min.
+    #   2. console.operator/cluster spec.plugins += pipelines-console-plugin --
+    #      on OCP 4.15+ the web console shows the Pipelines nav only when the
+    #      plugin is listed there; installing the operator alone never adds it.
+    #
+    # Why a Job rather than plain manifests: both CRs are operator-owned,
+    # cluster-scoped and heavily defaulted. Argo owning the whole object would
+    # fight the operator that curates it; a merge-patch of just these fields
+    # does not. Same approach as the Chains bootstrap Job.
+    #
+    # Pure stdlib against the in-cluster API -- no oc, no pip install at runtime.
+    import json, os, ssl, sys, time, urllib.error, urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    token = open(SA + "/token").read().strip()
+    ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+
+    def call(path, method="GET", body=None, ctype="application/json"):
+        req = urllib.request.Request(
+            API + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                     **({"Content-Type": ctype} if body is not None else {})})
+        try:
+            with urllib.request.urlopen(req, context=ctx) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()[:300]
+
+    # ---- 1. TektonConfig default PipelineRun timeout -----------------------
+    # The operator creates TektonConfig asynchronously after the Subscription
+    # resolves, so wait rather than failing the first sync.
+    timeout_minutes = int(os.environ["DEFAULT_TIMEOUT_MINUTES"])
+    if timeout_minutes <= 0:
+        print("TektonConfig default-timeout-minutes: 0, leaving the operator default alone")
+    else:
+        deadline = time.time() + int(os.environ.get("TIMEOUT_SECONDS", "900"))
+        while True:
+            st, cfg = call("/apis/operator.tekton.dev/v1alpha1/tektonconfigs/config")
+            if st == 200:
+                break
+            if time.time() > deadline:
+                sys.exit("TIMEOUT: TektonConfig/config never appeared (%s)" % st)
+            print("waiting for TektonConfig/config ... (%s)" % st, flush=True)
+            time.sleep(15)
+
+        current = ((cfg.get("spec") or {}).get("pipeline") or {}).get("default-timeout-minutes")
+        if current == timeout_minutes:
+            print("TektonConfig default-timeout-minutes: already %s" % current)
+        else:
+            st, err = call("/apis/operator.tekton.dev/v1alpha1/tektonconfigs/config",
+                           "PATCH",
+                           {"spec": {"pipeline": {"default-timeout-minutes": timeout_minutes}}},
+                           "application/merge-patch+json")
+            if st != 200:
+                sys.exit("ERROR: patching TektonConfig: %s %s" % (st, err))
+            print("TektonConfig default-timeout-minutes: %s -> %s"
+                  % (current if current is not None else "<operator default>", timeout_minutes))
+
+    # ---- 2. Pipelines nav in the web console -------------------------------
+    if os.environ.get("ENABLE_CONSOLE_PLUGIN", "") != "true":
+        print("console plugin: disabled by values, skipping")
+    else:
+        st, con = call("/apis/operator.openshift.io/v1/consoles/cluster")
+        if st != 200:
+            sys.exit("ERROR: reading console.operator/cluster: %s %s" % (st, con))
+        plugins = ((con.get("spec") or {}).get("plugins")) or []
+        if "pipelines-console-plugin" in plugins:
+            print("console plugins: pipelines-console-plugin already present")
+        else:
+            # A merge-patch replaces the array wholesale, so send the FULL
+            # merged list -- the console operator curates the other entries
+            # (monitoring-plugin, networking-console-plugin, ...).
+            merged = plugins + ["pipelines-console-plugin"]
+            st, err = call("/apis/operator.openshift.io/v1/consoles/cluster",
+                           "PATCH", {"spec": {"plugins": merged}},
+                           "application/merge-patch+json")
+            if st != 200:
+                sys.exit("ERROR: patching console.operator/cluster: %s %s" % (st, err))
+            print("console plugins: added pipelines-console-plugin ->", merged)
+
+    print("OK: platform defaults applied")
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pipelines-defaults
+  namespace: {{ .Values.platformDefaults.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.platformConfig | quote }}
+---
+# Both targets are CLUSTER-scoped, so this needs a ClusterRole -- there is no
+# namespaced path to either. Narrow on purpose: this Job runs on every sync
+# and should never hold broader rights than it needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pipelines-defaults
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.platformConfig | quote }}
+rules:
+  - apiGroups: ["operator.tekton.dev"]
+    resources: ["tektonconfigs"]
+    verbs: ["get", "patch", "update"]
+{{- if .Values.platformDefaults.consolePlugin.enabled }}
+  - apiGroups: ["operator.openshift.io"]
+    resources: ["consoles"]
+    verbs: ["get", "patch", "update"]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pipelines-defaults
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.platformConfig | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pipelines-defaults
+subjects:
+  - kind: ServiceAccount
+    name: pipelines-defaults
+    namespace: {{ .Values.platformDefaults.namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pipelines-defaults
+  namespace: {{ .Values.platformDefaults.namespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.platformConfig | quote }}
+    # Replace+Force, for the same reason as the Chains bootstrap Job: a Job's
+    # pod template is immutable, so a plain sync fails with "field is
+    # immutable" and never re-runs an edited script.
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "pipelines.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: pipelines-defaults
+      volumes:
+        - name: scripts
+          configMap:
+            name: pipelines-defaults
+      containers:
+        - name: bootstrap
+          # Same stdlib-Python image as the Chains bootstrap (the key exists in
+          # values.yaml regardless of chains.enabled) -- one job image in this
+          # component rather than two drifting copies.
+          image: {{ .Values.chains.jobImage }}
+          env:
+            - name: DEFAULT_TIMEOUT_MINUTES
+              value: {{ .Values.platformDefaults.defaultTimeoutMinutes | quote }}
+            - name: ENABLE_CONSOLE_PLUGIN
+              value: {{ if .Values.platformDefaults.consolePlugin.enabled }}"true"{{ else }}"false"{{ end }}
+          command: ["python3", "-I", "/scripts/bootstrap.py"]
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+{{- end }}
