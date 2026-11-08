@@ -1,0 +1,36 @@
+apiVersion: aap.ansible.com/v1alpha1
+kind: AutomationOrchestrator
+metadata:
+  name: automationorchestrator-demo
+  namespace: automation-orchestrator-operator-system
+spec:
+  imagePullSecrets:
+    - name: automation-orchestrator-pull-secret
+  otel:
+    enabled: false
+  backgroundWorker:
+    hpa:
+      maxReplicas: 1
+      minReplicas: 1
+      targetCPUUtilization: 80
+  ingress:
+    type: Route
+  postgres:
+    port: 5432
+    maxOverflow: 10
+    backendDatabase:
+      secretRef:
+        name: orchestrator-postgres-backend
+      host: postgres-backend.automation-orchestrator-operator-system.svc.cluster.local
+      sslMode: disable
+    sslMode: disable
+    poolTimeoutSeconds: 5
+    poolSize: 20
+    temporalDatabase:
+      secretRef:
+        name: orchestrator-postgres-temporal
+      host: postgres-backend.automation-orchestrator-operator-system.svc.cluster.local
+      sslMode: disable
+    host: postgres-backend.automation-orchestrator-operator-system.svc.cluster.local
+  redis:
+    replicas: 1
