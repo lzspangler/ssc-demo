@@ -4,28 +4,24 @@ This repo splits the agentic security flow into **four focused pipelines** that
 share the same tasks and images. Each has a single, distinct responsibility and
 can be run on its own:
 
-1. **`agentic-cve-selection`** — *decide what to fix (one).* Builds the image,
-   uploads the SBOM to RHTPA, scans it, applies the policy **must-fix** gate, and
-   asks the AI to select **exactly one** CVE. Ends at `ai-select-cve` and exposes
-   that decision as pipeline results.
-2. **`agentic-cve-analysis`** — *decide what to fix (all) → issues.* Same
+1. **`agentic-cve-analysis`** — *decide what to fix (all) → issues.* Same
    build → scan → must-fix chain, but asks the AI for a decision **per fixable
    CVE** and opens **one GitLab/GitHub issue per vulnerability**. Each issue
    carries the same six fields so commenting `/remediate` on it starts pipeline 3.
-3. **`agentic-cve-remediation`** — *apply a fix.* Takes a CVE decision **as
+2. **`agentic-cve-remediation`** — *apply a fix.* Takes a CVE decision **as
    params**, has the AI bump the vulnerable Maven dependency to its fixed
    version, re-runs `mvn verify`, and opens a **PR/MR**. Does no discovery or
    scanning of its own.
-4. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
+3. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
    **test-generation** flow (clone → build → generate tests → `mvn verify` →
    tests-only PR/MR). No image build, SBOM/scan, or CVE remediation. Triggered
    with `/generate-tests-unit`.
-5. **`agentic-test-generation-integration`** — same flow, but the agent
+4. **`agentic-test-generation-integration`** — same flow, but the agent
    generates **integration tests** (`*IT.java`, per the
    `test-generation-integration` skill: test-managed embedded H2/WireMock
    doubles, no Testcontainers) and the MR also carries any test-scoped
    `pom.xml` additions. Triggered with `/generate-tests-integration`.
-6. **`agentic-test-generation-functional`** — same flow, but the agent
+5. **`agentic-test-generation-functional`** — same flow, but the agent
    generates **functional tests** (`*FT.java`, per the
    `test-generation-functional` skill: black-box REST Assured against the
    application deployed as **ephemeral namespaced resources** in the pipeline
