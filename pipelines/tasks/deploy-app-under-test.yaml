@@ -214,21 +214,30 @@ spec:
                 app.kubernetes.io/name: app-under-test
                 app.kubernetes.io/instance: $(params.APP_NAME)
             spec:
-              # restricted-v3-clean pod (the cluster's most restrictive SCC must
-              # be able to run the app under test):
-              #   - hostUsers: false -- REQUIRED by restricted-v3 (it mandates a
-              #     user namespace; leaving it null is a validation error there)
-              #   - runAsNonRoot with NO pinned runAsUser -- the restricted SCCs
-              #     enforce MustRunAsRange 1000-65534 and admission assigns a uid
-              #     in that range. The ubi9/openjdk-17 image's nominal user 185
-              #     is BELOW that minimum, so pinning it would be rejected.
+              # restricted-v3 pod (the cluster's most restrictive SCC). The uid
+              # pin below is LOAD-BEARING, not cosmetic:
+              #   - restricted-v3's MustRunAsRange is 1000-65534, which maps
+              #     exactly onto the user namespace a hostUsers:false pod gets
+              #     (container-side uids 0-65535 -> an isolated host block).
+              #   - with NO pinned uid, SCC admission instead picks restricted-v2
+              #     and assigns the namespace-allocated uid (1000810000+), which
+              #     falls OUTSIDE that user-namespace mapping. runc then fails
+              #     every container create with "setgroups: Invalid argument"
+              #     (CreateContainerError) -- the app pod never starts, the
+              #     Availability wait times out, and the run fails
+              #     (agentic-test-generation-functional-issue-g27wr).
+              #   - 1001 rather than the ubi9/openjdk-17 image's nominal 185:
+              #     185 is below restricted-v3's minimum of 1000. Any uid in
+              #     1000-65534 works -- the jar is COPY'd world-readable and the
+              #     app's state is in-memory (H2 mem:) so it writes nothing.
+              #   - hostUsers: false -- user namespace, required by restricted-v3.
               #   - seccomp runtime/default, all capabilities dropped, no
               #     privilege escalation.
-              # Any assigned uid works: the jar is COPY'd world-readable, and the
-              # app's state is in-memory (H2 mem:) so it writes nothing.
               hostUsers: false
               securityContext:
                 runAsNonRoot: true
+                runAsUser: 1001
+                runAsGroup: 1001
                 seccompProfile:
                   type: RuntimeDefault
               containers:
