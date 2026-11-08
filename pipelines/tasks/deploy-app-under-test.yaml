@@ -332,6 +332,19 @@ metadata:
   labels:
     app.kubernetes.io/part-of: maven-build-ci
 rules:
+  # The deploy step stamps an ownerReference (blockOwnerDeletion: true) onto the
+  # ephemeral Deployment pointing at the PipelineRun, so Kubernetes GC removes
+  # the app even if the run is destroyed harder than the finally-task cleanup
+  # can react. Admission (the gc-permissions plugin) requires update on the
+  # OWNER's finalizers subresource for that -- without this rule the Deployment
+  # create fails Forbidden: "cannot set blockOwnerDeletion if an ownerReference
+  # refers to a resource you can't set finalizers on" (and note: `oc auth can-i
+  # update pipelineruns/finalizers` LIES about this -- it parses the "/" as
+  # resource/NAME, not resource/subresource, and answers for the bare resource;
+  # verify with a SubjectAccessReview instead).
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelineruns/finalizers"]
+    verbs: ["update"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
