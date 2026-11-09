@@ -378,10 +378,16 @@ spec:
         # ~5 min (agent + verify), so Tekton's 1h default would cut the loop
         # at ~9 attempts. 2h with the task's 90-min step budget leaves room
         # for clone/package/deploy upstream and reset/re-run/open-pr
-        # downstream. Like taskRunSpecs below, timeout is a PipelineRun-only
+        # downstream. Like taskRunSpecs below, this is a PipelineRun-only
         # field -- set it here, never on the Pipeline (the API server prunes
         # it); manual/console runs must set it on their own PipelineRun.
-        timeout: "2h"
+        # MUST be spec.timeouts.pipeline, NOT the legacy spec.timeout: the
+        # OpenShift admission webhook that defaults spec.timeouts.pipeline
+        # from TektonConfig default-timeout-minutes IGNORES the legacy field
+        # and overwrites it with the platform default (verified with
+        # --dry-run=server: legacy timeout: 2h came back as 3h0m0s).
+        timeouts:
+          pipeline: "2h"
         # Pin the ephemeral-resource and K8s-API-touching tasks to the `pipeline`
         # service account: the deploy/reset/cleanup RBAC (Role
         # app-under-test-lifecycle + system:image-builder, in
@@ -485,9 +491,12 @@ spec:
         pipelineRef:
           name: agentic-test-generation-integration
         # 2h for the same reason as the functional template above: 12
-        # generation attempts x ~5 min each does not fit Tekton's 1h default.
-        # PipelineRun-only field -- set here, not on the Pipeline.
-        timeout: "2h"
+        # generation attempts x ~5 min each does not fit a 1h run.
+        # PipelineRun-only field, and it must be spec.timeouts.pipeline (not
+        # the legacy spec.timeout, which the OpenShift admission defaulting
+        # overwrites -- see the functional template above).
+        timeouts:
+          pipeline: "2h"
         params:
           - name: git-url
             value: $(tt.params.git-url)

@@ -47,11 +47,16 @@ wholesale without fighting the operators that curate them):
 
 1. **`TektonConfig .spec.pipeline.default-timeout-minutes: 180`** — Tekton's
    default PipelineRun timeout. The API server materializes it into
-   `spec.timeouts.pipeline` of every run created *without* an explicit
-   timeout, which is every console-started agentic run. The stock 60m times
-   out `agentic-cve-analysis`: ~40 min of upstream RHTPA tasks (the
-   remediation report grows with the advisory corpus) plus ~45–90 min of
-   model-gated analysis. Pipelines that pin their own timeout are unaffected.
+   `spec.timeouts.pipeline` of every run created *without* an explicit one —
+   trigger- and CLI-created runs. Two caveats verified with server-side
+   dry-runs: the **web console submits an explicit `1h0m0s`** on every run it
+   starts, so console-started agentic runs keep the 1h wall regardless of
+   this default (start long runs via their trigger or `oc` instead); and the
+   admission defaulting **overwrites the legacy `spec.timeout` field**, so a
+   pin must use `spec.timeouts.pipeline`. The stock 60m times out
+   `agentic-cve-analysis`: ~40 min of upstream RHTPA tasks (the remediation
+   report grows with the advisory corpus) plus ~45–90 min of model-gated
+   analysis. Runs that pin `spec.timeouts.pipeline` are unaffected.
 2. **`console.operator/cluster .spec.plugins += pipelines-console-plugin`** —
    on OCP 4.15+ the web console only shows the Pipelines nav when the plugin
    is listed there; installing the operator alone never adds it.

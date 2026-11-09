@@ -70,8 +70,13 @@ platformDefaults:
   namespace: openshift-pipelines
   # Tekton's DEFAULT PipelineRun timeout, in minutes. The API server
   # materializes it into spec.timeouts.pipeline of every run created WITHOUT
-  # an explicit timeout (verified with a server-side dry-run) -- including
-  # every console-started agentic run, which submits none.
+  # an explicit timeouts.pipeline (verified with a server-side dry-run) --
+  # mainly trigger- and CLI-created runs. NOTE it does NOT reach runs that
+  # submit an explicit spec.timeouts.pipeline, and the web console submits
+  # 1h0m0s on every run it starts, so console-started agentic runs keep the
+  # 1h wall no matter what this is set to (start long runs via their trigger
+  # or oc instead). The legacy spec.timeout field does not override this
+  # either -- the admission defaulting overwrites it.
   #
   # The stock 60m no longer fits the agentic pipelines: the cve-analysis
   # upstream tasks alone eat ~40 min at current advisory scale (the RHTPA
