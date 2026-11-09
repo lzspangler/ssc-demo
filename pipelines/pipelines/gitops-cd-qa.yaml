@@ -56,15 +56,20 @@ spec:
     # ---------------- gitops repo ----------------
     # Cluster-specific: like the image-registry default in
     # ci-build-triggers.yaml, these cannot be templated (the pipelines are
-    # synced as plain YAML), so they carry this cluster's values.
+    # synced as plain YAML), so they carry this cluster's values. On gitops
+    # installs the tekton-cluster-defaults Job
+    # (automation/gitops/components/pipelines) rewrites these from
+    # deployer.domain after every sync, and ssc-tekton-pipelines ignores
+    # exactly these fields so Argo's selfHeal keeps the patch; edit these
+    # only for manual `oc apply` installs.
     - name: gitops-url
       type: string
       description: GitLab URL of the gitops repository to promote into.
-      default: https://gitlab-gitlab.apps.cluster-6gpcf.dyn.redhatworkshops.io/development/spring-boot-example-gitops
+      default: https://gitlab-gitlab.apps.cluster-b7zgr.dyn.redhatworkshops.io/development/spring-boot-example-gitops
     - name: git-host
       type: string
       description: Host of the SCM serving the gitops repository.
-      default: gitlab-gitlab.apps.cluster-6gpcf.dyn.redhatworkshops.io
+      default: gitlab-gitlab.apps.cluster-b7zgr.dyn.redhatworkshops.io
     - name: values-path
       type: string
       description: Values file inside the gitops repo whose image.tag is bumped.

@@ -5,6 +5,12 @@
 argocd:
   namespace: openshift-gitops
 
+# Namespace the Tekton layer is installed into -- home of the
+# tekton-cluster-defaults Job and of the objects it patches. Set by
+# bootstrap-infra (its top-level pipelineNamespace); empty in a standalone
+# render, which is fine because the Job is off by default there.
+pipelineNamespace: ""
+
 pipelines:
   # Chart-level gate (root-app Application only exists when components.pipelines.enabled)
   enabled: true
@@ -17,6 +23,11 @@ pipelines:
     # Same reasoning as chains: patches operator-owned cluster CRs, and waits
     # for the TektonConfig the operator creates rather than assuming it.
     platformConfig: "4"
+    # Last: patches the Tekton layer's cluster-specific param defaults, which
+    # live in a DIFFERENT set of Applications (root-app waves 3-5). Argo does
+    # not order syncs across Applications, so the Job waits for those objects
+    # itself rather than assuming they are already there.
+    clusterDefaults: "5"
 
 # -----------------------------------------------------------------------------
 # Tekton Chains -- image signing + SLSA provenance attestations.
@@ -93,6 +104,36 @@ platformDefaults:
   # merge-patch replaces the array, so it sends the full merged list).
   consolePlugin:
     enabled: true
+
+# -----------------------------------------------------------------------------
+# Tekton cluster-defaults patch Job ("tekton-cluster-defaults").
+#
+# The Tekton layer at the repo root is synced by Argo as PLAIN YAML, so its
+# cluster-specific param defaults are committed with the reference cluster's
+# hostnames and go stale on every cluster move:
+#   ci-build-push-template   image-registry      -> quay.apps.<domain>
+#   gitops-cd-{dev,qa,prod}  git-host, gitops-url -> gitlab-gitlab.apps.<domain>
+# ci-build-publish-5rxcw (buildah push to the dead previous-cluster Quay,
+# reading as a credential problem) is what that looks like when it bites.
+#
+# The Job rewrites those defaults on the LIVE objects from deployer.domain on
+# every sync of this component; bootstrap-infra adds ignoreDifferences for
+# exactly those fields to ssc-tekton-pipelines / ssc-tekton-triggers so
+# Argo's selfHeal keeps the patch. Consequence: repo-side edits to those
+# defaults no longer reach a gitops-installed cluster -- change
+# deployer.domain instead.
+#
+# `enabled` is turned on by bootstrap-infra (components.pipelines
+# .clusterDefaults, and only when components.tekton is enabled too); a
+# standalone render of this chart has no domain, so it defaults off here.
+# -----------------------------------------------------------------------------
+clusterDefaults:
+  enabled: false
+  # How long the Job waits for the Tekton-layer Applications (root-app waves
+  # 3-5) to produce the TriggerTemplate and the gitops-cd Pipelines before
+  # failing. Generous on purpose: those Applications can fail their first
+  # syncs while the operator installs CRDs.
+  timeoutSeconds: 1800
 
 # OLM install into openshift-operators (AllNamespaces; OperatorGroup already exists)
 operator:

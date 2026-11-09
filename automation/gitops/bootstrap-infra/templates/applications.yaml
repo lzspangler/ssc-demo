@@ -1,6 +1,12 @@
 {{- $domain := required "Set deployer.domain to the cluster's apps subdomain" .Values.deployer.domain }}
 {{- $realm := .Values.components.keycloak.realm }}
 {{- $issuer := printf "https://sso.%s/realms/%s" $domain $realm }}
+{{- /* The tekton-cluster-defaults Job rewrites the Tekton layer's
+       cluster-specific param defaults from $domain after waves 3-5 sync;
+       the ignoreDifferences below keep selfHeal from reverting its patch.
+       Needs the pipelines component (where the Job lives) AND the Tekton
+       layer (what it patches). */}}
+{{- $clusterDefaults := and .Values.components.pipelines.enabled .Values.components.tekton.enabled .Values.components.pipelines.clusterDefaults | default false }}
 {{- if and .Values.components.keycloak.enabled .Values.components.keycloakClients.enabled }}
 {{- fail "components.keycloak and components.keycloakClients are mutually exclusive: the first installs a Keycloak that claims the sso.<domain> Route, the second provisions ssc-demo's clients into one that already exists. Enable exactly one." }}
 {{- end }}
@@ -43,6 +49,13 @@ spec:
         deployer:
           domain: {{ $domain | quote }}
           apiUrl: {{ .Values.deployer.apiUrl | quote }}
+        # Where the Tekton layer lives and the tekton-cluster-defaults Job
+        # patches; see clusterDefaults just below.
+        pipelineNamespace: {{ .Values.pipelineNamespace | quote }}
+        clusterDefaults:
+          # Rendered as the effective gate from the root values: the Job
+          # needs both this component and the Tekton layer it patches.
+          enabled: {{ $clusterDefaults }}
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ .Values.components.pipelines.namespace }}
@@ -201,6 +214,17 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ $ns }}
+  {{- if $clusterDefaults }}
+  # The tekton-cluster-defaults Job (components/pipelines) rewrites these
+  # param defaults from deployer.domain after every sync; ignoring exactly
+  # those fields keeps selfHeal from reverting the patch. Repo-side edits to
+  # them no longer reach the cluster -- change deployer.domain instead.
+  ignoreDifferences:
+    - group: tekton.dev
+      kind: Pipeline
+      jqPathExpressions:
+        - '.spec.params[] | select(.name == "gitops-url" or .name == "git-host") | .default'
+  {{- end }}
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 ---
 apiVersion: argoproj.io/v1alpha1
@@ -225,6 +249,15 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ $ns }}
+  {{- if $clusterDefaults }}
+  # Same mechanism as the tekton-pipelines Application above: the
+  # tekton-cluster-defaults Job owns this field's cluster-specific value.
+  ignoreDifferences:
+    - group: triggers.tekton.dev
+      kind: TriggerTemplate
+      jqPathExpressions:
+        - '.spec.params[] | select(.name == "image-registry") | .default'
+  {{- end }}
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- if ne $ns "tssc-app-ci" }}
 {{- fail (printf "pipelineNamespace is %q, but pipelines/triggers/agentic-issue-triggers.yaml hardcodes the ClusterRoleBinding subject namespace as tssc-app-ci. Edit that file to match before changing pipelineNamespace, or the EventListener cannot reach the cel/gitlab ClusterInterceptors." $ns) }}

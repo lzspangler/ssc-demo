@@ -111,6 +111,15 @@ components:
     enabled: true
     namespace: openshift-operators
     syncWave: "0"
+    # Tekton cluster-defaults patch Job: components/pipelines rewrites the
+    # Tekton layer's cluster-specific param defaults (ci-build-push-template's
+    # image-registry; gitops-cd-{dev,qa,prod}'s gitops-url/git-host) from
+    # deployer.domain after the Tekton-layer Applications sync, and those two
+    # Applications get ignoreDifferences for exactly those fields so Argo's
+    # selfHeal keeps the patch. Requires components.tekton. Set false to go
+    # back to editing those defaults in pipelines/ by hand on every cluster
+    # move.
+    clusterDefaults: true
 
   # OpenShift Data Foundation. OPTIONAL, and OFF by default: the reference
   # cluster and most Red Hat workshop clusters already have it, and a second

@@ -34,6 +34,7 @@ oc get clusterinterceptors        # expect at least: cel, gitlab
 | `userinfo.yaml` | `demo-userinfo-pipelines` ConfigMap — orientation text for workshop UIs, no runtime effect |
 | `chains-job.yaml` / `chains-rbac.yaml` | post-install Job: generates the cosign keypair into `signing-secrets` (if still empty) and merge-patches `TektonConfig .spec.chain` for image signing + SLSA provenance |
 | `platform-config-job.yaml` | post-install Job: merge-patches operator-owned cluster CRs the demo needs — see below |
+| `cluster-defaults-job.yaml` | post-install Job: rewrites the Tekton layer's cluster-specific param defaults (`image-registry`, `gitops-url`, `git-host`) from `deployer.domain` — see below |
 
 No OperatorGroup: `openshift-operators` ships with one, and a second in the
 same namespace puts every operator in it into an error state.
@@ -63,6 +64,36 @@ wholesale without fighting the operators that curate them):
 
 Both are gated from `values.yaml` (`platformDefaults.defaultTimeoutMinutes`,
 `platformDefaults.consolePlugin.enabled`).
+
+## Cluster-specific Tekton defaults (`cluster-defaults-job.yaml`)
+
+The Tekton layer at the repo root is synced as plain YAML, so its
+cluster-specific param defaults are committed with the reference cluster's
+hostnames and go stale on every cluster move — most recently
+`ci-build-publish-5rxcw`, where `buildah push` timed out against the previous
+cluster's dead Quay and read as a credential problem. The Job rewrites those
+defaults on the live objects from `deployer.domain` on every sync:
+
+| Object | Param | Becomes |
+|---|---|---|
+| `TriggerTemplate/ci-build-push-template` | `image-registry` | `quay.apps.<domain>` |
+| `Pipeline/gitops-cd-{dev,qa,prod}` | `git-host` | `gitlab-gitlab.apps.<domain>` |
+| `Pipeline/gitops-cd-{dev,qa,prod}` | `gitops-url` | same URL with the host swapped |
+
+`gitops-url` keeps its group/repo path from the committed value — only the
+host is swapped, so the repo stays authoritative for everything but the
+domain. The Job waits for the Tekton-layer Applications (root-app waves 3–5)
+to produce the objects, then merge-patches the full `spec.params` array (a
+merge-patch replaces arrays wholesale). Patching is generic — any
+Pipeline/TriggerTemplate in the namespace carrying one of those params gets
+fixed — but the four expected targets must exist, or the Job fails rather
+than silently skipping a rename.
+
+`bootstrap-infra` also adds `ignoreDifferences` for exactly these fields to
+the `ssc-tekton-pipelines` / `ssc-tekton-triggers` Applications, so Argo's
+`selfHeal` does not revert the patch. The consequence: **repo-side edits to
+those defaults no longer reach a gitops-installed cluster** — change
+`deployer.domain`, or edit the files and the ignore lists together.
 
 ## Two fixes worth knowing about
 
@@ -102,3 +133,6 @@ on your cluster.
 | `chains.jobImage` | the stdlib-Python image both bootstrap Jobs run on |
 | `platformDefaults.defaultTimeoutMinutes` | TektonConfig default PipelineRun timeout (180; 0 = leave the operator default) |
 | `platformDefaults.consolePlugin.enabled` | patch the Pipelines nav plugin into `console.operator/cluster` |
+| `clusterDefaults.enabled` | the cluster-defaults patch Job (turned on by `bootstrap-infra`; off in a standalone render) |
+| `clusterDefaults.timeoutSeconds` | how long that Job waits for the Tekton layer to appear (1800) |
+| `pipelineNamespace` | where the Tekton layer lives and the Job patches; set by `bootstrap-infra` |
