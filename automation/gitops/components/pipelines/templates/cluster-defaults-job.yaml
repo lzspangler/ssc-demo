@@ -62,8 +62,16 @@ data:
                  "bootstrap values; the registry/SCM defaults cannot be "
                  "derived without it.")
     ns = os.environ["PIPELINE_NAMESPACE"]
-    QUAY = "quay.apps." + domain
-    GITLAB = "gitlab-gitlab.apps." + domain
+    # deployer.domain is the cluster's APPS subdomain ("apps.<cluster-domain>",
+    # required by bootstrap-infra's applications.yaml) -- the first run of this
+    # Job wrongly assumed a bare cluster domain and prepended "apps." again,
+    # writing quay.apps.apps.<domain> / gitlab-gitlab.apps.apps.<domain> into
+    # every default. Accept either spelling: use an apps-prefixed domain as
+    # given, prefix a bare one.
+    if not domain.startswith("apps."):
+        domain = "apps." + domain
+    QUAY = "quay." + domain
+    GITLAB = "gitlab-gitlab." + domain
 
     # API versions as committed in the Tekton layer itself.
     APIS = {
@@ -92,10 +100,21 @@ data:
         new, n = re.subn(r"^https?://[^/]+", "https://" + GITLAB, url, count=1)
         return new if n else None
 
+    # Fixes are scoped BY KIND to match bootstrap-infra's ignoreDifferences
+    # exactly: the pipelines app ignores gitops-url/git-host defaults, the
+    # triggers app ignores image-registry. Patching anything else (e.g. the
+    # issue templates' git-host) just gets reverted by Argo's selfHeal and
+    # flaps the Application on every sync. The issue templates' git-host
+    # default is never used anyway -- the trigger binding supplies the value
+    # from the webhook payload at run time.
     FIXES = {
-        "image-registry": lambda old: QUAY,
-        "git-host": lambda old: GITLAB,
-        "gitops-url": lambda old: rehost(old) if isinstance(old, str) else None,
+        "triggertemplates": {
+            "image-registry": lambda old: QUAY,
+        },
+        "pipelines": {
+            "git-host": lambda old: GITLAB,
+            "gitops-url": lambda old: rehost(old) if isinstance(old, str) else None,
+        },
     }
 
     def list_all():
@@ -132,7 +151,7 @@ data:
         params = (obj.get("spec") or {}).get("params") or []
         touched = False
         for p in params:
-            fix = FIXES.get(p.get("name"))
+            fix = FIXES.get(kind, {}).get(p.get("name"))
             if fix is None:
                 continue
             old = p.get("default")
