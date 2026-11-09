@@ -309,10 +309,14 @@ Applications, and it is only ever read at this `helm template` step. So after
 changing anything under `automation/gitops/bootstrap-infra/`, re-run the §5
 command to converge the cluster. `oc apply` makes it idempotent and adopts
 existing objects (e.g. a hand-made `spring-boot-example-dev`) in place; keep
-`/tmp/ssc-demo-values.yaml` — the private override from §4 is needed for every
+the private override from §4 somewhere DURABLE — `/tmp` is wiped on reboot
+(and macOS purges files unused for ~3 days), which silently deletes the only
+copy of the credentials. Keep it outside the repo (e.g. `~/.config/ssc-demo/`,
+`chmod 600`) so it cannot be committed by accident; it is needed for every
 re-render, not just the first. To apply only a slice of the chart, render with
 the full values and filter the output (e.g. just the `spring-boot-example-*`
-Applications) before piping to `oc apply`.
+Applications) before piping to `oc apply` — useful when the override file is
+gone but only Applications that carry no credentials need updating.
 
 Eleven Applications land at once; the sync waves serialise them.
 
