@@ -168,21 +168,34 @@ spec:
         # failsafe binding (the agent is only permitted TEST-SCOPED additions
         # and may have added none), and without a binding `mvn verify` silently
         # runs zero *IT.java tests -- the re-run would pass while testing
-        # nothing. DIRECT failsafe invocation runs the *IT.java suite
+        # nothing. DIRECT failsafe invocation runs the integration suite
         # regardless of pom bindings. It MUST be scoped with -Dit.test (same
         # pattern as the functional pipeline's -Dit.test=*FT): without it the
         # invocation INHERITS the pom's failsafe includes, which on this app
         # are **/*FT.java -- the FUNCTIONAL tests, RestAssured against
         # APP_BASE_URL from a deployed app this pipeline never stands up
         # (agentic-test-generation-integration-issue-hdrhp: all 8 FTs errored
-        # "Target host is null" while every *IT passed). test-compile rather
-        # than `test` because the unit suite is the unit pipeline's job.
+        # "Target host is null" while every *IT passed).
+        #
+        # The pattern covers BOTH integration naming conventions, because the
+        # agent does not reliably follow the skill's *IT.java contract: the
+        # repo's own seed tests are integration/*IntegrationTest.java, and the
+        # agent imitates what it sees (agentic-test-generation-integration-
+        # issue-jbvhv: it wrote ConfigImportSimpleIntegrationTest et al. --
+        # which passed the task's internal verification by explicit class
+        # name, then matched the bare *IT pattern zero times and failsafe
+        # failed "No tests matching pattern"). Both patterns are
+        # deployment-free in-JVM tests, so running the seed *IntegrationTest
+        # classes under failsafe is safe. If NEITHER matches, failsafe fails
+        # loudly -- that means the agent produced nothing integration-shaped.
+        # test-compile rather than `test` because the unit suite is the unit
+        # pipeline's job.
         - name: GOALS
           value:
             - test-compile
             - failsafe:integration-test
             - failsafe:verify
-            - -Dit.test=*IT
+            - -Dit.test=*IT,*IntegrationTest
         - name: SUBDIRECTORY
           value: $(params.subdirectory)
       workspaces:
