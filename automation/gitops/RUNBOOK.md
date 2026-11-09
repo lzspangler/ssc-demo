@@ -492,6 +492,7 @@ oc -n $NS get tasks | wc -l                                  # 23 + header
 oc -n $NS get pipelines                                      # 4 agentic + maven-build-ci
 oc -n $NS get eventlistener agentic-issue-commands           # ADDRESS populated
 oc get clusterinterceptors                                   # at least cel, gitlab
+oc -n $NS logs job/tekton-cluster-defaults                   # "already correct for <domain>"
 
 # Credentials — all six must exist
 oc -n $NS get secret scm-auth-secret scm-auth-gitops-secret gitlab-webhook-secret quay-push \

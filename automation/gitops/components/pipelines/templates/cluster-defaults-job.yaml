@@ -1,0 +1,252 @@
+{{- if and .Values.pipelines.enabled .Values.clusterDefaults.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tekton-cluster-defaults
+  namespace: {{ .Values.pipelineNamespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.clusterDefaults | quote }}
+data:
+  rewrite.py: |
+    # Cluster-specific defaults for the Tekton layer.
+    #
+    # The Tekton layer under pipelines/ (repo root) is synced by Argo as
+    # PLAIN YAML -- ssc-tekton-pipelines / ssc-tekton-triggers point at plain
+    # directories, no Helm -- so the cluster-specific param defaults
+    # committed there carry the REFERENCE cluster's hostnames and go stale on
+    # every cluster move:
+    #
+    #   TriggerTemplate ci-build-push-template  param image-registry
+    #   Pipeline gitops-cd-{dev,qa,prod}        params gitops-url, git-host
+    #
+    # ci-build-publish-5rxcw (2026-11-08) is what that looks like when it
+    # bites: package and the image build succeed, then buildah push times out
+    # against the previous cluster's dead Quay, which reads as a credential
+    # problem rather than a wrong-cluster problem.
+    #
+    # This Job rewrites those defaults on the LIVE objects from
+    # deployer.domain every time this component syncs. bootstrap-infra also
+    # adds ignoreDifferences for exactly these fields (jqPathExpressions
+    # naming the params) to the two Tekton Applications, so Argo's selfHeal
+    # does not revert the patch. Flip side: repo-side edits to those defaults
+    # no longer reach a gitops-installed cluster -- change deployer.domain,
+    # or edit the files and the ignore lists together.
+    #
+    # Idempotent, pure stdlib against the in-cluster API -- no oc, no pip.
+    import json, os, re, ssl, sys, time, urllib.error, urllib.request
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    token = open(SA + "/token").read().strip()
+    ctx = ssl.create_default_context(cafile=SA + "/ca.crt")
+
+    def call(path, method="GET", body=None, ctype="application/json"):
+        req = urllib.request.Request(
+            API + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                     **({"Content-Type": ctype} if body is not None else {})})
+        try:
+            with urllib.request.urlopen(req, context=ctx) as r:
+                raw = r.read()
+                return r.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()[:300]
+
+    domain = os.environ.get("CLUSTER_DOMAIN", "").strip()
+    if not domain:
+        sys.exit("ERROR: CLUSTER_DOMAIN is empty -- set deployer.domain in the "
+                 "bootstrap values; the registry/SCM defaults cannot be "
+                 "derived without it.")
+    ns = os.environ["PIPELINE_NAMESPACE"]
+    QUAY = "quay.apps." + domain
+    GITLAB = "gitlab-gitlab.apps." + domain
+
+    # API versions as committed in the Tekton layer itself.
+    APIS = {
+        "triggertemplates":
+            "/apis/triggers.tekton.dev/v1beta1/namespaces/%s/triggertemplates" % ns,
+        "pipelines":
+            "/apis/tekton.dev/v1/namespaces/%s/pipelines" % ns,
+    }
+
+    # Patching is generic -- any Pipeline / TriggerTemplate in the namespace
+    # carrying one of these params gets fixed -- but these four targets must
+    # EXIST: a rename that silently falls out of the patch set is the
+    # original failure mode back again, so a missing target fails the Job
+    # instead of being skipped.
+    EXPECTED = {
+        ("triggertemplates", "ci-build-push-template"),
+        ("pipelines", "gitops-cd-dev"),
+        ("pipelines", "gitops-cd-qa"),
+        ("pipelines", "gitops-cd-prod"),
+    }
+
+    def rehost(url):
+        # gitops-url: swap only the host, preserving the group/repo path from
+        # the committed value -- the repo stays authoritative for everything
+        # but the domain.
+        new, n = re.subn(r"^https?://[^/]+", "https://" + GITLAB, url, count=1)
+        return new if n else None
+
+    FIXES = {
+        "image-registry": lambda old: QUAY,
+        "git-host": lambda old: GITLAB,
+        "gitops-url": lambda old: rehost(old) if isinstance(old, str) else None,
+    }
+
+    def list_all():
+        inv = {}
+        for kind, base in APIS.items():
+            st, body = call(base)
+            if st != 200:
+                print("waiting for the %s API ... (%s)" % (kind, st), flush=True)
+                return None
+            for item in body.get("items") or []:
+                inv[(kind, item["metadata"]["name"])] = item
+        return inv
+
+    # The Tekton Applications sync at root-app waves 3-5 and can fail their
+    # first attempts while the operator installs CRDs (see RUNBOOK.md), and
+    # Argo does not order syncs ACROSS Applications anyway -- so wait for the
+    # objects rather than assuming they exist.
+    print("waiting for the Tekton layer in namespace %s ..." % ns, flush=True)
+    deadline = time.time() + int(os.environ.get("TIMEOUT_SECONDS", "1800"))
+    while True:
+        inv = list_all()
+        if inv is not None:
+            missing = sorted("%s/%s" % m for m in EXPECTED if m not in inv)
+            if not missing:
+                break
+            print("waiting for: %s" % ", ".join(missing), flush=True)
+        if time.time() > deadline:
+            sys.exit("TIMEOUT: the Tekton layer never fully appeared; expected "
+                     "%s" % ", ".join(sorted("%s/%s" % m for m in EXPECTED)))
+        time.sleep(15)
+
+    changes = 0
+    for (kind, name), obj in sorted(inv.items()):
+        params = (obj.get("spec") or {}).get("params") or []
+        touched = False
+        for p in params:
+            fix = FIXES.get(p.get("name"))
+            if fix is None:
+                continue
+            old = p.get("default")
+            new = fix(old)
+            if new is None:
+                print("WARNING: %s/%s param %s: cannot derive a replacement "
+                      "for %r -- left alone" % (kind, name, p.get("name"), old))
+            elif new != old:
+                p["default"] = new
+                touched = True
+                changes += 1
+                print("%s/%s: %s %r -> %r" % (kind, name, p.get("name"), old, new))
+        if touched:
+            # A merge-patch replaces the array wholesale, so send the FULL
+            # params list -- the untouched entries ride along unchanged.
+            st, err = call(APIS[kind] + "/" + name, "PATCH",
+                           {"spec": {"params": params}},
+                           "application/merge-patch+json")
+            if st != 200:
+                sys.exit("ERROR: patching %s/%s: %s %s" % (kind, name, st, err))
+
+    if changes:
+        print("OK: rewrote %d cluster-specific default(s) for %s" % (changes, domain))
+    else:
+        print("OK: cluster-specific defaults already correct for %s" % domain)
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tekton-cluster-defaults
+  namespace: {{ .Values.pipelineNamespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.clusterDefaults | quote }}
+---
+# A namespaced Role, unlike the platform-config Job's ClusterRole: the
+# targets (Pipelines, TriggerTemplates) live only in this namespace. Narrow
+# on purpose -- this Job runs on every sync.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tekton-cluster-defaults
+  namespace: {{ .Values.pipelineNamespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.clusterDefaults | quote }}
+rules:
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelines"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: ["triggers.tekton.dev"]
+    resources: ["triggertemplates"]
+    verbs: ["get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tekton-cluster-defaults
+  namespace: {{ .Values.pipelineNamespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.clusterDefaults | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tekton-cluster-defaults
+subjects:
+  - kind: ServiceAccount
+    name: tekton-cluster-defaults
+    namespace: {{ .Values.pipelineNamespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tekton-cluster-defaults
+  namespace: {{ .Values.pipelineNamespace }}
+  labels:
+    {{- include "pipelines.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.pipelines.syncWaves.clusterDefaults | quote }}
+    # Replace+Force, for the same reason as the platform-config Job: a Job's
+    # pod template is immutable, so a plain sync fails with "field is
+    # immutable" and never re-runs an edited script.
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "pipelines.labels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: tekton-cluster-defaults
+      volumes:
+        - name: scripts
+          configMap:
+            name: tekton-cluster-defaults
+      containers:
+        - name: rewrite
+          # Same stdlib-Python image as the other bootstrap Jobs in this
+          # component (the key exists in values.yaml regardless of
+          # chains.enabled).
+          image: {{ .Values.chains.jobImage }}
+          env:
+            - name: CLUSTER_DOMAIN
+              value: {{ .Values.deployer.domain | quote }}
+            - name: PIPELINE_NAMESPACE
+              value: {{ .Values.pipelineNamespace | quote }}
+            - name: TIMEOUT_SECONDS
+              value: {{ .Values.clusterDefaults.timeoutSeconds | quote }}
+          command: ["python3", "-I", "/scripts/rewrite.py"]
+          volumeMounts:
+            - {name: scripts, mountPath: /scripts}
+{{- end }}
