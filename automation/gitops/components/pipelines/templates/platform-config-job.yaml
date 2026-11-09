@@ -16,9 +16,12 @@ data:
     # Idempotent, because this runs on every Argo sync:
     #   1. TektonConfig spec.pipeline.default-timeout-minutes -- the DEFAULT
     #      PipelineRun timeout. The API server materializes it into
-    #      spec.timeouts.pipeline of every run created WITHOUT an explicit one
-    #      (verified with a server-side dry-run), which includes every
-    #      console-started agentic run. The stock 60m no longer fits: the
+    #      spec.timeouts.pipeline of every run created WITHOUT an explicit
+    #      one (verified with a server-side dry-run). This reaches trigger-
+    #      and CLI-created runs; it does NOT reach console-started runs (the
+    #      web console submits an explicit 1h0m0s on every run it starts) and
+    #      it overwrites the legacy spec.timeout field rather than respecting
+    #      it. The stock 60m no longer fits: the
     #      cve-analysis upstream tasks alone eat ~40 min at current advisory
     #      scale, and the model-gated analysis needs another ~45-90 min.
     #   2. console.operator/cluster spec.plugins += pipelines-console-plugin --

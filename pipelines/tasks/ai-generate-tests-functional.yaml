@@ -219,9 +219,11 @@ spec:
         fi
 
         # ---- Time budgets -----------------------------------------------------
-        # The PipelineRun has a 2h timeout (set in the issue TriggerTemplate;
-        # the Tekton default is 1h, which manual runs get unless they set it
-        # themselves), and on timeout Tekton cancels AND deletes the pod --
+        # The PipelineRun has a 2h timeout (pinned as spec.timeouts.pipeline
+        # in the issue TriggerTemplate; note the legacy spec.timeout field
+        # gets overwritten by OpenShift's default-timeout admission, and
+        # console-started runs pin their own 1h), and on timeout Tekton
+        # cancels AND deletes the pod --
         # the step logs (including the agent tee) vanish, so a hung run
         # leaves nothing to diagnose. Three defenses:
         #   1. AGENT_TIMEOUT caps each agent invocation (a stalled model
