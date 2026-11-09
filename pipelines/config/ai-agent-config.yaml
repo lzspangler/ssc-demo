@@ -23,7 +23,7 @@
 #                 Secret (use any placeholder for servers that don't check it).
 #
 # AI_AGENT -- which coding-agent CLI drives the file-editing tasks
-#             (ai-generate-tests, ai-remediate-dependency):
+#             (ai-generate-tests-unit, ai-remediate-dependency):
 #   claude-code -> Claude Code headless (Anthropic protocol only). Use with
 #                  AI_PROVIDER anthropic|gateway|bedrock|vertex.
 #   aider       -> aider (litellm-backed) for OpenAI-compatible models. Use with

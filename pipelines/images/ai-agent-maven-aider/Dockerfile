@@ -1,5 +1,5 @@
 # AI coding-agent runtime -- AIDER / Python flavor.
-# Used by: ai-generate-tests, ai-remediate-dependency when AI_AGENT=aider.
+# Used by: ai-generate-tests-unit, ai-remediate-dependency when AI_AGENT=aider.
 # Pair with AI_PROVIDER=openai to reach any OpenAI-compatible endpoint -- gpt-oss,
 # IBM Granite, and any vLLM/RHOAI/Ollama/watsonx model server.
 #

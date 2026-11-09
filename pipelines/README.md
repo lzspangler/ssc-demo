@@ -10,10 +10,10 @@ can be run on its own:
    carries the same six fields so commenting `/remediate` on it starts pipeline 3.
 2. **`agentic-cve-remediation`** — *apply a fix.* Takes a CVE decision **as
    params**, has the AI bump the vulnerable Maven dependency to its fixed
-   version, re-runs `mvn verify`, and opens a **PR/MR**. Does no discovery or
-   scanning of its own.
-3. **`agentic-test-generation`** — *raise test coverage.* Runs just the AI
-   **test-generation** flow (clone → build → generate tests → `mvn verify` →
+   version, re-runs `mvn package` (unit tests only), and opens a **PR/MR**.
+   Does no discovery or scanning of its own.
+3. **`agentic-test-generation-unit`** — *raise test coverage.* Runs just the AI
+   **test-generation** flow (clone → build → generate unit tests → `mvn test` →
    tests-only PR/MR). No image build, SBOM/scan, or CVE remediation. Triggered
    with `/generate-tests-unit`.
 4. **`agentic-test-generation-integration`** — same flow, but the agent
@@ -49,15 +49,16 @@ This repo defines **six** pipelines that share the same tasks and images:
   opens **one issue per vulnerability** (each issue carries the six-field
   decision). Changes nothing in the repo beyond creating issues.
 - **`pipelines/agentic-cve-remediation.yaml`** — applies a decision (passed in as
-  params) to the git project: clone → AI bump the dependency → `mvn verify` →
-  PR/MR. The remediation tail runs only when `SELECTED="1"`.
-- **`pipelines/agentic-test-generation.yaml`** — a standalone AI
-  **test-generation** flow (clone → build → generate tests → `mvn verify` →
+  params) to the git project: clone → AI bump the dependency → `mvn package`
+  (unit tests only) → PR/MR. The remediation tail runs only when `SELECTED="1"`.
+- **`pipelines/agentic-test-generation-unit.yaml`** — a standalone AI
+  **test-generation** flow (clone → build → generate unit tests → `mvn test` →
   tests-only PR/MR). No image build, SBOM/scan, or CVE remediation.
 - **`pipelines/agentic-test-generation-integration.yaml`** — the same flow
   generating integration tests (`*IT.java`, embedded/WireMock doubles only);
-  re-runs the unit suite plus direct failsafe invocation of the `*IT.java`
-  suite; the MR stages `pom.xml` test-scoped additions alongside `src/test`.
+  re-runs direct failsafe invocation of the `*IT.java` suite (scoped
+  `-Dit.test=*IT`); the MR stages `pom.xml` test-scoped additions alongside
+  `src/test`.
 - **`pipelines/agentic-test-generation-functional.yaml`** — the same flow
   generating functional tests (`*FT.java`, black-box REST Assured). The
   pipeline deploys the application under test as **ephemeral namespaced
@@ -111,10 +112,10 @@ selection — those live in `agentic-cve-selection`.
 | `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
 | `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
 | `ai-remediate-dependency` (`ai-remediate-dependency`) | if `SELECTED="1"` | AI edits `pom.xml` to bump only the vulnerable dependency (`PACKAGE`) to `FIXED_VERSION` and confirms it still compiles (scratch build); leaves the change on the workspace. `CHANGED` result. | **AI model server** (reasoning + edits); **Artifact repository** — Maven repo/mirror (`maven-settings`), installed as `~/.m2/settings.xml` so both the verify-compile and the agent's own `mvn` calls resolve through it. A pinned Lightwell `.rhlw` backport does not exist on Central, so without this workspace the verify-compile fails on the version the agent just pinned. |
-| `re-run-tests` (`maven`) | if `SELECTED="1"` | Runs `mvn verify` against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
+| `re-run-tests` (`maven`) | if `SELECTED="1"` | Runs `mvn package` (surefire unit tests only) against the remediated tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
 | `open-pr` (`open-pr`) | if `SELECTED="1"` | Commits the remediation to an `rhtpa/*` branch, pushes it, and opens a PR/MR (carries the CVE/fix context; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger). Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
-### `agentic-test-generation` steps
+### `agentic-test-generation-unit` steps
 
 Every task runs unconditionally except **`verify-commit`** (optional). No `init`,
 image build, SBOM upload, or RHTPA scan. The two sibling pipelines
@@ -126,13 +127,13 @@ for what differs.
 | `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
 | `verify-commit` (`verify-commit`) | only if `verify-commit="true"` | Verifies the cloned commit's signature against the signing infrastructure. | **RHTAS** — Rekor (`rekor-url`), TUF (`tuf-mirror`), Fulcio/OIDC issuer (`oidc-issuer`). |
 | `package` (`maven`) | always | Runs the Maven build in `<workspace>/<subdirectory>`, producing `target/`. | **Artifact repository** — Maven repo/mirror for dependency resolution (`maven-settings` workspace). |
-| `ai-generate-tests` (`ai-generate-tests`) | always | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** — Maven repo/mirror (`maven-settings`), installed as `~/.m2/settings.xml` so both the scratch verification build and the agent's own `mvn test` calls resolve through it. Once a remediation PR has merged, the tree carries a Lightwell `.rhlw` pin that does not exist on Central. |
-| `re-run-tests` (`maven`) | always | Runs `mvn verify` (existing + generated tests) against the tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
+| `ai-generate-tests-unit` (`ai-generate-tests-unit`) | always | AI coding agent generates JUnit tests under `src/test/**` and runs them (in a pod-local scratch copy); leaves the new tests on the workspace. `TESTS_ADDED` result. | **AI model server** (reasoning + edits); **Artifact repository** — Maven repo/mirror (`maven-settings`), installed as `~/.m2/settings.xml` so both the scratch verification build and the agent's own `mvn test` calls resolve through it. Once a remediation PR has merged, the tree carries a Lightwell `.rhlw` pin that does not exist on Central. |
+| `re-run-tests` (`maven`) | always | Runs `mvn test` (existing + generated unit tests; surefire only — never the failsafe `*FT`/`*IT` classes) against the tree. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
 | `open-pr` (`open-pr-tests`) | always | Commits **only** the generated tests (`src/test`) to an `ai-tests/*` branch and opens a tests-only PR/MR (no CVE/fix wording; adds `Related to #N` when `ISSUE_IID` is set by an issue trigger); no-ops if nothing changed. Runs on the **agent image** (bundles git/glab/gh). `PR_URL` result. | **SCM / Git repo** — `git push` + `glab mr create` / `gh pr create` (creds from `scm-auth-secret`). |
 
 ### `agentic-test-generation-integration` / `-functional` steps
 
-Same chain as `agentic-test-generation` (clone → verify-commit → package → … →
+Same chain as `agentic-test-generation-unit` (clone → verify-commit → package → … →
 re-run → open-pr), with the differences below. Each generation task follows its
 own agent skill — `test-generation-integration` / `test-generation-functional`
 — which defines the category's execution contract and tool stack; the task
@@ -144,9 +145,9 @@ prompt carries only the run contract.
 | Test category / naming | integration — `*IT.java` | functional — `*FT.java` |
 | What the agent generates | interactions between components and their dependencies, every dependency a **test-managed double** (embedded H2, WireMock stub; **no Testcontainers** — CI runners are dockerless) | black-box REST Assured tests of the **deployed application** through its service interface (OpenAPI spec as read-only context); no DB/actuator/log assertions, data self-arranged via the API with **unique identifiers** (the app's state persists across runs) |
 | App under test | none — doubles run inside the test JVM | `deploy-app-under-test` builds an image from the packaged boot jar, pushes it to the **integrated registry**, and creates a Deployment + Service in `tssc-app-ci` (named after the PipelineRun, so concurrent runs never collide); its readiness probe is the app's health endpoint, so the task only succeeds once the app genuinely serves. The generation task then drives that Deployment through the Kubernetes API with its own service-account token: **state reset** (delete the app's pods → fresh in-memory database) before every verification run, and the app's **server log tail** appended to the agent's failure feedback (the stack traces behind HTTP 5xx responses live there, not in the Maven output) |
-| `re-run-tests` goals | `test` + direct `failsafe:integration-test` + `failsafe:verify` (runs the whole `*IT.java` suite even without a pom failsafe binding) | `test-compile` → direct failsafe (scoped `-Dit.test=*FT`) → `failsafe:verify`, against the deployed app's Service URL (`-DAPP_BASE_URL` + credentials; no `spring-boot:start`/`stop` — the app is a Deployment, not a forked JVM in the pod). Preceded by `reset-app-under-test`, which deletes the app's pods so the re-run sees the same fresh state the generation task verified against |
+| `re-run-tests` goals | `test-compile` + direct `failsafe:integration-test` + `failsafe:verify`, scoped `-Dit.test=*IT` (runs the `*IT.java` suite even without a pom failsafe binding) | `test-compile` → direct failsafe (scoped `-Dit.test=*FT`) → `failsafe:verify`, against the deployed app's Service URL (`-DAPP_BASE_URL` + credentials; no `spring-boot:start`/`stop` — the app is a Deployment, not a forked JVM in the pod). Preceded by `reset-app-under-test`, which deletes the app's pods so the re-run sees the same fresh state the generation task verified against |
 | MR contents | `src/test` + `pom.xml` (test-scoped additions such as WireMock/Awaitility) | `src/test` + `pom.xml` (test-scoped additions such as REST Assured) |
-| Why direct failsafe, not `mvn verify` | the pom may declare no failsafe binding (the agent is only *permitted* test-scoped changes), and without a binding `mvn verify` silently runs **zero** `*IT.java`/`*FT.java` tests — the re-run would go green while testing nothing | same |
+| Why direct failsafe, not `mvn verify` | the pom may declare no failsafe binding (the agent is only *permitted* test-scoped changes), and without a binding `mvn verify` silently runs **zero** `*IT.java`/`*FT.java` tests — the re-run would go green while testing nothing. The `-Dit.test` scope is not optional: the CLI failsafe goal otherwise inherits the pom's failsafe includes, which on this app are `**/*FT.java` — the functional tests against a deployed app (`agentic-test-generation-integration-issue-hdrhp`) | same |
 | Ephemeral resources / cleanup | none | Deployment + Service + ImageStream labeled `app.kubernetes.io/part-of=ephemeral-test-resources` and carrying an ownerReference to the PipelineRun; `cleanup-app-under-test` runs as a **`finally` task** (success *or* failure) and never fails the run. Hard-timeout caveat: a PipelineRun **timeout** cancels finally tasks too, so on that path the resources linger until the PipelineRun object is deleted (ownerReference GC) — or sweep manually: `oc -n tssc-app-ci delete deployment,service,imagestream -l app.kubernetes.io/part-of=ephemeral-test-resources` |
 | RBAC | none beyond the standard pipeline SA | `pipeline` SA gets the `app-under-test-lifecycle` Role (deployments/services/pods, pods/log, imagestreams — all in `tasks/deploy-app-under-test.yaml`) plus `system:image-builder` for the integrated registry push; the pipeline pins the ephemeral-resource tasks to that SA via `taskRunSpecs` |
 | SCC | none | the generated app Deployment is **restricted-v3-clean by construction**: `hostUsers: false` (restricted-v3 mandates a user namespace), `runAsNonRoot` with an admission-assigned uid (the restricted SCCs enforce MustRunAsRange 1000–65534 — don't pin the image's nominal user 185, it's below the minimum), all capabilities dropped, seccomp `runtime/default`; no special SCC needed. The deploy task's buildah step adds `SETFCAP` and runs under the operator's `pipelines-scc` — **spell it all-caps**: SCC capability matching is case-sensitive and the Tekton-catalog spelling `SETFCap` is rejected by every SCC on the cluster |
@@ -158,7 +159,7 @@ prompt carries only the run contract.
 | `pipelines/agentic-cve-selection.yaml` | Self-contained CVE discovery/scan/selection pipeline (build → SBOM → RHTPA scan → must-fix gate → AI select); outputs the selection decision as results |
 | `pipelines/agentic-cve-analysis.yaml` | Same scan chain, but analyzes every fixable CVE and opens one issue per vulnerability (each carries the six-field decision) |
 | `pipelines/agentic-cve-remediation.yaml` | Applies a selection decision (in via params) to the repo: clone → AI bump dependency → `mvn verify` → PR/MR |
-| `pipelines/agentic-test-generation.yaml` | Standalone AI test-generation pipeline (generate tests → `mvn verify` → tests-only PR/MR) |
+| `pipelines/agentic-test-generation-unit.yaml` | Standalone AI test-generation pipeline (generate unit tests → `mvn test` → tests-only PR/MR) |
 | `pipelines/agentic-test-generation-integration.yaml` | Same flow generating integration tests (`*IT.java`, embedded/WireMock doubles); re-run uses direct failsafe; MR stages test-scoped pom additions |
 | `pipelines/agentic-test-generation-functional.yaml` | Same flow generating functional tests (`*FT.java`, black-box REST Assured) against the app deployed as ephemeral namespaced resources; `finally` task guarantees cleanup; `taskRunSpecs` pin the ephemeral-resource tasks to the `pipeline` SA |
 | `pipelines/gitops-cd-dev.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
@@ -176,7 +177,7 @@ prompt carries only the run contract.
 | `secrets/scm-auth-secret.example.yaml` | Example Secret — Git token for opening the PR/MR |
 | `secrets/scm-auth-gitops-secret.example.yaml` | Example Secret — the gitops repository's own token for the gitops CD pipelines (a GitLab project bot cannot be shared across projects, so it is separate from `scm-auth-secret`) |
 | `secrets/gitlab-webhook-secret.example.yaml` | Example Secret — shared token validating the GitLab issue webhook |
-| `tasks/ai-generate-tests.yaml` | AI generates + runs unit tests |
+| `tasks/ai-generate-tests-unit.yaml` | AI generates + runs unit tests |
 | `tasks/ai-generate-tests-integration.yaml` | AI generates + runs integration tests (`*IT.java`) per the `test-generation-integration` skill |
 | `tasks/ai-generate-tests-functional.yaml` | AI generates + runs functional tests (`*FT.java`) per the `test-generation-functional` skill, against the app **deployed** by `deploy-app-under-test`; health-checks it, resets its state (pod deletion) before every verification run, and feeds its server log tail back to the agent on failures |
 | `tasks/deploy-app-under-test.yaml` | Deploys the app under test as ephemeral namespaced resources (jar → image → integrated registry → health-gated Deployment + Service, owner-referenced to the PipelineRun); the generated Deployment is restricted-v3-clean (user namespace, non-root, no capabilities); **also carries the RBAC** — Role `app-under-test-lifecycle` + `system:image-builder` RoleBinding for the `pipeline` SA (namespace hardcoded to `tssc-app-ci`; change it if the pipeline namespace moves) |
@@ -258,7 +259,7 @@ per run):
 ### `agentic-cve-remediation`
 
 ```
-clone-repository → verify-commit → ai-remediate-dependency → re-run-tests (mvn verify) → open-pr
+clone-repository → verify-commit → ai-remediate-dependency → re-run-tests (mvn package) → open-pr
                                                         (whole tail only if SELECTED == "1")
 ```
 
@@ -270,27 +271,33 @@ PR. `ai-remediate-dependency`, `re-run-tests`, and `open-pr` are each gated on
 `"0"`) makes the pipeline a clean no-op after the clone. The guard is repeated on
 all three tasks because Tekton's "skipped-parent still runs the successor"
 semantics don't short-circuit a `runAfter` successor unless the successor's own
-`when` also fails. `verify-commit` is optional. Like the other pipelines the
-agent and `mvn verify` run in a pod-local scratch copy to avoid the
+`when` also fails. `verify-commit` is optional. The re-run stops at `mvn package`:
+surefire unit tests only — the pom's main build binds failsafe to `**/*FT.java`,
+so `verify` would run the deployment-dependent functional tests (see
+`agentic-cve-remediation-issue-mhm88`). Like the other pipelines the
+agent and `mvn package` run in a pod-local scratch copy to avoid the
 shared-`target/` race.
 
-### `agentic-test-generation`
+### `agentic-test-generation-unit`
 
 ```
-clone-repository → verify-commit → package → ai-generate-tests → re-run-tests (mvn verify) → open-pr
+clone-repository → verify-commit → package → ai-generate-tests-unit → re-run-tests (mvn test) → open-pr
                                                           (re-run-tests + open-pr only if TESTS_ADDED != "0")
 ```
 
-The standalone test-generation pipeline (`pipelines/agentic-test-generation.yaml`)
-is the `ai-generate-tests` flow split out on its own. It has no `init`, image
+The standalone test-generation pipeline (`pipelines/agentic-test-generation-unit.yaml`)
+is the `ai-generate-tests-unit` flow split out on its own. It has no `init`, image
 build, SBOM upload, or RHTPA scan; every task runs unconditionally except
 **`verify-commit`** (optional) and the `re-run-tests`/`open-pr` tail, which is
-gated on `ai-generate-tests` actually producing new/changed tests
+gated on `ai-generate-tests-unit` actually producing new/changed tests
 (`TESTS_ADDED != "0"`) — a run that generates nothing ends cleanly after
-`ai-generate-tests`. The final `open-pr` step uses the **`open-pr-tests`** task —
+`ai-generate-tests-unit`. The re-run stops at `mvn test`: surefire unit tests only —
+the pom's main build binds failsafe to `**/*FT.java`, so `verify` would run the
+deployment-dependent functional tests this pipeline never stands up. The final
+`open-pr` step uses the **`open-pr-tests`** task —
 a tests-only variant that commits just the generated tests (`src/test`) to an
 `ai-tests/*` branch with no CVE/fix wording, and no-ops if nothing changed. Like
-the CVE pipelines the agent and `mvn verify` run in a pod-local scratch copy to
+the CVE pipelines the agent and `mvn test` run in a pod-local scratch copy to
 avoid the shared-`target/` race. It needs the `ai-agent-config`/`ai-agent-secret`
 and `scm-auth-secret` objects (and the agent image), but not `tpa-secret`, RHTPA,
 or TAS.
@@ -308,7 +315,7 @@ clone-repository → verify-commit → package → deploy-app-under-test → ai-
   finally (always, success or failure): cleanup-app-under-test
 ```
 
-Identical gating to `agentic-test-generation` above; the task-level differences
+Identical gating to `agentic-test-generation-unit` above; the task-level differences
 (skill, verification goals, app lifecycle, MR contents, ephemeral resources and
 their cleanup) are in the steps table in the [Overview](#overview). Three
 things worth restating:
@@ -467,7 +474,7 @@ a pipeline by **commenting a slash-command on a GitLab issue**:
 | Comment | Starts | Needs a decision? |
 |---|---|---|
 | `/remediate` | `agentic-cve-remediation` | yes — reads the six-field decision from the issue |
-| `/generate-tests-unit` | `agentic-test-generation` | no — only the repo coordinates |
+| `/generate-tests-unit` | `agentic-test-generation-unit` | no — only the repo coordinates |
 | `/generate-tests-functional` | `agentic-test-generation-functional` | no — only the repo coordinates |
 | `/generate-tests-integration` | `agentic-test-generation-integration` | no — only the repo coordinates |
 
@@ -530,7 +537,8 @@ start a run.
 
 ### `/generate-tests-unit`
 
-Kicks off `agentic-test-generation` (add JUnit tests, run them, open a PR). Unlike
+Kicks off `agentic-test-generation-unit` (add JUnit unit tests, run them, open a
+PR). Unlike
 `/remediate` it carries **no decision** — the comment is just the command on its
 own line:
 
@@ -571,7 +579,7 @@ oc get clusterinterceptors      # expect at least: cel, gitlab
 
 **2. The pipelines + their tasks must already be applied.** Each trigger only
 creates a PipelineRun that references its Pipeline (`agentic-cve-remediation` for
-`/remediate`, `agentic-test-generation` for `/generate-tests-unit`,
+`/remediate`, `agentic-test-generation-unit` for `/generate-tests-unit`,
 `agentic-test-generation-functional` for `/generate-tests-functional`,
 `agentic-test-generation-integration` for `/generate-tests-integration`); those
 Pipelines and every Task they use must exist in the namespace (your normal
@@ -678,7 +686,7 @@ oc -n tssc-app-ci create secret generic maven-settings \
 ```
 
 Note that the four AI tasks reach the mirror by a different route than the `maven`
-task does. `ai-remediate-dependency` and `ai-generate-tests` copy the workspace's
+task does. `ai-remediate-dependency` and `ai-generate-tests-unit` copy the workspace's
 `settings.xml` to `~/.m2/settings.xml` at the top of their step, because the coding
 agent composes its own `mvn` command lines and there is no way to add `-s` to them;
 one file covers both the agent's calls and the task's own scratch verification
@@ -718,8 +726,8 @@ Everything below is assumed to be in place **before** the `## One-time setup`
 commands. Items marked _(scan chain)_ are needed by **`agentic-cve-selection`**
 (the build → SBOM → RHTPA scan half); the AI/SCM items are needed by whichever
 pipelines you run (`agentic-cve-selection` uses the AI model server;
-`agentic-cve-remediation` and `agentic-test-generation` additionally push a
-PR/MR). `agentic-cve-remediation` and `agentic-test-generation` do **not** need
+`agentic-cve-remediation` and `agentic-test-generation-unit` additionally push a
+PR/MR). `agentic-cve-remediation` and `agentic-test-generation-unit` do **not** need
 RHTPA or `tpa-secret`. The examples use the namespace `tssc-app-ci` — substitute
 your own.
 
@@ -1212,7 +1220,7 @@ many lookups failed so a degraded run is visible rather than merely quieter.
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-selection.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-analysis.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-cve-remediation.yaml
-   oc -n tssc-app-ci apply -f pipelines/agentic-test-generation.yaml
+   oc -n tssc-app-ci apply -f pipelines/agentic-test-generation-unit.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-test-generation-integration.yaml
    oc -n tssc-app-ci apply -f pipelines/agentic-test-generation-functional.yaml
    ```
@@ -1227,11 +1235,11 @@ many lookups failed so a degraded run is visible rather than merely quieter.
 There is no single on/off gate anymore — you **start whichever pipeline** does the
 job. A typical CVE run is two steps: `agentic-cve-selection` to decide, then
 `agentic-cve-remediation` with that decision as params (see
-[Hand-off](#hand-off-selection--remediation)). `agentic-test-generation` (and its
-`-integration` / `-functional` siblings) run independently.
+[Hand-off](#hand-off-selection--remediation)). `agentic-test-generation-unit` (and
+its `-integration` / `-functional` siblings) run independently.
 
 The pipelines that open a PR/MR (`agentic-cve-remediation`,
-`agentic-test-generation`) need the SCM params set on the PipelineRun (or in the
+`agentic-test-generation-unit`) need the SCM params set on the PipelineRun (or in the
 PaC template):
 
 ```yaml
@@ -1273,7 +1281,7 @@ and Claude Code auth:
 | `openai` | `AI_BASE_URL` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint — **gpt-oss, IBM Granite** via vLLM / RHOAI / Ollama / watsonx |
 
 **`AI_AGENT`** — which coding-agent CLI drives the file-editing tasks
-(`ai-generate-tests`, `ai-remediate-dependency`):
+(`ai-generate-tests-unit`, `ai-remediate-dependency`):
 
 | `AI_AGENT` | Use with | Runtime |
 |------------|----------|---------|
@@ -1331,7 +1339,7 @@ To plug in a *different agent implementation entirely* (not just a different
 Claude backend), replace the images via `agent-image` / `ai-python-image`. Any
 replacement must honor these task contracts:
 
-**`ai-generate-tests`** — workspace `source`, working dir
+**`ai-generate-tests-unit`** — workspace `source`, working dir
 `<source>/<SUBDIRECTORY>`. Must generate JUnit tests under `src/test/**`, run
 them, and leave changes in the working tree. Result `TESTS_ADDED` = count of
 added/changed test files. Env available via `envFrom` (provider/model/creds).

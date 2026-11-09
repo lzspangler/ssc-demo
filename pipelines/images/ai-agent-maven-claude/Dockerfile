@@ -1,5 +1,5 @@
 # AI coding-agent runtime -- CLAUDE CODE flavor.
-# Used by: ai-generate-tests, ai-remediate-dependency when AI_AGENT=claude-code
+# Used by: ai-generate-tests-unit, ai-remediate-dependency when AI_AGENT=claude-code
 # (the default backend). Pair with AI_PROVIDER=anthropic|gateway|bedrock|vertex.
 #
 # Contains: JDK 17 (javac, for Maven builds) + Maven, Node.js + Claude Code (the
