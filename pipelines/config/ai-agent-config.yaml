@@ -9,7 +9,7 @@
 # There are two independent switches:
 #
 # AI_PROVIDER -- the wire protocol / hosting for the *reasoning* call
-#                (ai-select-cve) and for Claude Code auth:
+#                (ai-analyze-cves) and for Claude Code auth:
 #   anthropic  -> first-party Anthropic API   (Secret: ANTHROPIC_API_KEY)
 #   gateway    -> any Claude-compatible gateway/proxy (e.g. LiteLLM, an
 #                 on-cluster relay). Set AI_BASE_URL; auth via
@@ -57,7 +57,7 @@
 #       oc create configmap ai-endpoint-ca --from-file=ca-bundle.crt=<your-ca>.pem
 #     (or add the label config.openshift.io/inject-trusted-cabundle=true to have
 #     OpenShift populate ca-bundle.crt with the cluster + proxy trust bundle),
-#     then set AI_CA_BUNDLE below. The ai-select-cve task mounts this ConfigMap
+#     then set AI_CA_BUNDLE below. The ai-analyze-cves task mounts this ConfigMap
 #     (optional) at /etc/ai-ca.
 #   * Disable verification (AI_TLS_INSECURE, demo/dev ONLY -- never production).
 # aider/litellm reach the endpoint differently: they honor SSL_VERIFY, so for the

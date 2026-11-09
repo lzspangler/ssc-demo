@@ -353,9 +353,15 @@ spec:
         - input: "$(params.deploy-dev-gitops)"
           operator: in
           values: ["true"]
+        # Capital S: Tekton task status conditions are Kubernetes conditions
+        # ("Succeeded"), not lowercase. With ["succeeded"] the guard never
+        # matches and the finally task is silently skipped -- exactly what
+        # happened on ci-build-publish-83b6f93: build succeeded, no
+        # gitops-cd-dev run was ever created (visible only in
+        # .status.skippedTasks, "When Expressions evaluated to false").
         - input: "$(tasks.build-container.status)"
           operator: in
-          values: ["succeeded"]
+          values: ["Succeeded"]
 
   # NOTE: the finally task start-gitops-cd-dev is pinned to tekton-triggers-sa
   # via `taskRunSpecs` on the PipelineRun, in triggers/ci-build-triggers.yaml.
