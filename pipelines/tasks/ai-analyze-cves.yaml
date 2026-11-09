@@ -17,7 +17,7 @@ spec:
     array (each decision also carries the CVE severity and the list of available
     fixed versions) AND pre-renders one issue title/body/labels triple per CVE (so
     the downstream issue-opening task needs no JSON parser). Each rendered body
-    carries the same six remediation fields as ai-select-cve (selected / cve_id /
+    carries the six remediation fields (selected / cve_id /
     package / current_version / fixed_version / justification) inside a
     <!-- cve-decision --> marker, so the issue is directly consumable by the
     /remediate trigger; the body also shows the severity, the recommended version
@@ -151,9 +151,8 @@ spec:
         os.makedirs(issuesdir, exist_ok=True)
         decisions_path = os.path.join(outdir, "decisions.json")
 
-        # Char budgets so the prompt stays under the model's context window (see
-        # ai-select-cve for the reasoning). Analysis needs the whole must-fix set,
-        # so keep the same generous vuln budget.
+        # Char budgets so the prompt stays under the model's context window.
+        # Analysis needs the whole must-fix set, so keep a generous vuln budget.
         VULN_CHAR_BUDGET = int(os.environ.get("AI_VULN_CHAR_BUDGET", "260000"))
         REPORT_CHAR_BUDGET = int(os.environ.get("AI_REPORT_CHAR_BUDGET", "40000"))
         # Combined thinking+output token budget per model call, and how many CVEs to
@@ -291,7 +290,7 @@ spec:
         vuln_raw = vuln          # keep the untrimmed report; each batch trims per-CVE
         report = _cap(_trim_report(report, ids), REPORT_CHAR_BUDGET)
 
-        # ---- TLS trust for self-hosted / internal endpoints (see ai-select-cve) ----
+        # ---- TLS trust for self-hosted / internal endpoints ----
         def _tls_verify():
             if os.environ.get("AI_TLS_INSECURE", "").strip().lower() in ("1", "true", "yes"):
                 sys.stderr.write("WARNING: AI_TLS_INSECURE set -- TLS certificate "
@@ -717,9 +716,8 @@ spec:
             print("No decisions returned by the model for any batch.", file=sys.stderr)
             finish([])
 
-        # Validate each decision the same way ai-select-cve validates its single
-        # pick: real package (groupId:artifactId), versions with digits, and a CVE
-        # that is actually in the must-fix set. Only fixable, valid ones become
+        # Validate each decision: real package (groupId:artifactId), versions
+        # with digits, and a CVE that is actually in the must-fix set. Only fixable, valid ones become
         # issues -- junk can never produce a bogus issue.
         def _placeholder(v):
             if not isinstance(v, str):

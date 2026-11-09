@@ -110,8 +110,9 @@ spec:
           # published CVE affecting a dependency in the SBOM. We keep those at or
           # above the threshold. We deliberately do NOT require a structured fixed
           # version here -- analyze exposes the fix only as free text in the CVE
-          # title/description (surfaced as fixed_version_hints), and ai-select-cve
-          # is responsible for resolving the concrete fixed version. Gating on a
+          # title/description (surfaced as fixed_version_hints), and
+          # ai-analyze-cves is responsible for resolving the concrete fixed
+          # version. Gating on a
           # structured fix would drop every finding and the AI branch would never
           # fire, which is exactly the bug this replaces.
           #

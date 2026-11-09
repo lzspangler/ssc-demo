@@ -1,5 +1,5 @@
-# Anthropic Python SDK runtime for the maven-build-ci CVE selector.
-# Used by: ai-select-cve.
+# Anthropic Python SDK runtime for the maven-build-ci CVE analysis.
+# Used by: ai-analyze-cves.
 # Contains: Python 3.11 + the `anthropic` SDK (with Bedrock/Vertex extras so the
 # same image serves every AI_PROVIDER) + the `openai` SDK + jq.
 #
@@ -19,7 +19,7 @@ USER 0
 RUN microdnf install -y python3.11 python3.11-pip jq && microdnf clean all
 
 # Make `python3`/`python`/`pip` resolve to 3.11. /usr/local/bin precedes /usr/bin
-# on PATH, so `#!/usr/bin/env python3` (used by the ai-select-cve step) picks up
+# on PATH, so `#!/usr/bin/env python3` (used by the ai-analyze-cves step) picks up
 # 3.11 -- the same interpreter the SDKs below are installed into.
 RUN ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
