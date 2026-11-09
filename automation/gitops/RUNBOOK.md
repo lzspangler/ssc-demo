@@ -542,7 +542,7 @@ Lightwell backport.
 Then exercise the webhook: comment **`/remediate`** on one of those issues. The
 EventListener starts `agentic-cve-remediation`, which pushes a branch and opens
 a merge request. **`/generate-tests-unit`** does the same through
-`agentic-test-generation`, **`/generate-tests-functional`** through
+`agentic-test-generation-unit`, **`/generate-tests-functional`** through
 `agentic-test-generation-functional`, and **`/generate-tests-integration`**
 through `agentic-test-generation-integration` — one webhook, four slash
 commands; each trigger's cel filter picks its command.
@@ -551,7 +551,7 @@ commands; each trigger's cel filter picks its command.
 
 * **`base-branch` defaults to `master`**, the TriggerTemplates default to
   `main`, and the imported repository uses `main`. Manual runs of
-  `agentic-cve-remediation` / `agentic-test-generation` need
+  `agentic-cve-remediation` / `agentic-test-generation-unit` need
   `-p base-branch=main`; webhook-driven runs are already correct.
 * **The RHTAS defaults in the pipelines are stale** — `rekor-url`,
   `tuf-mirror` and `oidc-issuer` name the `tssc-tas` namespace and a

@@ -168,10 +168,21 @@ spec:
         # failsafe binding (the agent is only permitted TEST-SCOPED additions
         # and may have added none), and without a binding `mvn verify` silently
         # runs zero *IT.java tests -- the re-run would pass while testing
-        # nothing. `test` (full unit suite) followed by DIRECT failsafe
-        # invocation runs the whole *IT.java suite regardless of pom bindings.
+        # nothing. DIRECT failsafe invocation runs the *IT.java suite
+        # regardless of pom bindings. It MUST be scoped with -Dit.test (same
+        # pattern as the functional pipeline's -Dit.test=*FT): without it the
+        # invocation INHERITS the pom's failsafe includes, which on this app
+        # are **/*FT.java -- the FUNCTIONAL tests, RestAssured against
+        # APP_BASE_URL from a deployed app this pipeline never stands up
+        # (agentic-test-generation-integration-issue-hdrhp: all 8 FTs errored
+        # "Target host is null" while every *IT passed). test-compile rather
+        # than `test` because the unit suite is the unit pipeline's job.
         - name: GOALS
-          value: ["test", "failsafe:integration-test", "failsafe:verify"]
+          value:
+            - test-compile
+            - failsafe:integration-test
+            - failsafe:verify
+            - -Dit.test=*IT
         - name: SUBDIRECTORY
           value: $(params.subdirectory)
       workspaces:

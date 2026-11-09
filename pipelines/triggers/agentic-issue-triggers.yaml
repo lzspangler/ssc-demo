@@ -5,7 +5,7 @@
 # matching pipeline:
 #
 #   /remediate       ->  agentic-cve-remediation   (reads a decision from the issue)
-#   /generate-tests-unit        ->  agentic-test-generation          (unit tests)
+#   /generate-tests-unit        ->  agentic-test-generation-unit
 #   /generate-tests-functional   ->  agentic-test-generation-functional
 #   /generate-tests-integration  ->  agentic-test-generation-integration
 #
@@ -265,7 +265,7 @@ spec:
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
 metadata:
-  name: test-generation-issue-template
+  name: test-generation-unit-issue-template
   labels:
     app.kubernetes.io/part-of: maven-build-ci
 spec:
@@ -289,14 +289,14 @@ spec:
     - apiVersion: tekton.dev/v1
       kind: PipelineRun
       metadata:
-        generateName: agentic-test-generation-issue-
+        generateName: agentic-test-generation-unit-issue-
         labels:
           app.kubernetes.io/part-of: maven-build-ci
-          tekton.dev/pipeline: agentic-test-generation
+          tekton.dev/pipeline: agentic-test-generation-unit
           trigger: gitlab-issue
       spec:
         pipelineRef:
-          name: agentic-test-generation
+          name: agentic-test-generation-unit
         params:
           - name: git-url
             value: $(tt.params.git-url)
@@ -323,7 +323,7 @@ spec:
                     storage: $(tt.params.workspace-size)
           # maven-settings carries the settings.xml that routes ALL dependency
           # resolution through the Artifactory `maven` virtual repo. Both
-          # ai-generate-tests (the agent's own `mvn test` plus its scratch
+          # ai-generate-tests-unit (the agent's own `mvn test` plus its scratch
           # verification build) and re-run-tests need it: once a remediation PR
           # has merged, the tree carries a Lightwell backport pin that does not
           # exist on Maven Central. See the remediation template above for the
@@ -337,7 +337,7 @@ spec:
           # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
 ---
 # ---- /generate-tests-functional ----------------------------------------------
-# Same shape as test-generation-issue-template above, pointing at the functional
+# Same shape as test-generation-unit-issue-template above, pointing at the functional
 # pipeline. Shares test-generation-issue-binding (nothing command-specific in it).
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
@@ -453,7 +453,7 @@ spec:
           # pod). For a PRIVATE repo, create a `git-auth` Secret and add it back.
 ---
 # ---- /generate-tests-integration ---------------------------------------------
-# Same shape as test-generation-issue-template above, pointing at the integration
+# Same shape as test-generation-unit-issue-template above, pointing at the integration
 # pipeline. Shares test-generation-issue-binding (nothing command-specific in it).
 apiVersion: triggers.tekton.dev/v1beta1
 kind: TriggerTemplate
@@ -695,7 +695,7 @@ spec:
       bindings:
         - ref: test-generation-issue-binding
       template:
-        ref: test-generation-issue-template
+        ref: test-generation-unit-issue-template
     - name: gitlab-issue-generate-tests-functional
       interceptors:
         # 1) Validate the shared secret token and that this is a comment event.

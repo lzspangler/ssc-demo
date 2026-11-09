@@ -2,7 +2,7 @@
 # Agent skill: coverage-gap-driven JUnit 5 unit test generation, per the
 # unit-test execution contract (test-generation-unit).
 #
-# Mounted read-only into the ai-generate-tests task at
+# Mounted read-only into the ai-generate-tests-unit task at
 # /tekton/home/agent-skills/test-generation-unit/ and handed to the coding
 # agent as context (aider: --read SKILL.md; claude-code:
 # --append-system-prompt). The task prompt carries the run contract (evaluate

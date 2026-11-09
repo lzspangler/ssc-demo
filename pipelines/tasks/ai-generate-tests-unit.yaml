@@ -1,7 +1,7 @@
 apiVersion: tekton.dev/v1
 kind: Task
 metadata:
-  name: ai-generate-tests
+  name: ai-generate-tests-unit
   labels:
     app.kubernetes.io/part-of: maven-build-ci
   annotations:
@@ -10,10 +10,13 @@ metadata:
 spec:
   description: >-
     Use an AI coding agent to generate JUnit unit tests for the application and
-    make them pass. The coding agent is selected by AI_AGENT (claude-code |
-    aider); aider drives OpenAI-compatible models such as gpt-oss and Granite.
-    Backend (provider/model/creds) is supplied via the ai-agent-config ConfigMap
-    and ai-agent-secret Secret. Swap the runtime by overriding AGENT_IMAGE.
+    make them pass. Named -unit to match ai-generate-tests-integration/
+    -functional and the agentic-test-generation-* pipelines; only this task's
+    pipeline family uses it. The coding agent is selected by AI_AGENT
+    (claude-code | aider); aider drives OpenAI-compatible models such as gpt-oss
+    and Granite. Backend (provider/model/creds) is supplied via the
+    ai-agent-config ConfigMap and ai-agent-secret Secret. Swap the runtime by
+    overriding AGENT_IMAGE.
   params:
     - name: SUBDIRECTORY
       type: string

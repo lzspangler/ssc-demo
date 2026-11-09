@@ -5,13 +5,16 @@ metadata:
     pipelines.openshift.io/runtime: generic
     pipelines.openshift.io/strategy: docker
     pipelines.openshift.io/used-by: build-cloud
-  name: agentic-test-generation
+  name: agentic-test-generation-unit
 spec:
   # Linear chain: clone-repository -> verify-commit (optional) -> package
-  #   -> ai-generate-tests -> re-run-tests (mvn verify) -> open-pr
-  # The AI coding agent generates JUnit tests, the project is re-verified with the
-  # new tests, and a PR/MR is opened with just the generated tests. This is the
-  # ai-generate-tests flow split out of agentic-cve-remediation.yaml.
+  #   -> ai-generate-tests-unit -> re-run-tests (mvn test -- unit tests only)
+  #   -> open-pr
+  # The AI coding agent generates JUnit UNIT tests, the project is re-verified
+  # with the new tests, and a PR/MR is opened with just the generated tests.
+  # This is the ai-generate-tests-unit flow split out of
+  # agentic-cve-remediation.yaml; pipeline and task are named -unit to match
+  # agentic-test-generation-functional/-integration.
   params:
     - description: Source Repository URL
       name: git-url
@@ -77,7 +80,7 @@ spec:
     - name: CHAINS-GIT_COMMIT
       value: $(tasks.clone-repository.results.commit)
     - name: TESTS_ADDED
-      value: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+      value: $(tasks.ai-generate-tests-unit.results.TESTS_ADDED)
     - name: PR_URL
       value: $(tasks.open-pr.results.PR_URL)
   tasks:
@@ -129,11 +132,11 @@ spec:
           workspace: workspace
         - name: maven_settings
           workspace: maven-settings
-    - name: ai-generate-tests
+    - name: ai-generate-tests-unit
       runAfter:
         - package
       taskRef:
-        name: ai-generate-tests
+        name: ai-generate-tests-unit
       params:
         - name: SUBDIRECTORY
           value: $(params.subdirectory)
@@ -154,16 +157,26 @@ spec:
     # when its parent is skipped by a when-expression.
     - name: re-run-tests
       runAfter:
-        - ai-generate-tests
+        - ai-generate-tests-unit
       taskRef:
         name: maven
       when:
-        - input: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+        - input: $(tasks.ai-generate-tests-unit.results.TESTS_ADDED)
           operator: notin
           values: ["0"]
       params:
         - name: GOALS
-          value: ["verify"]
+          # `test`, NOT `verify` (and not `package` either, nothing here needs
+          # the jar): this pipeline validates UNIT tests only. `verify` runs
+          # the failsafe phase, and the app's pom binds failsafe to
+          # **/*FT.java in the MAIN build -- RestAssured against APP_BASE_URL,
+          # i.e. a deployed app this pipeline never stands up. At `test`,
+          # surefire's default includes (*Test.java et al.) never match the
+          # *FT/*IT classes, so the deployment-dependent tests cannot run.
+          # Functional/integration tests belong to their own pipelines, which
+          # scope failsafe with -Dit.test (see agentic-test-generation-
+          # functional/-integration).
+          value: ["test"]
         - name: SUBDIRECTORY
           value: $(params.subdirectory)
       workspaces:
@@ -178,7 +191,7 @@ spec:
       taskRef:
         name: open-pr-tests
       when:
-        - input: $(tasks.ai-generate-tests.results.TESTS_ADDED)
+        - input: $(tasks.ai-generate-tests-unit.results.TESTS_ADDED)
           operator: notin
           values: ["0"]
       params:
