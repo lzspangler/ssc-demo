@@ -20,6 +20,17 @@ Run after cluster login:
 bash cluster/ssc-demo-cluster.sh --preflight
 ```
 
+Cluster-specific checks and resource names are overrideable without editing the
+script. For example:
+
+```bash
+SSC_DOMAIN="apps.example.com" \
+SSC_EXPECTED_OCP_VERSION="4.21." \
+SSC_MIN_READY_WORKERS=4 \
+SSC_CEPH_STORAGE_CLASS="ocs-external-storagecluster-cephfs" \
+  bash cluster/ssc-demo-cluster.sh --preflight
+```
+
 The preflight is read-only. The following actions mutate only cluster resources:
 
 ```bash
@@ -104,7 +115,7 @@ The next deployment step must use an uncommitted SSC values override containing 
 - No changes are made to `ssc-demo` by these utilities.
 - The VPE-to-Test-Generation MVP can be developed after the platform baseline is healthy; SCM/PR integration remains conditional on what the demo flow requires.
 
-## edge94 Preparation Status
+## Cluster Preparation Status
 
 Applied on Oct 30, 2026 after the auto-toolbox redeployment:
 
@@ -119,7 +130,7 @@ Applied on Oct 30, 2026 after the auto-toolbox redeployment:
 
 The remaining deployment step is the SSC app-of-apps: prepare an uncommitted values override, verify its credentials and domain, then apply it through the `platform-gitops` ArgoCD instance. The cluster-preparation script intentionally stops before that step.
 
-## edge94 SSC Deployment Status
+## SSC Deployment Status
 
 Deployment was started on Nov 2, 2026 using the existing `ssc-demo` manifests and a private `/tmp/ssc-demo-values.yaml` override. The fork now has local, uncommitted RHTPA hook changes for this cluster; nothing has been committed or pushed.
 

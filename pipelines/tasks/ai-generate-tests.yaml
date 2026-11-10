@@ -47,6 +47,10 @@ spec:
         prompt. If the generated tests still fail after the last attempt, the task
         fails.
       default: "6"
+    - name: CPU_REQUEST
+      type: string
+      description: CPU request for the test-generation step.
+      default: 500m
   workspaces:
     - name: source
       description: Workspace containing the application source (shared PVC).
@@ -88,7 +92,7 @@ spec:
           readOnly: true
       computeResources:
         requests:
-          cpu: 100m
+          cpu: $(params.CPU_REQUEST)
           memory: 2Gi
         limits:
           memory: 4Gi

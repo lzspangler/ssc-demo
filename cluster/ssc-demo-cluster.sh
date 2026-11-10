@@ -5,7 +5,21 @@ set -euo pipefail
 # ssc-demo checkout; it only reads its existing manifests and applies the
 # explicitly requested cluster bootstrap resources.
 
-SSC_DEMO_DIR="${SSC_DEMO_DIR:-/Users/tstetson/Public/workspaces/project-lightpath/ssc-demo}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SSC_DEMO_DIR="${SSC_DEMO_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+SSC_DOMAIN="${SSC_DOMAIN:-}"
+SSC_EXPECTED_OCP_VERSION="${SSC_EXPECTED_OCP_VERSION:-4.20.}"
+SSC_MIN_READY_WORKERS="${SSC_MIN_READY_WORKERS:-3}"
+SSC_OPERATOR_NAMESPACE="${SSC_OPERATOR_NAMESPACE:-openshift-operators}"
+SSC_PLATFORM_ARGOCD_NAMESPACE="${SSC_PLATFORM_ARGOCD_NAMESPACE:-platform-gitops}"
+SSC_PLATFORM_ARGOCD_NAME="${SSC_PLATFORM_ARGOCD_NAME:-platform-gitops}"
+SSC_STORAGE_NAMESPACE="${SSC_STORAGE_NAMESPACE:-openshift-storage}"
+SSC_RHTPA_NAMESPACE="${SSC_RHTPA_NAMESPACE:-trusted-profile-analyzer}"
+SSC_QUAY_NAMESPACE="${SSC_QUAY_NAMESPACE:-quay-registry}"
+SSC_STORAGE_CLUSTER_NAME="${SSC_STORAGE_CLUSTER_NAME:-ocs-storagecluster}"
+SSC_NOOBAA_NAME="${SSC_NOOBAA_NAME:-noobaa}"
+SSC_CEPH_STORAGE_CLASS="${SSC_CEPH_STORAGE_CLASS:-ocs-storagecluster-cephfs}"
+SSC_RHTPA_HOOK_TLS_INSECURE="${SSC_RHTPA_HOOK_TLS_INSECURE:-true}"
 ACTION="preflight"
 
 usage() {
@@ -27,6 +41,19 @@ Actions:
 
 Environment:
   SSC_DEMO_DIR             Path to an untouched ssc-demo checkout
+  SSC_DOMAIN               Optional ingress domain override
+  SSC_EXPECTED_OCP_VERSION Expected server-version prefix (default: 4.20.)
+  SSC_MIN_READY_WORKERS     Minimum Ready worker count (default: 3)
+  SSC_OPERATOR_NAMESPACE    Operator namespace (default: openshift-operators)
+  SSC_PLATFORM_ARGOCD_NAMESPACE  Argo CD Application namespace (default: platform-gitops)
+  SSC_PLATFORM_ARGOCD_NAME  Argo CD instance name (default: platform-gitops)
+  SSC_STORAGE_NAMESPACE     ODF namespace (default: openshift-storage)
+  SSC_RHTPA_NAMESPACE       RHTPA namespace (default: trusted-profile-analyzer)
+  SSC_QUAY_NAMESPACE        Quay namespace (default: quay-registry)
+  SSC_STORAGE_CLUSTER_NAME  ODF StorageCluster name (default: ocs-storagecluster)
+  SSC_NOOBAA_NAME           NooBaa resource name (default: noobaa)
+  SSC_CEPH_STORAGE_CLASS    Filesystem StorageClass (default: ocs-storagecluster-cephfs)
+  SSC_RHTPA_HOOK_TLS_INSECURE  Use insecure TLS for dev hook (default: true)
 EOF
 }
 
@@ -61,13 +88,13 @@ check_login() {
 check_cluster() {
   local server_version
   server_version="$(oc version | awk '/Server Version:/ {print $3; exit}')"
-  [[ "$server_version" == 4.20.* ]] || {
-    echo "Expected OpenShift 4.20.x; found ${server_version:-unknown}" >&2
+  [[ "$server_version" == "${SSC_EXPECTED_OCP_VERSION}"* ]] || {
+    echo "Expected OpenShift ${SSC_EXPECTED_OCP_VERSION}*; found ${server_version:-unknown}" >&2
     exit 1
   }
   local ready_workers
   ready_workers="$(oc get nodes -l node-role.kubernetes.io/worker --no-headers | awk '$2 == "Ready" {count++} END {print count+0}')"
-  (( ready_workers >= 3 )) || { echo "Expected at least three Ready workers; found $ready_workers" >&2; exit 1; }
+  (( ready_workers >= SSC_MIN_READY_WORKERS )) || { echo "Expected at least ${SSC_MIN_READY_WORKERS} Ready workers; found $ready_workers" >&2; exit 1; }
   oc wait --for=condition=Available --timeout=5m clusteroperator --all >/dev/null
   oc wait --for=condition=Degraded=false --timeout=5m clusteroperator --all >/dev/null
   echo "OpenShift: $server_version; Ready workers: $ready_workers"
@@ -75,10 +102,10 @@ check_cluster() {
 
 check_storage() {
   local phase health noobaa_phase default_fs
-  phase="$(oc get storagecluster ocs-storagecluster -n openshift-storage -o jsonpath='{.status.phase}')"
-  health="$(oc get cephcluster -n openshift-storage -o jsonpath='{.items[0].status.ceph.health}')"
-  noobaa_phase="$(oc get noobaa noobaa -n openshift-storage -o jsonpath='{.status.phase}')"
-  default_fs="$(oc get storageclass ocs-storagecluster-cephfs -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}')"
+  phase="$(oc get storagecluster "$SSC_STORAGE_CLUSTER_NAME" -n "$SSC_STORAGE_NAMESPACE" -o jsonpath='{.status.phase}')"
+  health="$(oc get cephcluster -n "$SSC_STORAGE_NAMESPACE" -o jsonpath='{.items[0].status.ceph.health}')"
+  noobaa_phase="$(oc get noobaa "$SSC_NOOBAA_NAME" -n "$SSC_STORAGE_NAMESPACE" -o jsonpath='{.status.phase}')"
+  default_fs="$(oc get storageclass "$SSC_CEPH_STORAGE_CLASS" -o jsonpath='{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}')"
   [[ "$phase" == Ready && "$health" == HEALTH_OK && "$noobaa_phase" == Ready ]] || {
     echo "ODF is not ready: StorageCluster=$phase Ceph=$health NooBaa=$noobaa_phase" >&2
     exit 1
@@ -110,13 +137,13 @@ preflight() {
 ensure_storage() {
   check_login
   check_storage
-  oc patch storageclass ocs-storagecluster-cephfs --type=merge \
+  oc patch storageclass "$SSC_CEPH_STORAGE_CLASS" --type=merge \
     -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' >/dev/null
-  echo "Ensured ocs-storagecluster-cephfs is the default filesystem StorageClass"
+  echo "Ensured $SSC_CEPH_STORAGE_CLASS is the default filesystem StorageClass"
 }
 
 bootstrap_gitops() {
-  if oc get subscription openshift-gitops-operator -n openshift-operators >/dev/null 2>&1; then
+  if oc get subscription openshift-gitops-operator -n "$SSC_OPERATOR_NAMESPACE" >/dev/null 2>&1; then
     echo "GitOps subscription already exists; skipping bootstrap manifests"
     return
   fi
@@ -130,13 +157,13 @@ bootstrap_gitops() {
     -f "$SSC_DEMO_DIR/bootstrap/platform-gitops/gitops-operator/olm-gitops-subscription.yaml"
   # The demo manifest pins an older starting CSV. Let the current 4.20 catalog
   # resolve the selected channel instead of failing on that stale pin.
-  oc patch subscription openshift-gitops-operator -n openshift-operators \
+  oc patch subscription openshift-gitops-operator -n "$SSC_OPERATOR_NAMESPACE" \
     --type=merge -p '{"spec":{"startingCSV":null}}' >/dev/null
   echo "GitOps operator bootstrap applied; wait for the CSV before creating the SSC app-of-apps."
 }
 
 bootstrap_pipelines() {
-  if oc get subscription openshift-pipelines-operator -n openshift-operators >/dev/null 2>&1; then
+  if oc get subscription openshift-pipelines-operator -n "$SSC_OPERATOR_NAMESPACE" >/dev/null 2>&1; then
     echo "Pipelines subscription already exists; skipping bootstrap chart"
     return
   fi
@@ -152,8 +179,8 @@ bootstrap_pipelines() {
 }
 
 bootstrap_platform_argocd() {
-  if oc get argocd platform-gitops -n platform-gitops >/dev/null 2>&1; then
-    echo "platform-gitops ArgoCD already exists; skipping bootstrap manifests"
+  if oc get argocd "$SSC_PLATFORM_ARGOCD_NAME" -n "$SSC_PLATFORM_ARGOCD_NAMESPACE" >/dev/null 2>&1; then
+    echo "$SSC_PLATFORM_ARGOCD_NAME ArgoCD already exists; skipping bootstrap manifests"
     return
   fi
   local dir="$SSC_DEMO_DIR/bootstrap/platform-gitops/gitops-platform-instance"
@@ -172,12 +199,12 @@ bootstrap_platform_argocd() {
 
 ensure_quay_noobaa_rbac() {
   check_login
-  oc apply -f - <<'EOF'
+  oc apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: ssc-quay-noobaa-reader
-  namespace: openshift-storage
+  namespace: ${SSC_STORAGE_NAMESPACE}
 rules:
 - apiGroups: ["noobaa.io"]
   resources: ["noobaas"]
@@ -190,7 +217,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: ssc-quay-noobaa-reader
-  namespace: openshift-storage
+  namespace: ${SSC_STORAGE_NAMESPACE}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -198,16 +225,16 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: quay-noobaa
-  namespace: quay-registry
+  namespace: ${SSC_QUAY_NAMESPACE}
 EOF
   echo "SSC Quay NooBaa read-only RBAC applied."
 }
 
 ensure_platform_argocd_admin() {
   check_login
-  oc create clusterrolebinding ssc-platform-gitops-application-admin \
+  oc create clusterrolebinding ssc-${SSC_PLATFORM_ARGOCD_NAME}-application-admin \
     --clusterrole=cluster-admin \
-    --serviceaccount=platform-gitops:platform-gitops-argocd-application-controller \
+    --serviceaccount=${SSC_PLATFORM_ARGOCD_NAMESPACE}:${SSC_PLATFORM_ARGOCD_NAME}-argocd-application-controller \
     --dry-run=client -o yaml | oc apply -f -
   echo "Demo-only cluster-admin binding applied to the platform Argo application controller."
 }
@@ -243,9 +270,9 @@ EOF
 
 ensure_rhtpa_router_ca() {
   check_login
-  oc get namespace trusted-profile-analyzer >/dev/null
+  oc get namespace "$SSC_RHTPA_NAMESPACE" >/dev/null
   oc get secret router-ca -n openshift-ingress-operator -o jsonpath='{.data.tls\.crt}' | base64 -d \
-    | oc create configmap ssc-router-ca -n trusted-profile-analyzer \
+    | oc create configmap ssc-router-ca -n "$SSC_RHTPA_NAMESPACE" \
         --from-file=ca-bundle.crt=/dev/stdin --dry-run=client -o yaml | oc apply -f -
   echo "RHTPA router CA ConfigMap applied"
 }
@@ -253,27 +280,30 @@ ensure_rhtpa_router_ca() {
 ensure_rhtpa_server_ca() {
   check_login
   local app_patch
-  app_patch='{"spec":{"ignoreDifferences":[{"group":"apps","kind":"Deployment","name":"server","namespace":"trusted-profile-analyzer","jsonPointers":["/spec/template/spec/containers/0/env","/spec/template/spec/containers/0/volumeMounts","/spec/template/spec/volumes","/spec/strategy"]}]}}'
-  oc patch application ssc-rhtpa-operator -n platform-gitops --type=merge -p "$app_patch" >/dev/null
-  oc set env deployment/server -n trusted-profile-analyzer SSL_CERT_FILE=/etc/rhtpa-ca/ca-bundle.crt
-  oc set volume deployment/server -n trusted-profile-analyzer --add --name=rhtpa-extra-ca --type=configmap --configmap-name=rhtpa-extra-ca --mount-path=/etc/rhtpa-ca --read-only --overwrite
-  oc patch deployment server -n trusted-profile-analyzer --type=merge -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}' >/dev/null
-  oc rollout status deployment/server -n trusted-profile-analyzer --timeout=5m
+  app_patch='{"spec":{"ignoreDifferences":[{"group":"apps","kind":"Deployment","name":"server","namespace":"'"$SSC_RHTPA_NAMESPACE"'","jsonPointers":["/spec/template/spec/containers/0/env","/spec/template/spec/containers/0/volumeMounts","/spec/template/spec/volumes","/spec/strategy"]}]}}'
+  oc patch application ssc-rhtpa-operator -n "$SSC_PLATFORM_ARGOCD_NAMESPACE" --type=merge -p "$app_patch" >/dev/null
+  oc set env deployment/server -n "$SSC_RHTPA_NAMESPACE" SSL_CERT_FILE=/etc/rhtpa-ca/ca-bundle.crt
+  oc set volume deployment/server -n "$SSC_RHTPA_NAMESPACE" --add --name=rhtpa-extra-ca --type=configmap --configmap-name=rhtpa-extra-ca --mount-path=/etc/rhtpa-ca --read-only --overwrite
+  oc patch deployment server -n "$SSC_RHTPA_NAMESPACE" --type=merge -p '{"spec":{"strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":0,"maxUnavailable":1}}}}' >/dev/null
+  oc rollout status deployment/server -n "$SSC_RHTPA_NAMESPACE" --timeout=5m
   echo "RHTPA server CA trust and low-resource rollout override applied"
 }
 
 ensure_rhtpa_hook_tls() {
   check_login
-  oc patch application ssc-rhtpa-prerequisites -n platform-gitops --type=merge -p '{"spec":{"ignoreDifferences":[{"group":"batch","kind":"Job","name":"wait-for-keycloak","namespace":"trusted-profile-analyzer","jsonPointers":["/spec/template/spec/containers/0/command"]}]}}' >/dev/null
-  oc delete job wait-for-keycloak -n trusted-profile-analyzer --ignore-not-found=true
-  oc create job wait-for-keycloak -n trusted-profile-analyzer \
+  local domain="${SSC_DOMAIN:-$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')}"
+  local tls_option=""
+  [[ "$SSC_RHTPA_HOOK_TLS_INSECURE" == true ]] && tls_option="-k"
+  oc patch application ssc-rhtpa-prerequisites -n "$SSC_PLATFORM_ARGOCD_NAMESPACE" --type=merge -p '{"spec":{"ignoreDifferences":[{"group":"batch","kind":"Job","name":"wait-for-keycloak","namespace":"'"$SSC_RHTPA_NAMESPACE"'","jsonPointers":["/spec/template/spec/containers/0/command"]}]}}' >/dev/null
+  oc delete job wait-for-keycloak -n "$SSC_RHTPA_NAMESPACE" --ignore-not-found=true
+  oc create job wait-for-keycloak -n "$SSC_RHTPA_NAMESPACE" \
     --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
-    -- /bin/sh -c 'curl -k -sf -o /dev/null https://sso.apps.ocp-edge94.qe.lab.redhat.com/realms/backstage/.well-known/openid-configuration'
-  oc annotate job wait-for-keycloak -n trusted-profile-analyzer \
+    -- /bin/sh -c "curl $tls_option -sf -o /dev/null https://sso.${domain}/realms/backstage/.well-known/openid-configuration"
+  oc annotate job wait-for-keycloak -n "$SSC_RHTPA_NAMESPACE" \
     argocd.argoproj.io/hook=PreSync \
     argocd.argoproj.io/hook-delete-policy=BeforeHookCreation \
     argocd.argoproj.io/sync-wave=0 >/dev/null
-  oc wait --for=condition=complete --timeout=120s job/wait-for-keycloak -n trusted-profile-analyzer
+  oc wait --for=condition=complete --timeout=120s job/wait-for-keycloak -n "$SSC_RHTPA_NAMESPACE"
   echo "Development-only RHTPA TLS hook override applied and completed"
 }
 
