@@ -112,6 +112,9 @@ oidc:
   # https://sso.apps.<subdomain>/realms/backstage. Leave empty to derive it
   # from global.cluster.subdomain.
   issuerUrl: ""
+  # Optional ConfigMap containing ca-bundle.crt for a private ingress CA.
+  # When unset, the hook uses the container trust store.
+  caConfigMap: ""
   ssoHostPrefix: sso
   realm: backstage
   tpaCli:
