@@ -89,7 +89,13 @@ pgsql:
 
 persistence:
   mode: persistent
-  capacity: 20Gi
+  # Sizing history: 20Gi filled completely (~17h of importer ingest, mostly
+  # redhat-sboms, which is tens of GB on its own). Postgres refuses to start
+  # on a full data volume, which takes down the whole RHTPA stack. 100Gi as
+  # of 2026-11-13. Growing an existing volume is safe: the storage class
+  # (ocs-external-storagecluster-ceph-rbd) allows volume expansion and the
+  # CSI driver resizes in place on the next pod restart.
+  capacity: 100Gi
 
 storage:
   # s3 | filesystem -- must match the RHTPA chart's own `storage.type`.
