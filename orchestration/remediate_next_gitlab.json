@@ -56,7 +56,7 @@
       "name": "GET Open Issues from Gitlab",
       "parameters": {
         "method": "GET",
-        "url": "https://gitlab-gitlab.apps.cluster-jz4hr.dyn.redhatworkshops.io/api/v4/projects/1/issues?state=opened",
+        "url": "https://gitlab-gitlab.apps.cluster-b7zgr.dyn.redhatworkshops.io/api/v4/projects/1/issues?state=opened",
         "credential_id": "b06d0f27-9afb-48f9-8e90-2b336d3c5657"
       },
       "settings": {},

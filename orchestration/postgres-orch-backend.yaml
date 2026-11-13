@@ -6,6 +6,10 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  # Explicit rather than relying on the cluster's default storage class, so
+  # the binding survives a change of default. WaitForFirstConsumer on this
+  # class means the volume binds only once the postgres pod schedules.
+  storageClassName: ocs-external-storagecluster-ceph-rbd
   resources:
     requests:
       storage: 5Gi

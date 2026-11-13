@@ -1,0 +1,28 @@
+# Long-lived Kubernetes API credentials for the workflow worker.
+#
+# The operator's worker deployment sets automountServiceAccountToken: false
+# (the worker only talks to Temporal/Postgres/Redis, never the Kubernetes
+# API) and resets any manual attempt to flip that field, so the usual
+# projected token path does not exist in the worker pods. Env injection does
+# not work either: script subprocesses receive only an ALLOWLISTED
+# environment (locale/PATH vars), so custom worker env vars never reach the
+# scripts. Workflow script nodes need the credentials to drive PipelineRuns
+# in tssc-app-ci, so this Secret requests a token for the SAME service
+# account (automationorchestrator-demo-worker) another way: the cluster's
+# token controller populates the token/ca.crt keys, and the token does not
+# expire. The README's setup step patches the worker deployment to mount
+# this Secret at /var/run/ao-k8s (manually added volumes/mounts survive the
+# operator's reconcile the same way extra env entries do; the automount
+# field does not).
+#
+# What the credential can do is still scoped by
+# orchestrator-tekton-rbac.yaml: create/read PipelineRuns and get one named
+# secret in tssc-app-ci, nothing else.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orchestrator-worker-k8s-access
+  namespace: automation-orchestrator-operator-system
+  annotations:
+    kubernetes.io/service-account.name: automationorchestrator-demo-worker
+type: kubernetes.io/service-account-token

@@ -1,11 +1,22 @@
+# The AutomationOrchestrator CR -- the piece that makes the operator actually
+# deploy the platform (app pods, Route, admin secret).
+#
+# Deliberately NO spec.imagePullSecrets: the operator's images come from
+# registry.redhat.io, which every node on the demo cluster can already pull
+# via the global pull secret, and a reference to a Secret that does not exist
+# would fail pod creation. (An earlier revision referenced
+# `automation-orchestrator-pull-secret`, which was never defined anywhere.)
+#
+# Deliberately NO spec.secrets section: the operator auto-generates the
+# initial admin password and the secret-encryption key when
+# initialAdminPasswordSecretRef / secretEncryptionKeySecretRef are omitted.
+# Add explicit refs here if you want reproducible values instead.
 apiVersion: aap.ansible.com/v1alpha1
 kind: AutomationOrchestrator
 metadata:
   name: automationorchestrator-demo
   namespace: automation-orchestrator-operator-system
 spec:
-  imagePullSecrets:
-    - name: automation-orchestrator-pull-secret
   otel:
     enabled: false
   backgroundWorker:
