@@ -1,0 +1,238 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-app-image
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "testing, deployment, ephemeral"
+spec:
+  description: >-
+    Deploy a given container image as the application under test into a given
+    namespace, as a health-gated Deployment + Service. Unlike
+    deploy-app-under-test (which builds an ephemeral image from the packaged
+    jar), the image arrives as a parameter -- this task deploys exactly the
+    artifact a CI pipeline published, which is the point of image-level test
+    evidence. The Deployment's readiness probe polls the app's health
+    endpoint, so the task only succeeds once the app is genuinely serving.
+    Emits APP_BASE_URL (the in-cluster Service URL) for the test tasks.
+
+    If the image lives in a PRIVATE registry (the demo's in-cluster Quay,
+    say), the namespace the app deploys into has no pull credentials -- its
+    `default` service account knows nothing about them. PULL_SECRET_NAME
+    names a dockerconfigjson Secret in the PIPELINE namespace (mounted into
+    this pod, not read through the API); when it is present the task
+    re-creates it inside the target namespace and references it as an
+    imagePullSecret on the pod, so the pull authenticates. A public image
+    needs none of this -- point PULL_SECRET_NAME at a Secret that does not
+    exist and the step is skipped (the volume is optional, so a missing
+    Secret is not an error).
+  params:
+    - name: IMAGE
+      type: string
+      description: >-
+        Full image reference to deploy, e.g.
+        quay.apps.<domain>/tssc/spring-boot-example-application:<sha>. Must be
+        pullable from inside the cluster (see PULL_SECRET_NAME for private
+        registries).
+    - name: NAMESPACE
+      type: string
+      description: Namespace to deploy into (e.g. the create-test-namespace result).
+    - name: APP_NAME
+      type: string
+      description: >-
+        Name of the Deployment/Service to create inside the target namespace.
+        The namespace is already unique per run, so a fixed default is safe;
+        it is also the Service's DNS label.
+      default: app-under-test
+    - name: PORT
+      type: string
+      description: Container port the application listens on.
+      default: "8080"
+    - name: HEALTH_PATH
+      type: string
+      description: >-
+        Health endpoint the Deployment's readiness/liveness probes poll. Must
+        be unauthenticated (this demo's apps expose /actuator/health
+        permitAll).
+      default: /actuator/health
+    - name: PULL_SECRET_NAME
+      type: string
+      description: >-
+        Name of a dockerconfigjson Secret in the PIPELINE namespace to copy
+        into the target namespace for image pulls (e.g. the Quay push robot's
+        quay-push). The Secret is MOUNTED into this pod (optional volume) and
+        re-created in the target namespace -- it is never read through the
+        Kubernetes API. Point it at a non-existent name for a public image.
+        Must be non-empty (a volume cannot have an empty secretName).
+      default: quay-push
+  results:
+    - name: APP_BASE_URL
+      description: In-cluster base URL of the deployed application's Service.
+  volumes:
+    # Optional: a missing Secret mounts nothing (no PodInitializing hang --
+    # the missing-backing hang only bites non-optional secret volumes), and
+    # the script treats "file absent" as "no pull secret needed".
+    - name: pull-secret
+      secret:
+        secretName: $(params.PULL_SECRET_NAME)
+        optional: true
+  steps:
+    - name: deploy
+      # In-cluster `cli` ImageStream, not registry.redhat.io: there is no
+      # `openshift/oc-cli` repo there and the pull fails "unauthorized" even
+      # though the cluster's registry auth works for every other image (see
+      # deploy-app-under-test.yaml for the full note).
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      volumeMounts:
+        - name: pull-secret
+          mountPath: /run/secrets/pull-secret
+          readOnly: true
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        NS="$(params.NAMESPACE)"
+        APP_NAME="$(params.APP_NAME)"
+        IMAGE="$(params.IMAGE)"
+
+        if [ -z "${IMAGE}" ]; then
+          echo "ERROR: IMAGE param is empty -- nothing to deploy." >&2
+          exit 1
+        fi
+        if ! oc get namespace "${NS}" >/dev/null 2>&1; then
+          echo "ERROR: namespace ${NS} does not exist; create-test-namespace must run first." >&2
+          exit 1
+        fi
+
+        # Materialize the pull secret inside the target namespace when one was
+        # mounted. `oc create secret docker-registry --from-file` reads the
+        # mounted dockerconfigjson directly; nothing is fetched through the
+        # API, so the ClusterRole needs only secrets:create (never get) and
+        # this works regardless of who can read Secrets where.
+        PULL_SECRET_BLOCK=""
+        if [ -f /run/secrets/pull-secret/.dockerconfigjson ]; then
+          if oc -n "${NS}" get secret app-image-pull >/dev/null 2>&1; then
+            oc -n "${NS}" delete secret app-image-pull
+          fi
+          oc -n "${NS}" create secret docker-registry app-image-pull \
+            --from-file=.dockerconfigjson=/run/secrets/pull-secret/.dockerconfigjson
+          # NB: both lines of this string are indented >= the YAML block-scalar
+          # indent (a shallower line would silently terminate the script
+          # block). The FIRST line's 6 spaces are relative to the ${...}
+          # heredoc line; the second renders verbatim at 8 -- one deeper than
+          # its key, which is where the list item belongs.
+          PULL_SECRET_BLOCK="      imagePullSecrets:
+        - name: app-image-pull"
+          echo "Copied pull secret $(params.PULL_SECRET_NAME) into ${NS} as app-image-pull."
+        else
+          echo "No pull secret mounted (public image, or PULL_SECRET_NAME names nothing); deploying without one."
+        fi
+
+        # ${PULL_SECRET_BLOCK} expands to nothing when unset; field order in
+        # YAML does not matter, so appending it inside spec is safe either
+        # way. Same heredoc-append pattern as the ownerReference block in
+        # deploy-app-under-test.
+        cat <<EOF | oc apply -n "${NS}" -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${APP_NAME}
+          namespace: ${NS}
+          labels:
+            app.kubernetes.io/name: app-under-test
+            app.kubernetes.io/instance: ${APP_NAME}
+            app.kubernetes.io/part-of: ephemeral-test-resources
+            app.kubernetes.io/managed-by: tekton-pipelines
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app.kubernetes.io/instance: ${APP_NAME}
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: app-under-test
+                app.kubernetes.io/instance: ${APP_NAME}
+            spec:
+        ${PULL_SECRET_BLOCK}
+              # restricted-v3 pod (the cluster's most restrictive SCC). The
+              # uid pin is LOAD-BEARING, not cosmetic -- the full story is in
+              # deploy-app-under-test.yaml; short version: restricted-v3's
+              # MustRunAsRange (1000-65534) must map onto the user namespace
+              # a hostUsers:false pod gets, and 1001 (not the image's nominal
+              # user) sits inside it. The app writes nothing (in-memory
+              # state), so any uid in range works.
+              hostUsers: false
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1001
+                runAsGroup: 1001
+                seccompProfile:
+                  type: RuntimeDefault
+              containers:
+                - name: app
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    capabilities:
+                      drop:
+                        - ALL
+                  ports:
+                    - name: http
+                      containerPort: $(params.PORT)
+                  readinessProbe:
+                    httpGet:
+                      path: $(params.HEALTH_PATH)
+                      port: $(params.PORT)
+                    initialDelaySeconds: 15
+                    periodSeconds: 5
+                    failureThreshold: 36
+                  livenessProbe:
+                    httpGet:
+                      path: $(params.HEALTH_PATH)
+                      port: $(params.PORT)
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    failureThreshold: 12
+                  resources:
+                    requests:
+                      cpu: 250m
+                      memory: 512Mi
+                    limits:
+                      memory: 1Gi
+              terminationGracePeriodSeconds: 10
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${APP_NAME}
+          namespace: ${NS}
+          labels:
+            app.kubernetes.io/name: app-under-test
+            app.kubernetes.io/instance: ${APP_NAME}
+            app.kubernetes.io/part-of: ephemeral-test-resources
+            app.kubernetes.io/managed-by: tekton-pipelines
+        spec:
+          selector:
+            app.kubernetes.io/instance: ${APP_NAME}
+          ports:
+            - name: http
+              port: $(params.PORT)
+              targetPort: $(params.PORT)
+        EOF
+
+        # Deployment "Available" only turns true once the readiness probe (the
+        # app's health endpoint) passes, so this wait means "genuinely
+        # serving", not just "pod running". A failed rollout (bad image,
+        # crashlooping app, unpullable image) fails the task here, which fails
+        # the pipeline BEFORE any test evidence is recorded.
+        oc -n "${NS}" wait --for=condition=Available \
+          "deployment/${APP_NAME}" --timeout=420s
+
+        printf 'http://%s.%s.svc.cluster.local:%s' \
+          "${APP_NAME}" "${NS}" "$(params.PORT)" > "$(results.APP_BASE_URL.path)"
+        echo "Application image deployed: ${IMAGE}"
+        echo "Base URL: $(cat "$(results.APP_BASE_URL.path)")"
