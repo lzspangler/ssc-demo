@@ -120,11 +120,17 @@ spec:
             --from-file=.dockerconfigjson=/run/secrets/pull-secret/.dockerconfigjson
           # NB: both lines of this string are indented >= the YAML block-scalar
           # indent (a shallower line would silently terminate the script
-          # block). The FIRST line's 6 spaces are relative to the ${...}
-          # heredoc line; the second renders verbatim at 8 -- one deeper than
-          # its key, which is where the list item belongs.
+          # block). Two DIFFERENT indentation games are in play here:
+          #   - line 1: the 6 spaces are relative to the ${...} heredoc line
+          #     (script column 0), landing imagePullSecrets at the pod-spec
+          #     child indent (6);
+          #   - line 2: heredoc variable expansion emits continuation lines
+          #     VERBATIM -- nothing re-indents them -- so the 8 spaces it must
+          #     render at (one deeper than its key) must be written INTO the
+          #     script text, i.e. 8 here + 8 stripped by the block scalar =
+          #     16 spaces in this file.
           PULL_SECRET_BLOCK="      imagePullSecrets:
-        - name: app-image-pull"
+                - name: app-image-pull"
           echo "Copied pull secret $(params.PULL_SECRET_NAME) into ${NS} as app-image-pull."
         else
           echo "No pull secret mounted (public image, or PULL_SECRET_NAME names nothing); deploying without one."
