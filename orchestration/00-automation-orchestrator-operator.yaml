@@ -1,0 +1,48 @@
+# Install the Automation Orchestrator Operator (Red Hat Automation Orchestrator
+# 2026.8) from the cluster's Red Hat Operators catalog.
+#
+# The operator bundle's system namespace is
+# `automation-orchestrator-operator-system` -- the same namespace every other
+# file in this directory already targets -- so the subscription lives there
+# too, and the AutomationOrchestrator CR, its databases and the workflow
+# platform all end up in one place.
+#
+# NOTE: installing the operator deploys ONLY the controller-manager. The
+# AutomationOrchestrator CR in automation-orchestrator.yaml is what actually
+# creates the application pods, Route and admin secret.
+#
+# installPlanApproval: Manual -- the `stable` channel ships continuous builds
+# (the CSV version is a timestamp), so automatic approval would upgrade the
+# operator under a running demo. After applying, approve the InstallPlan once:
+#
+#   oc -n automation-orchestrator-operator-system patch installplan \
+#     $(oc -n automation-orchestrator-operator-system get installplan -o name | cut -d/ -f2) \
+#     --type merge -p '{"spec":{"approved":true}}'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: automation-orchestrator-operator-system
+  labels:
+    app.kubernetes.io/part-of: automation-orchestrator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: automation-orchestrator-operator-system
+  namespace: automation-orchestrator-operator-system
+spec: {} # AllNamespaces: the CR may live in any namespace
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: automation-orchestrator-operator
+  namespace: automation-orchestrator-operator-system
+spec:
+  channel: stable
+  installPlanApproval: Manual
+  name: automation-orchestrator-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  # Pinned to the CSV verified present in this cluster's catalog
+  # (2026-11-13). Drop startingCSV to always take the latest stable build.
+  startingCSV: automation-orchestrator-operator.v2026.8.1793830765

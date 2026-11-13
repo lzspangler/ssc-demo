@@ -1,0 +1,88 @@
+# RBAC for the "Remediate Test Promote Gitlab" workflow's script nodes.
+#
+# The workflow's python scripts talk to the Kubernetes API in-cluster
+# (https://kubernetes.default.svc) to watch for finished PipelineRuns and to
+# create new ones for test-image-functional, test-image-integration and
+# gitops-cd-prod in tssc-app-ci. Their credentials are the worker SA's token,
+# mounted at /var/run/ao-k8s from orchestrator-worker-k8s-access.yaml (the
+# operator mounts no token in the worker pods, resets manual
+# automountServiceAccountToken changes, and script subprocesses see only an
+# allowlisted environment, so neither the projected path nor env injection
+# works). The service account that runs workflow script subprocesses
+# therefore needs pipelinerun access in that namespace.
+#
+# The service account below was identified from the running platform: the
+# `automationorchestrator-demo-worker` deployment (SA of the same name) polls
+# the `orchestrator-workflow-queue` Temporal task queue and is where workflow
+# node activities -- including script nodes -- execute. The
+# `...-background-worker` deployment polls `orchestrator-background-queue`
+# (internal scheduled jobs only) and is NOT involved.
+#
+# NB: the SA name derives from the CR name (`automationorchestrator-demo`).
+# If the AutomationOrchestrator CR is ever renamed, update the subject below
+# to `<new-cr-name>-worker`.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-pipelinerun-driver
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: automation-orchestrator
+rules:
+  # Enumerated on purpose -- the same convention as the ephemeral test
+  # namespace ClusterRole: never resources: ["*"].
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelineruns"]
+    verbs: ["get", "list", "watch", "create"]
+---
+# The "Remediate Test Promote Gitlab" workflow's comment node reads the
+# GitLab token from the SAME secret the pipelines use (scm-auth-secret,
+# keys: token, username) instead of duplicating it into a platform
+# credential. This grant is deliberately the tightest possible: `get` on
+# exactly that one named secret -- no list, no other secrets, no other
+# verbs -- so the worker pods cannot discover or read anything else in
+# tssc-app-ci.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-gitlab-token-reader
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: automation-orchestrator
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["scm-auth-secret"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-pipelinerun-driver
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: automation-orchestrator
+subjects:
+  - kind: ServiceAccount
+    name: automationorchestrator-demo-worker
+    namespace: automation-orchestrator-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-pipelinerun-driver
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-gitlab-token-reader
+  namespace: tssc-app-ci
+  labels:
+    app.kubernetes.io/part-of: automation-orchestrator
+subjects:
+  - kind: ServiceAccount
+    name: automationorchestrator-demo-worker
+    namespace: automation-orchestrator-operator-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-gitlab-token-reader
