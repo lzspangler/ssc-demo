@@ -227,10 +227,42 @@ starts it with an issue number, and the workflow drives everything from the
   projected SA token. If the orchestrator executes scripts elsewhere, move
   the pipeline-starting steps to `http_request` nodes with an API-token
   credential against `https://api.cluster-b7zgr.dyn.redhatworkshops.io:6443`.
-- **Timeouts** (constants at the top of each script): remediation+merge 4 h
-  (a human merges the MR), build 60 min, tests 90 min, prod promotion 30 min.
+- **Inter-node handoffs are stdout-JSON contracts**: each polling script
+  sends all progress output to **stderr** and reserves stdout for a single
+  JSON line that the next node `json.loads`es verbatim. (A first version
+  printed progress to stdout too; the first run that got past the wait node
+  then died in the tests node with `JSONDecodeError: Expecting value`.)
+  Relatedly, the wait node snapshots the newest already-failed remediation
+  run when it starts: a failure visible in its first moments is a stale run
+  from an earlier attempt (the just-posted `/remediate` comment takes a few
+  seconds to spawn its PipelineRun), so only a *newer* failed run fails the
+  workflow.
+- **Timeouts** — two layers, and both matter. The platform kills any script
+  node at `settings.timeout` seconds (default **300**) regardless of what the
+  script itself would wait — the first version of this workflow died at
+  exactly 5 minutes with `Script execution timed out after 300 seconds`
+  while polling (Temporal cancels the activity 10 s after that ceiling). So
+  the three polling nodes carry explicit `settings.timeout` values sized
+  above their scripts' own waits: wait-for-build 11 100 s, tests 5 700 s,
+  promotion 2 100 s. The in-script constants (remediation+merge **2 h** — a
+  human merges the MR — then build 60 min, tests 90 min, prod promotion
+  30 min) fire first, keeping the specific "what was I waiting for" error
+  messages.
 - The `agentic` LLM node is deliberately absent — no LLM decisions in this
   chain; the human at the trigger is the judgment.
+- **The chain is only as good as the issue's decision block**: the workflow
+  fails the run — by design, before anything is tested or promoted — when
+  the remediation PipelineRun fails, and the most common cause is the
+  issue's `FIXED_VERSION` not resolving. It must be a version the
+  Artifactory `maven` repo can actually serve: a real Maven Central version
+  (verified against Central, not just the advisory) or one of the
+  custom-staged `.rhlw-00001` artifacts. Demo-issue examples of exactly
+  this: issue 55 advised `tomcat-embed-core 9.0.101` — a version Tomcat
+  never published (the 9.0.x line jumps 9.0.100 → 9.0.102) — and issue 18
+  advised `11.0.0-M5`, a milestone never published to Central. Fix by
+  editing the hidden `<!-- cve-decision ... -->` block in the issue body
+  (see pipelines/triggers/agentic-issue-triggers.yaml), or overriding in
+  the comment itself (`/remediate` + `FIXED_VERSION: <existing>`).
 
 ## Notes
 
