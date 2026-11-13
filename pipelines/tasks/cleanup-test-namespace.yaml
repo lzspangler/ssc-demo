@@ -1,0 +1,93 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: cleanup-test-namespace
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "testing, ephemeral, cleanup, namespace"
+spec:
+  description: >-
+    Delete the ephemeral test namespace created by create-test-namespace --
+    and with it EVERYTHING the run deployed (deleting a namespace garbage-
+    collects all resources inside it, which is why the test pipelines use a
+    per-run namespace instead of per-resource cleanup). Runs as a PIPELINE
+    FINALLY task so it executes whether the run succeeded, failed, or was
+    skipped partway. Deliberately never fails the run: a cleanup error after
+    a successful test pass should not turn the run red; it logs loudly
+    instead so a human can sweep up manually.
+
+    Namespace deletion is asynchronous (finalizers, graceful pod
+    termination); this task kicks it off with --wait=false and then polls
+    for up to ~2 minutes so the common case is "gone before the run ends".
+    If it is still terminating after that, the deletion continues in the
+    background -- that is a warning, not an error.
+
+    Safety nets behind this task: the namespace is labeled
+    app.kubernetes.io/part-of=ephemeral-test-namespace, so a manual sweep for
+    anything a killed run left behind is one command:
+      oc delete namespace -l app.kubernetes.io/part-of=ephemeral-test-namespace
+    (A namespace cannot carry an ownerReference to the PipelineRun --
+    cluster-scoped objects can only be owned by cluster-scoped owners -- so
+    GC-on-PipelineRun-deletion is NOT one of the nets here, unlike the
+    in-namespace resources of the test-generation pipelines.)
+  params:
+    - name: NAMESPACE
+      type: string
+      description: >-
+        The namespace to delete. Pass the same value create-test-namespace
+        got ($(context.pipelineRun.name)): deriving it from the context
+        instead of the create task's results means this finally task still
+        works when the create task itself failed partway. Empty is a no-op.
+      default: ""
+  steps:
+    - name: cleanup
+      # In-cluster `cli` ImageStream, not registry.redhat.io: there is no
+      # `openshift/oc-cli` repo there and the pull fails "unauthorized" even
+      # though the cluster's registry auth works for every other image (see
+      # deploy-app-under-test.yaml for the full note).
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -uo pipefail   # no -e: cleanup must never fail the run
+
+        NS="$(params.NAMESPACE)"
+        if [ -z "${NS}" ]; then
+          echo "No namespace name given (create-test-namespace never ran); nothing to clean up."
+          exit 0
+        fi
+
+        if ! oc get namespace "${NS}" >/dev/null 2>&1; then
+          echo "Namespace ${NS} does not exist; nothing to clean up."
+          exit 0
+        fi
+
+        # --wait=false: kick off the deletion, then poll below. A blocking
+        # delete could hold the finally task hostage to a slow finalizer.
+        # --ignore-not-found makes a re-run (or a run whose create step never
+        # finished) a no-op instead of an error.
+        if ! oc delete namespace "${NS}" --ignore-not-found --wait=false; then
+          echo "WARN: failed to delete namespace ${NS}." >&2
+          echo "(manual sweep: oc delete namespace -l app.kubernetes.io/part-of=ephemeral-test-namespace)" >&2
+          exit 0
+        fi
+        echo "Namespace ${NS} deletion started."
+
+        # Bounded wait for the namespace to actually disappear (~2 min).
+        # Still terminating afterwards is a warning, not an error: the
+        # deletion continues server-side either way.
+        for i in $(seq 1 24); do
+          if ! oc get namespace "${NS}" >/dev/null 2>&1; then
+            echo "Namespace ${NS} (and everything in it) deleted."
+            exit 0
+          fi
+          sleep 5
+        done
+
+        echo "WARN: namespace ${NS} is still terminating after ~2 minutes:" >&2
+        oc get namespace "${NS}" -o jsonpath='{.status.phase}{"\n"}' >&2 || true
+        echo "Deletion continues in the background; if it is still there later," >&2
+        echo "inspect with: oc get namespace ${NS} -o yaml   (check .spec.finalizers)" >&2
+        echo "(manual sweep: oc delete namespace -l app.kubernetes.io/part-of=ephemeral-test-namespace)" >&2
+        exit 0

@@ -1,0 +1,223 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    pipelines.openshift.io/runtime: generic
+    pipelines.openshift.io/strategy: docker
+    pipelines.openshift.io/used-by: build-cloud
+  name: test-image-integration
+spec:
+  # Linear chain with a parallel head: clone-repository ∥ create-test-namespace
+  #   -> deploy-app-image -> run-tests (failsafe *IT/*IntegrationTest, in-JVM)
+  #   -> comment-test-evidence
+  #   finally: cleanup-test-namespace
+  #
+  # IMAGE-LEVEL test evidence: deploy the exact container image a CI pipeline
+  # published (not a rebuild from source) into a PER-RUN EPHEMERAL NAMESPACE,
+  # then run the project's integration test suite (*IT.java /
+  # *IntegrationTest.java per the test-generation-integration skill's
+  # contract: test-managed embedded H2/WireMock doubles, no Testcontainers).
+  # On success, a test-summary evidence comment lands on the given
+  # GitLab/GitHub issue; the namespace -- and everything deployed into it --
+  # is deleted whether the run passed or failed.
+  #
+  # NOTE ON THE DEPLOYMENT: the integration suite itself is deployment-free
+  # (its doubles run inside the test JVM), so the Deployment is not the test
+  # target here -- it is a smoke gate. The deployment's readiness probe is
+  # the app's health endpoint, so a run only reaches the test step once the
+  # image is genuinely serving: an image that cannot boot never gets
+  # integration-test evidence. If you want the suite to run regardless of the
+  # image's bootability, drop deploy-app-image from run-tests' runAfter (but
+  # then the evidence no longer says anything about the image itself).
+  #
+  # The two head tasks run in parallel: only clone-repository touches the
+  # workspace (RWO PVC), and create-test-namespace touches only the Kubernetes
+  # API, so there is no writer to serialize against.
+  params:
+    - description: >-
+        Container image to test, e.g.
+        quay.apps.<domain>/tssc/spring-boot-example-application:<sha> -- the
+        exact artifact CI published, not a rebuild.
+      name: image
+      type: string
+    - description: Source Repository URL (the project whose tests run, and the issue's project).
+      name: git-url
+      type: string
+    - default: ""
+      description: Revision of the Source Repository
+      name: revision
+      type: string
+    - default: source
+      description: Project subdirectory within the source workspace (where pom.xml lives).
+      name: subdirectory
+      type: string
+    # ---------------- SCM (evidence comment) ----------------
+    - name: git-host
+      type: string
+      description: SCM host for the issue comment, e.g. gitlab-gitlab.apps.cluster.example.com
+      default: ""
+    - name: scm-provider
+      type: string
+      description: gitlab | github
+      default: gitlab
+    - name: scm-secret-name
+      type: string
+      default: scm-auth-secret
+    - name: issue-iid
+      type: string
+      description: >-
+        Project-scoped number of the GitLab/GitHub issue to comment the test
+        evidence on. Empty (the default) posts nothing -- the evidence then
+        lives only in the PipelineRun log.
+      default: ""
+    - name: agent-image
+      type: string
+      description: >-
+        Image for the evidence-comment task. It must bundle the SCM CLI glab
+        (both agent-image flavors do); the pipelines-git-init default inside
+        the task ships git only.
+      default: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+    - name: pull-secret-name
+      type: string
+      description: >-
+        dockerconfigjson Secret in the PIPELINE namespace used to pull IMAGE
+        inside the ephemeral namespace (private Quay repos need it; the demo's
+        default is the quay-push robot's secret). Point it at a Secret that
+        does not exist to skip pull authentication (public image).
+      default: quay-push
+  results:
+    - name: CHAINS-GIT_URL
+      value: $(tasks.clone-repository.results.url)
+    - name: CHAINS-GIT_COMMIT
+      value: $(tasks.clone-repository.results.commit)
+    - name: APP_BASE_URL
+      value: $(tasks.deploy-app-image.results.APP_BASE_URL)
+  tasks:
+    # Parallel head: the clone writes the workspace, the namespace creation
+    # talks to the API -- nothing contends.
+    - name: clone-repository
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: workspace
+        - name: basic-auth
+          workspace: git-auth
+    - name: create-test-namespace
+      taskRef:
+        name: create-test-namespace
+      params:
+        # The PipelineRun's name IS the namespace name: unique per run, so
+        # concurrent runs never collide, and the finally cleanup can derive
+        # the same name without depending on this task having succeeded.
+        - name: NAME
+          value: $(context.pipelineRun.name)
+
+    - name: deploy-app-image
+      runAfter:
+        - create-test-namespace
+      taskRef:
+        name: deploy-app-image
+      params:
+        - name: IMAGE
+          value: $(params.image)
+        - name: NAMESPACE
+          value: $(tasks.create-test-namespace.results.NAMESPACE)
+        - name: PULL_SECRET_NAME
+          value: $(params.pull-secret-name)
+
+    - name: run-tests
+      runAfter:
+        - clone-repository
+        - deploy-app-image
+      taskRef:
+        name: maven
+      params:
+        # Same invocation contract as agentic-test-generation-integration's
+        # re-run-tests: DIRECT failsafe (a pom without a failsafe binding
+        # silently runs zero *IT.java on `verify`), scoped with -Dit.test.
+        # The pattern covers BOTH naming conventions -- the skill's *IT.java
+        # and the repo's own *IntegrationTest.java seeds -- because one
+        # pattern alone has historically matched zero classes and failed the
+        # run with "No tests matching pattern". If NEITHER matches, failsafe
+        # fails loudly: no integration-shaped tests exist to evidence.
+        # No APP_BASE_URL: this suite runs against test-managed doubles, not
+        # the deployed app (see the pipeline header note). test-compile (not
+        # `package`): the boot jar is not needed -- the image under test
+        # arrives as a param.
+        - name: GOALS
+          value:
+            - test-compile
+            - failsafe:integration-test
+            - failsafe:verify
+            - -Dit.test=*IT,*IntegrationTest
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: maven_settings
+          workspace: maven-settings
+
+    # Success tail: a DAG task (NOT a finally task), so Tekton's ordinary
+    # task-failure semantics skip it when run-tests fails -- the issue only
+    # receives evidence for a run that passed. It deliberately FAILS the run
+    # when it cannot post a comment it was asked to post.
+    - name: comment-test-evidence
+      runAfter:
+        - run-tests
+      taskRef:
+        name: comment-test-evidence
+      params:
+        - name: SUBDIRECTORY
+          value: $(params.subdirectory)
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: GIT_HOST
+          value: $(params.git-host)
+        - name: SCM_PROVIDER
+          value: $(params.scm-provider)
+        - name: ISSUE_IID
+          value: $(params.issue-iid)
+        - name: SCM_SECRET_NAME
+          value: $(params.scm-secret-name)
+        - name: TEST_CATEGORY
+          value: integration
+        - name: TEST_PATTERN
+          value: "*IT,*IntegrationTest"
+        - name: IMAGE
+          value: $(params.image)
+        - name: SOURCE_COMMIT
+          value: $(tasks.clone-repository.results.commit)
+        - name: NAMESPACE
+          value: $(tasks.create-test-namespace.results.NAMESPACE)
+        - name: GIT_IMAGE
+          value: $(params.agent-image)
+        - name: PIPELINE_RUN_NAME
+          value: $(context.pipelineRun.name)
+      workspaces:
+        - name: source
+          workspace: workspace
+
+  # Delete the ephemeral namespace (and everything in it) whether the run
+  # succeeded, failed, or was skipped partway. NAMESPACE is derived from the
+  # PipelineRun context, NOT from the create task's results, so the cleanup
+  # still runs correctly when the create task itself failed partway.
+  finally:
+    - name: cleanup-test-namespace
+      taskRef:
+        name: cleanup-test-namespace
+      params:
+        - name: NAMESPACE
+          value: $(context.pipelineRun.name)
+
+  workspaces:
+    - name: workspace
+    - name: maven-settings
+    - name: git-auth
+      optional: true

@@ -1,0 +1,222 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: comment-test-evidence
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "git, issue, testing, evidence"
+spec:
+  description: >-
+    Post a test-summary evidence comment on a GitLab/GitHub issue. Parses the
+    Maven Failsafe reports (target/failsafe-reports/*.txt) left on the
+    workspace by the test run, aggregates them (total tests / failures /
+    errors / skipped, plus a per-class table), and submits the summary as an
+    issue comment via glab (GitLab) or gh (GitHub).
+
+    This task is the SUCCESS TAIL of the image-test pipelines: place it after
+    the test task in the DAG (not in finally), so Tekton's ordinary
+    task-failure semantics skip it when tests fail -- the issue only gets
+    evidence for a run that passed. It FAILS the run when it cannot post a
+    comment it was asked to post: an issue that asked for evidence and did
+    not get it is a failed requirement, not a warning.
+
+    Auth comes from the SCM_SECRET_NAME secret (keys: token, username), the
+    same secret open-pr/open-cve-issues use.
+  params:
+    - name: SUBDIRECTORY
+      type: string
+      description: Project subdirectory within the source workspace (where target/ lives).
+      default: source
+    - name: GIT_URL
+      type: string
+      description: HTTPS URL of the project repository (the issue's project).
+    - name: GIT_HOST
+      type: string
+      description: >-
+        SCM host, e.g. gitlab-gitlab.apps.cluster.example.com. Empty derives
+        it from GIT_URL.
+      default: ""
+    - name: SCM_PROVIDER
+      type: string
+      description: gitlab | github
+      default: gitlab
+    - name: ISSUE_IID
+      type: string
+      description: >-
+        Project-scoped number of the issue to comment on. Empty (the default)
+        skips the comment entirely -- a manual run with no issue records its
+        evidence only in the PipelineRun log.
+      default: ""
+    - name: SCM_SECRET_NAME
+      type: string
+      default: scm-auth-secret
+    - name: TEST_CATEGORY
+      type: string
+      description: Test category this evidence is for (functional | integration).
+      default: functional
+    - name: TEST_PATTERN
+      type: string
+      description: The failsafe -Dit.test pattern that scoped the suite, shown in the evidence body.
+      default: "*FT"
+    - name: IMAGE
+      type: string
+      description: The container image the tests ran against (shown in the evidence body).
+      default: ""
+    - name: SOURCE_COMMIT
+      type: string
+      description: The commit the tests ran from (shown in the evidence body).
+      default: ""
+    - name: NAMESPACE
+      type: string
+      description: The ephemeral test namespace (shown in the evidence body).
+      default: ""
+    - name: PIPELINE_RUN_NAME
+      type: string
+      description: >-
+        Name of this PipelineRun (shown in the evidence body). Pass
+        $(context.pipelineRun.name) from the pipeline; context variables are
+        substituted in PARAMS, not inside step scripts.
+      default: ""
+    - name: GIT_IMAGE
+      type: string
+      description: >-
+        Image this task runs in. It MUST contain the SCM CLI it calls (glab
+        for GitLab, gh for GitHub). The pipeline overrides this with the agent
+        image, which bundles both (plus git). The default below
+        (pipelines-git-init) ships git ONLY -- override it when running this
+        task standalone.
+      default: registry.redhat.io/openshift-pipelines/pipelines-git-init-rhel8:latest
+  workspaces:
+    - name: source
+      description: Workspace carrying the tested project (target/failsafe-reports/).
+  results:
+    - name: TESTS_TOTAL
+      description: Total tests found in the failsafe reports.
+    - name: TESTS_FAILED
+      description: Failures + errors across the failsafe reports.
+  volumes:
+    - name: scm-secret
+      secret:
+        secretName: $(params.SCM_SECRET_NAME)
+        optional: false
+  steps:
+    - name: comment-evidence
+      image: $(params.GIT_IMAGE)
+      workingDir: "$(workspaces.source.path)/$(params.SUBDIRECTORY)"
+      volumeMounts:
+        - name: scm-secret
+          mountPath: /run/secrets/scm
+          readOnly: true
+      env:
+        - name: HOME
+          value: /tekton/home
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: ISSUE_IID
+          value: $(params.ISSUE_IID)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        REPORT_DIR="target/failsafe-reports"
+        if [ ! -d "${REPORT_DIR}" ] || ! ls "${REPORT_DIR}"/*.txt >/dev/null 2>&1; then
+          echo "ERROR: no Failsafe reports under ${REPORT_DIR}." >&2
+          echo "       The test step claimed success but left no reports -- that is a" >&2
+          echo "       broken test invocation (e.g. a -Dit.test pattern matching zero" >&2
+          echo "       classes), not evidence. Refusing to post an empty summary." >&2
+          exit 1
+        fi
+
+        # Aggregate the per-class summaries. Each *.txt carries a line like
+        # "Tests run: 12, Failures: 0, Errors: 0, Skipped: 1"; the filename is
+        # the test class. awk sums the four counters and keeps the per-class
+        # rows for the evidence table.
+        awk '
+          FNR == 1 { cls = FILENAME; sub(/^.*\//, "", cls); sub(/\.txt$/, "", cls) }
+          /Tests run:/ {
+            tests = failures = errors = skipped = 0
+            if (match($0, /Tests run: [0-9]+/))      tests    = substr($0, RSTART + 11, RLENGTH - 11) + 0
+            if (match($0, /Failures: [0-9]+/))       failures = substr($0, RSTART + 10, RLENGTH - 10) + 0
+            if (match($0, /Errors: [0-9]+/))         errors   = substr($0, RSTART + 8,  RLENGTH - 8)  + 0
+            if (match($0, /Skipped: [0-9]+/))        skipped  = substr($0, RSTART + 9,  RLENGTH - 9)  + 0
+            T += tests; F += failures; E += errors; S += skipped
+            rows[++n] = sprintf("| %s | %d | %d | %d | %d |", cls, tests, failures, errors, skipped)
+          }
+          END {
+            printf "%d %d %d %d\n", T, F, E, S > "/tmp/totals"
+            for (i = 1; i <= n; i++) print rows[i] > "/tmp/rows"
+          }
+        ' "${REPORT_DIR}"/*.txt
+
+        read -r T F E S < /tmp/totals
+        printf '%s' "${T}" > "$(results.TESTS_TOTAL.path)"
+        printf '%s' "$((F + E))" > "$(results.TESTS_FAILED.path)"
+        echo "Failsafe totals: tests=${T} failures=${F} errors=${E} skipped=${S}"
+
+        if [ -z "${ISSUE_IID}" ]; then
+          echo "ISSUE_IID empty -- no issue to comment on; evidence lives in this PipelineRun's log."
+          exit 0
+        fi
+
+        TOKEN="$(cat /run/secrets/scm/token)"
+
+        # Repo path (group/project) from GIT_URL, stripping scheme/creds/.git
+        # -- same derivation as open-cve-issues.
+        REPO_PATH="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
+        if [ -z "${GIT_HOST}" ]; then
+          GIT_HOST="$(echo "${GIT_URL}" | sed -E 's#^https?://##; s#/.*$##')"
+          echo "GIT_HOST not set; derived '${GIT_HOST}' from GIT_URL."
+        fi
+
+        case "${SCM_PROVIDER}" in
+          gitlab) export GITLAB_HOST="${GIT_HOST}" GITLAB_TOKEN="${TOKEN}" ;;
+          github) export GH_HOST="${GIT_HOST}"     GH_TOKEN="${TOKEN}"    ;;
+          *) echo "Unsupported SCM_PROVIDER: ${SCM_PROVIDER}" >&2; exit 1 ;;
+        esac
+
+        SHORT_COMMIT="$(echo "$(params.SOURCE_COMMIT)" | cut -c1-12)"
+        NOW="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+        {
+          echo "## ✅ Test evidence — $(params.TEST_CATEGORY) suite ($(params.TEST_PATTERN))"
+          echo
+          echo "**Result: PASSED** — ${T} tests, ${F} failures, ${E} errors, ${S} skipped"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Image | \`$(params.IMAGE)\` |"
+          [ -n "${SHORT_COMMIT}" ] && echo "| Source | $(params.GIT_URL) @ ${SHORT_COMMIT} |"
+          [ -n "$(params.NAMESPACE)" ] && echo "| Test namespace | \`$(params.NAMESPACE)\` (ephemeral, removed after the run) |"
+          echo "| Recorded | ${NOW} |"
+          echo
+          echo "### Per-class results"
+          echo
+          echo "| Test class | Tests | Failures | Errors | Skipped |"
+          echo "|---|---:|---:|---:|---:|"
+          cat /tmp/rows
+          echo
+          [ -n "$(params.PIPELINE_RUN_NAME)" ] && echo "*Posted automatically by the image-test pipeline (PipelineRun: \`$(params.PIPELINE_RUN_NAME)\`).*"
+        } > /tmp/evidence.md
+
+        echo "---- evidence comment ----"
+        cat /tmp/evidence.md
+        echo "--------------------------"
+
+        case "${SCM_PROVIDER}" in
+          gitlab)
+            # Command substitution preserves the newlines inside the argument.
+            glab issue note "${ISSUE_IID}" -R "${REPO_PATH}" \
+              -m "$(cat /tmp/evidence.md)"
+            ;;
+          github)
+            gh issue comment "${ISSUE_IID}" -R "${REPO_PATH}" \
+              --body-file /tmp/evidence.md
+            ;;
+        esac
+        echo "Evidence comment posted to ${REPO_PATH}#${ISSUE_IID}."

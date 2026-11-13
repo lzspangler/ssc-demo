@@ -1,0 +1,153 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-test-namespace
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.41.0"
+    tekton.dev/tags: "testing, ephemeral, namespace"
+spec:
+  description: >-
+    Create the ephemeral namespace a test pipeline runs its deployment in.
+    The namespace is named after the PipelineRun (pass $(context.pipelineRun.name)
+    as NAME), so concurrent runs never collide and cleanup-test-namespace can
+    derive the same name without depending on this task having run. The
+    namespace is labeled app.kubernetes.io/part-of=ephemeral-test-namespace so
+    a manual sweep can find anything a killed run left behind.
+
+    Deleting the namespace is what removes everything inside it -- the test
+    pipelines' finally task does that (see cleanup-test-namespace). A namespace
+    CANNOT carry an ownerReference to the PipelineRun (a cluster-scoped object
+    can only be owned by a cluster-scoped owner, and a PipelineRun is
+    namespaced), so the finally task plus the label are the safety nets.
+
+    This file also carries the ClusterRole that makes any of this possible:
+    the `pipeline` service account needs cluster-scoped create/delete on
+    namespaces plus the in-namespace rights to deploy and inspect the app
+    under test. See the RBAC block at the bottom.
+  params:
+    - name: NAME
+      type: string
+      description: >-
+        Name of the namespace to create. Pass $(context.pipelineRun.name) from
+        the pipeline: PipelineRun names are unique, so concurrent runs never
+        collide, and the name is a valid DNS label by construction. Must be
+        <= 63 chars (a Namespace name is a DNS label).
+      default: test-namespace
+  results:
+    - name: NAMESPACE
+      description: The namespace that was created (echoes NAME).
+  steps:
+    - name: create-namespace
+      # In-cluster `cli` ImageStream, not registry.redhat.io: there is no
+      # `openshift/oc-cli` repo there and the pull fails "unauthorized" even
+      # though the cluster's registry auth works for every other image (see
+      # deploy-app-under-test.yaml for the full note).
+      image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        NAME="$(params.NAME)"
+
+        # A namespace name is a DNS label: max 63 chars, alnum/hyphen, start
+        # and end alphanumeric. A generateName'd PipelineRun lands ~35 chars,
+        # but a human-named one can exceed the limit -- fail loudly here
+        # rather than with an opaque API error (or, worse, a truncated name
+        # the cleanup task cannot derive).
+        if [ "${#NAME}" -gt 63 ]; then
+          echo "ERROR: namespace name '${NAME}' is ${#NAME} chars; a namespace name must be <= 63." >&2
+          echo "       Use a generateName'd PipelineRun (the triggers do) or a shorter -n name." >&2
+          exit 1
+        fi
+        if ! echo "${NAME}" | grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'; then
+          echo "ERROR: namespace name '${NAME}' is not a valid DNS label." >&2
+          exit 1
+        fi
+
+        # create (not apply): the name is unique per run, so an existing
+        # namespace with this name means a name collision -- fail loudly
+        # instead of adopting a stranger's namespace.
+        oc create namespace "${NAME}"
+
+        # The label is the manual-sweep handle for runs killed so hard that
+        # even the finally task never executed (a PipelineRun hard timeout
+        # cancels finally tasks too). Keep it in sync with
+        # cleanup-test-namespace's sweep hint.
+        oc label namespace "${NAME}" --overwrite \
+          app.kubernetes.io/part-of=ephemeral-test-namespace \
+          app.kubernetes.io/managed-by=tekton-pipelines
+
+        printf '%s' "${NAME}" > "$(results.NAMESPACE.path)"
+        echo "Created ephemeral test namespace: ${NAME}"
+---
+# -----------------------------------------------------------------------------
+# RBAC for the ephemeral test-namespace lifecycle.
+#
+# The `pipeline` service account (the SA these pipelines' ephemeral-resource
+# tasks run as) needs TWO kinds of rights the demo never needed before:
+#   1. cluster-scoped create/delete on namespaces -- creating and tearing
+#      down the per-run test namespace;
+#   2. namespaced rights INSIDE that namespace -- but a Role/RoleBinding
+#      cannot be pre-created in a namespace that does not exist yet, so these
+#      rights are granted cluster-wide via a ClusterRole.
+#
+# The namespaced rules are deliberately ENUMERATED (deployments, services,
+# pods, pods/log, events, secrets-create) rather than a blanket
+# resources: ["*"]: a wildcard would also match cluster-scoped resources
+# (nodes, clusterroles, ...), making the binding a de-facto cluster-admin.
+# Add a rule here when a task needs a new resource kind -- do not widen the
+# existing ones to "*".
+#
+# The secrets rule is create-only (no get/list/watch anywhere): the deploy
+# task materializes the image pull secret inside the new namespace from a
+# secret mounted into its own pod, so it never has to READ secrets through
+# the API -- and this role must not turn into a cluster-wide secret reader.
+#
+# NOTE: the ClusterRoleBinding subject namespace is HARDCODED to tssc-app-ci,
+# the same caveat as the RoleBinding in deploy-app-under-test.yaml and the
+# ClusterRoleBinding in triggers/agentic-issue-triggers.yaml -- plain YAML
+# Applications cannot template it. Change all of them if the pipeline
+# namespace moves.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ephemeral-test-namespace-lifecycle
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ephemeral-test-namespace-lifecycle
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+subjects:
+  - kind: ServiceAccount
+    name: pipeline
+    namespace: tssc-app-ci
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ephemeral-test-namespace-lifecycle

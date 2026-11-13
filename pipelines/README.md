@@ -1,6 +1,6 @@
 # AI vulnerability remediation
 
-This repo defines **nine** pipelines under `pipelines/` that share the same
+This repo defines **eleven** pipelines under `pipelines/` that share the same
 tasks and images. Each has a single, distinct responsibility and can be run on
 its own:
 
@@ -39,6 +39,14 @@ its own:
    into the prod values file; started by a human, the MR stays open for review.
 9. **`gitops-cd-qa`** — *qa image promotion (human-gated).* Same promotion
    into the qa values file; started by a human, the MR stays open for review.
+10. **`test-image-functional`** — *image-level functional test evidence.* Deploys
+    a published container image into a **per-run ephemeral namespace**, runs the
+    project's functional suite (`*FT.java`) against it, comments a test-summary
+    on the given GitLab/GitHub issue on success, and deletes the namespace
+    (win or lose).
+11. **`test-image-integration`** — same shape for the integration suite
+    (`*IT.java`/`*IntegrationTest.java`, in-JVM doubles); the deployment acts
+    as a boot smoke-gate on the image rather than the test target.
 
 The CVE pipelines share one six-field decision contract
 (`SELECTED`/`CVE_ID`/`PACKAGE`/`CURRENT_VERSION`/`FIXED_VERSION`/`JUSTIFICATION`):
@@ -49,7 +57,7 @@ per-step detail.
 
 ## Overview
 
-This repo defines **nine** pipelines that share the same tasks and images:
+This repo defines **eleven** pipelines that share the same tasks and images:
 
 - **`pipelines/agentic-cve-analysis.yaml`** — self-contained CVE discovery,
   prioritization, and fan-out (build → SBOM → RHTPA scan → must-fix gate → AI
@@ -91,6 +99,14 @@ This repo defines **nine** pipelines that share the same tasks and images:
 - **`pipelines/gitops-cd-qa.yaml`** — qa GitOps CD: same promotion, into the qa
   values file, started by a human; the MR stays open for review
   (`auto-merge="false"`).
+- **`pipelines/test-image-functional.yaml`** — image-level functional test
+  evidence: deploy a published image into a per-run ephemeral namespace
+  (health-gated), run the `*FT.java` suite against it, post a test-summary
+  comment on the given issue on success; the namespace is deleted in `finally`
+  whether the run passed or failed.
+- **`pipelines/test-image-integration.yaml`** — same flow for the `*IT.java` /
+  `*IntegrationTest.java` suite (in-JVM doubles; the deployment is a boot
+  smoke-gate on the image, not the test target).
 
 ### `agentic-cve-analysis` steps
 
@@ -152,6 +168,46 @@ prompt carries only the run contract.
 | RBAC | `pipeline` SA gets the `app-under-test-lifecycle` Role (deployments/services/pods, pods/log, imagestreams — all in `tasks/deploy-app-under-test.yaml`) plus `system:image-builder` for the integrated registry push; the pipeline pins the ephemeral-resource tasks to that SA via `taskRunSpecs` | none beyond the standard pipeline SA |
 | SCC | the generated app Deployment is **restricted-v3-clean by construction**: `hostUsers: false` (restricted-v3 mandates a user namespace), `runAsNonRoot` with an admission-assigned uid (the restricted SCCs enforce MustRunAsRange 1000–65534 — don't pin the image's nominal user 185, it's below the minimum), all capabilities dropped, seccomp `runtime/default`; no special SCC needed. The deploy task's buildah step adds `SETFCAP` and runs under the operator's `pipelines-scc` — **spell it all-caps**: SCC capability matching is case-sensitive and the Tekton-catalog spelling `SETFCap` is rejected by every SCC on the cluster | none |
 
+### `test-image-functional` / `test-image-integration` steps
+
+Image-level test evidence: run a project's existing test suite against a
+**published container image** (the exact artifact CI built — not a rebuild),
+in a **per-run ephemeral namespace** that is deleted when the run ends. The
+two pipelines share one shape; both take the `image`, the project repo
+(`git-url`/`revision`), and an optional `issue-iid` to comment evidence on.
+
+| Step (`taskRef`) | Runs when | Description | External systems / endpoints |
+|------------------|-----------|--------------|------------------------------|
+| `clone-repository` (`git-clone`) | always | Clones the source repo at `revision` into the shared `workspace`; exposes `url`/`commit` results. Runs **in parallel** with `create-test-namespace` (only the clone touches the workspace PVC). | **SCM / Git repo** — `git clone` over HTTPS (creds from `git-auth` workspace). |
+| `create-test-namespace` (`create-test-namespace`) | always | Creates a namespace **named after the PipelineRun** (unique per run, so concurrent runs never collide), labeled `app.kubernetes.io/part-of=ephemeral-test-namespace` for manual sweeps. `NAMESPACE` result. | **Kubernetes API** — namespace create (RBAC: the `ephemeral-test-namespace-lifecycle` ClusterRole in the task file). |
+| `deploy-app-image` (`deploy-app-image`) | always | Deploys `image` into the ephemeral namespace as a health-gated Deployment + Service (readiness probe = the app's health endpoint, so the task only succeeds once the image is genuinely **serving**). Copies the `quay-push` pull secret into the namespace when the image lives in the private in-cluster Quay (the secret is **mounted** into the task pod and re-created inside the target namespace — never read through the API, so the ClusterRole needs only `secrets:create`). `APP_BASE_URL` result. | **Kubernetes API** — deployment/service create + wait. |
+| `run-tests` (`maven`) | always | `test-compile` → direct failsafe → `failsafe:verify` (same invocation contract as the test-generation pipelines' re-runs: a pom without a failsafe binding silently runs zero `*FT`/`*IT` tests on `verify`). Functional: `-Dit.test=*FT` against the deployed app (`-DAPP_BASE_URL` + credentials). Integration: `-Dit.test=*IT,*IntegrationTest`, in-JVM doubles — the deployment is a boot **smoke-gate** on the image, not the test target. | **Artifact repository** — Maven repo/mirror (`maven-settings`). |
+| `comment-test-evidence` (`comment-test-evidence`) | only if `run-tests` succeeded (plain DAG ordering — **not** a finally task) | Parses `target/failsafe-reports/*.txt`, aggregates totals + a per-class table, and posts a test-summary evidence comment on the `issue-iid` issue (`glab issue note` / `gh issue comment`, creds from `scm-auth-secret`). Empty `issue-iid` = no comment, evidence stays in the PipelineRun log. **Fails the run** when it cannot post a comment it was asked to post. | **SCM / Git repo** — issue comment (creds from `scm-auth-secret`). |
+| `cleanup-test-namespace` (`cleanup-test-namespace`) | `finally` (always) | Deletes the ephemeral namespace — and with it **everything** the run deployed (namespace deletion garbage-collects all contents, which is why these pipelines use a per-run namespace instead of per-resource cleanup). `--wait=false` + a ~2-min bounded poll; never fails the run. | **Kubernetes API** — namespace delete. |
+
+Notes that matter when changing these pipelines:
+
+- **The namespace name comes from `$(context.pipelineRun.name)`** — passed to
+  both the create task and the finally cleanup directly from the context, so
+  cleanup works even when the create task itself failed partway. A namespace
+  **cannot** carry an ownerReference to the PipelineRun (cluster-scoped
+  objects need cluster-scoped owners), so the safety nets are the finally
+  task and the label sweep:
+  `oc delete namespace -l app.kubernetes.io/part-of=ephemeral-test-namespace`.
+  As with the test-generation pipelines, a PipelineRun **hard timeout**
+  cancels finally tasks too — that sweep is the recovery path.
+- **The ClusterRole is deliberately enumerated** (namespaces cluster-scoped;
+  deployments/services/pods/pods/log/events namespaced; `secrets` create-only)
+  — a `resources: ["*"]` wildcard would also match cluster-scoped resources
+  and make the binding a de-facto cluster-admin. `secrets` is create-only so
+  the SA never becomes a cluster-wide secret *reader*: the pull secret is
+  mounted into the pod and re-created, not fetched. Add a rule when a task
+  needs a new resource kind; don't widen existing ones.
+- **`deploy-app-image` is a gate, not scaffolding** — an image that cannot
+  boot never gets test evidence. If you want the integration suite to run
+  regardless of bootability, drop `deploy-app-image` from `run-tests`'
+  `runAfter` (documented in the pipeline header too).
+
 ### `agentic-cve-remediation` steps
 
 Every task runs unconditionally except **`verify-commit`** (optional) and the
@@ -198,6 +254,8 @@ out. Every task runs unconditionally except `verify-commit` (optional) and
 | `pipelines/gitops-cd-dev.yaml` | Dev GitOps CD — promote the image `ci-build-publish` just published into the gitops repo's dev values file (MR + auto-merge) |
 | `pipelines/gitops-cd-prod.yaml` | Prod GitOps CD — same promotion, into the prod values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
 | `pipelines/gitops-cd-qa.yaml` | QA GitOps CD — same promotion, into the qa values file, started by a human; the MR stays open for review (`auto-merge="false"`) |
+| `pipelines/test-image-functional.yaml` | Image-level functional test evidence — deploy a published image in a per-run ephemeral namespace, run the `*FT.java` suite against it, comment the summary on the given issue on success |
+| `pipelines/test-image-integration.yaml` | Same for the `*IT.java`/`*IntegrationTest.java` suite; the deployment is a boot smoke-gate, the tests run against in-JVM doubles |
 | `triggers/agentic-issue-triggers.yaml` | Tekton Triggers wiring to start pipelines from a GitLab issue comment — `/remediate` → `agentic-cve-remediation`, `/generate-tests-unit` → `agentic-test-generation-unit`, `/generate-tests-functional` → `agentic-test-generation-functional`, `/generate-tests-integration` → `agentic-test-generation-integration` (one EventListener + interceptors + a binding/template per command + RBAC + Route; the three `/generate-tests*` commands share one TriggerBinding) |
 | `triggers/ci-build-triggers.yaml` | Tekton Triggers wiring for `ci-build-publish` — the push EventListener + `ci-build-push-template` (resolves `output-image` from the commit SHA and the cluster's Quay); also carries the PipelineRun `taskRunSpecs` that pin the `start-gitops-cd-dev` finally task to `tekton-triggers-sa` |
 | `config/ai-agent-config.yaml` | ConfigMap — the single AI backend switch (provider/model/region/effort) |
@@ -217,6 +275,10 @@ out. Every task runs unconditionally except `verify-commit` (optional) and
 | `tasks/deploy-app-under-test.yaml` | Deploys the app under test as ephemeral namespaced resources (jar → image → integrated registry → health-gated Deployment + Service, owner-referenced to the PipelineRun); the generated Deployment is restricted-v3-clean (user namespace, non-root, no capabilities); **also carries the RBAC** — Role `app-under-test-lifecycle` + `system:image-builder` RoleBinding for the `pipeline` SA (namespace hardcoded to `tssc-app-ci`; change it if the pipeline namespace moves) |
 | `tasks/reset-app-under-test.yaml` | Resets the deployed app to a clean state (delete its pods; the Deployment recreates them with a fresh in-memory database) and waits for readiness |
 | `tasks/cleanup-app-under-test.yaml` | `finally` task — deletes the run's ephemeral Deployment/Service/ImageStream whether the run succeeded or failed; never fails the run itself |
+| `tasks/create-test-namespace.yaml` | Creates the per-run ephemeral test namespace (named after the PipelineRun, labeled for sweeps); **carries the `ephemeral-test-namespace-lifecycle` ClusterRole + ClusterRoleBinding** that let the `pipeline` SA create/delete namespaces and deploy inside them |
+| `tasks/deploy-app-image.yaml` | Deploys a given published image into a given namespace as a health-gated Deployment + Service; copies the pull secret in-namespace when the registry is private |
+| `tasks/comment-test-evidence.yaml` | Parses the failsafe reports and posts the test-summary evidence comment on a GitLab/GitHub issue (success tail of the test-image pipelines) |
+| `tasks/cleanup-test-namespace.yaml` | `finally` task — deletes the ephemeral test namespace (and everything in it) whether the run succeeded or failed; never fails the run |
 | `tasks/rhtpa-vulnerability-analysis1.yaml` | Scans the SBOM's PURLs against RHTPA, then suppresses findings explicitly marked fixed/not_affected |
 | `tasks/rhtpa-remediation-report2.yaml` | Resolves a concrete fix version per (PURL, CVE) — `.fix_versions`, backports first |
 | `tasks/conforma-policy-check.yaml` | Conforma gate → must-fix CVE set |
@@ -474,6 +536,44 @@ tkn -n tssc-app-ci pipeline start gitops-cd-prod \
 The run's `MR_URL` result points at the open MR; after you merge it, the
 `spring-boot-example-prod` (or `-qa`) Argo CD Application picks up the values
 change and rolls the deployment.
+
+### `test-image-functional` / `test-image-integration` (image-level test evidence)
+
+```
+clone-repository ─┐
+                  ├─> run-tests (failsafe: *FT against the app | *IT in-JVM) -> comment-test-evidence
+create-test-namespace -> deploy-app-image ─┘
+
+finally (always): cleanup-test-namespace   (deletes the namespace = everything in it)
+```
+
+Both pipelines take the **published image** as a param — the exact artifact
+`ci-build-publish` pushed (`quay.apps.<domain>/tssc/<component>:<sha>`), not a
+rebuild — plus the project repo and an optional `issue-iid`. `run-tests` gates
+on both the clone and the deployment: the deployment's readiness probe is the
+app's health endpoint, so the suite only runs once the image is **genuinely
+serving** (in the integration pipeline that deployment is a boot smoke-gate
+rather than the test target — the suite runs against in-JVM doubles). On
+success `comment-test-evidence` parses `target/failsafe-reports/*.txt` and
+posts the totals + per-class table on the issue; a run with no `issue-iid`
+records its evidence only in the PipelineRun log. The `finally` task deletes
+the ephemeral namespace whatever happened.
+
+Run one manually:
+
+```bash
+tkn -n tssc-app-ci pipeline start test-image-functional \
+  -p image=quay.apps.<domain>/tssc/spring-boot-example-application:<sha> \
+  -p git-url=https://gitlab-gitlab.apps.<domain>/development/spring-boot-example-application \
+  -p issue-iid=42 \
+  -w name=workspace,claimName=pvc --showlog    # bind workspace + maven-settings
+```
+
+The `pipeline` SA needs the `ephemeral-test-namespace-lifecycle` ClusterRole
+(shipped in `tasks/create-test-namespace.yaml`) before the first run — it
+grants namespace create/delete plus the in-namespace deploy rights; see the
+RBAC notes in the steps section above for why it is enumerated rather than
+wildcarded.
 
 ## Triggering pipelines from a GitLab issue comment
 
@@ -1249,7 +1349,14 @@ many lookups failed so a degraded run is visible rather than merely quieter.
    oc -n tssc-app-ci apply -f pipelines/gitops-cd-dev.yaml
    oc -n tssc-app-ci apply -f pipelines/gitops-cd-prod.yaml
    oc -n tssc-app-ci apply -f pipelines/gitops-cd-qa.yaml
+   oc -n tssc-app-ci apply -f pipelines/test-image-functional.yaml
+   oc -n tssc-app-ci apply -f pipelines/test-image-integration.yaml
    ```
+
+   > The `test-image-*` pipelines additionally need the
+   > `ephemeral-test-namespace-lifecycle` ClusterRole/ClusterRoleBinding —
+   > it ships inside `tasks/create-test-namespace.yaml`, so the
+   > `oc apply -f tasks/` above already created it.
 
 6. **Egress:** the cluster must allow the selected provider's endpoint
    (`api.anthropic.com:443` for the default `anthropic` provider; your gateway /
@@ -1266,7 +1373,8 @@ worth fixing (or review the issues and let them sit). `ci-build-publish` runs on
 every merge to the application repository and promotes to dev on its own;
 `gitops-cd-prod`/`gitops-cd-qa` are human-started. The
 `agentic-test-generation-*` pipelines run independently, from their own issue
-comments.
+comments. The `test-image-*` pipelines are started with the image that earned
+the evidence (usually the tag dev just rolled) and an issue to comment on.
 
 The pipelines that open a PR/MR (`agentic-cve-remediation`,
 `agentic-test-generation-*`) need the SCM params set on the PipelineRun (or in the
