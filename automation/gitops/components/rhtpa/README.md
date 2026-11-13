@@ -21,7 +21,7 @@ What it provides:
 
 ```
 tpa-prerequisites/
-  postgresql-*            PostgreSQL 16, 20Gi PVC — RHTPA's graph database
+  postgresql-*            PostgreSQL 16, 100Gi PVC — RHTPA's graph database
   secret-oidc-cli.yaml    the `oidc-tpa-cli` Secret RHTPA reads its client secret from
   objectbucketclaim.yaml  the S3 bucket (s3 mode only)
   wait-for-keycloak.yaml  PreSync hook: block until the Keycloak issuer answers
