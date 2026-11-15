@@ -52,6 +52,24 @@ spec:
       type: string
       description: Application commit the image was built from (MR context only).
       default: ""
+    - name: issue-ref
+      type: string
+      description: >-
+        Cross-project issue reference to link from the promotion MR's
+        description, e.g. development/spring-boot-example-application#55.
+        GitLab links the MR and the issue both ways (the issue's activity feed
+        shows "mentioned in merge request"); the promotion workflow passes the
+        remediation issue here. Empty auto-derives it from the MR that landed
+        app-commit (see gitops-bump-image's ISSUE_REF).
+      default: ""
+    - name: issue-action
+      type: string
+      description: >-
+        Reference verb for issue-ref in the MR description: "Closes" (the
+        default here) auto-closes the issue when the promotion MR merges --
+        a CVE issue is only done once the fix ships to prod. Pass "References"
+        to link without closing.
+      default: "Closes"
     # ---------------- gitops repo ----------------
     # Cluster-specific: like the image-registry default in
     # ci-build-triggers.yaml, these cannot be templated (the pipelines are
@@ -131,6 +149,10 @@ spec:
           value: $(params.app-repo-url)
         - name: APP_COMMIT
           value: $(params.app-commit)
+        - name: ISSUE_REF
+          value: $(params.issue-ref)
+        - name: ISSUE_ACTION
+          value: $(params.issue-action)
         - name: SCM_SECRET_NAME
           value: $(params.scm-secret-name)
         # gitops-bump-image needs git + glab; the default git-init image ships
