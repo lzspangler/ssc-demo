@@ -64,6 +64,30 @@ spec:
       type: string
       description: Application commit the image was built from (MR description context only).
       default: ""
+    - name: ISSUE_REF
+      type: string
+      description: >-
+        Cross-project issue reference to put in the MR description, e.g.
+        development/spring-boot-example-application#55. GitLab links the MR and
+        the issue both ways: the issue's activity feed gets a "mentioned in
+        merge request" note. Empty (the default) AUTO-DERIVES it when
+        APP_REPO_URL and APP_COMMIT are set: the app project is public, so the
+        task can ask its API which merge request landed that commit and read
+        the "Related to #<iid>" line the remediation pipeline (open-pr-cve)
+        writes into the MR description. Set it explicitly to override; leave
+        it empty and unset APP_COMMIT for no reference at all.
+      default: ""
+    - name: ISSUE_ACTION
+      type: string
+      description: >-
+        GitLab reference verb that prefixes ISSUE_REF in the MR description.
+        "References" (the default) only links the MR and the issue -- what dev
+        and qa promotions want. "Closes" additionally auto-closes the issue
+        the moment this MR merges into the gitops repo's default branch --
+        what prod promotions want (the issue tracks a CVE that is only
+        considered fixed once the fix ships to prod). Any other GitLab closing
+        keyword (Fixes, Resolves) works the same way as "Closes".
+      default: "References"
     - name: SCM_SECRET_NAME
       type: string
       default: scm-auth-secret
@@ -187,11 +211,50 @@ spec:
 
         git push --quiet "${AUTH_URL}" "${BRANCH}"
 
+        # --- issue reference -------------------------------------------------
+        # Link the promotion MR back to the app repo's remediation issue so
+        # the issue's activity feed shows the MR ("mentioned in merge
+        # request"). An explicit ISSUE_REF param wins; otherwise derive it
+        # from the merge request that landed APP_COMMIT: the remediation
+        # pipeline (open-pr-cve) writes "Related to #<iid>" into its MR
+        # description, and the app project is public, so the lookup needs no
+        # token (anonymous API reads answer 200 -- verified on this cluster).
+        # Best-effort by design: a non-remediation merge (no "Related to" in
+        # any MR description) or an unreachable API just leaves the promotion
+        # MR unreferenced -- never fail a promotion over a courtesy link.
+        if [ -z "${ISSUE_REF}" ] && [ -n "${APP_COMMIT}" ] && [ -n "${APP_REPO_URL}" ]; then
+          APP_HOST="$(echo "${APP_REPO_URL}" | sed -E 's#^https?://##; s#/.*##')"
+          APP_PATH="$(echo "${APP_REPO_URL}" | sed -E 's#^https?://##; s#^[^/]+/##; s#\.git$##')"
+          # (|| true: with the task's default git-only image neither jq nor
+          # curl exists; the empty APP_ENC then makes the lookup URL invalid,
+          # curl -sf fails, and the whole derivation quietly no-ops.)
+          APP_ENC="$(jq -rn --arg v "${APP_PATH}" '$v|@uri' 2>/dev/null || true)"
+          MR_DESCS="$(curl -sf --max-time 20 \
+            "https://${APP_HOST}/api/v4/projects/${APP_ENC}/repository/commits/${APP_COMMIT}/merge_requests" \
+            | jq -r '.[].description // empty' 2>/dev/null || true)"
+          APP_ISSUE="$(printf '%s\n' "${MR_DESCS}" | grep -Eo 'Related to #[0-9]+' \
+            | head -1 | grep -Eo '[0-9]+' || true)"
+          if [ -n "${APP_ISSUE}" ]; then
+            ISSUE_REF="${APP_PATH}#${APP_ISSUE}"
+            echo "Derived issue reference from the MR that landed ${APP_COMMIT}: ${ISSUE_REF}"
+          fi
+        fi
+
         TITLE="Promote ${ENVIRONMENT}: ${IMAGE_TAG}"
-        BODY="Automated promotion from the gitops-cd-dev pipeline (started by ci-build-publish).
+        BODY="Automated promotion from the gitops-cd-${ENVIRONMENT} pipeline.
 
         - New image: ${IMAGE}
         - App commit: ${APP_COMMIT:-n/a} in ${APP_REPO_URL:-n/a}"
+
+        # ISSUE_ACTION picks the verb: "References" only links (dev/qa -- the
+        # issue must survive until prod); "Closes" makes GitLab auto-close the
+        # issue when this MR merges into the default branch (prod -- the CVE
+        # is only "done" once the fix ships).
+        if [ -n "${ISSUE_REF}" ]; then
+          BODY="${BODY}
+
+        ${ISSUE_ACTION} ${ISSUE_REF}"
+        fi
 
         export GITLAB_HOST="${GIT_HOST}"
         export GITLAB_TOKEN="${TOKEN}"

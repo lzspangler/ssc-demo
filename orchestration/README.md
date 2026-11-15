@@ -112,7 +112,18 @@ starts it with an issue number, and the workflow drives everything from the
    fails the workflow and blocks promotion.
 5. **Promote to prod** — creates a `gitops-cd-prod` PipelineRun with the new
    image and `auto-merge: "true"`, waits for it, and reports the promotion
-   MR URL and merge status.
+   MR URL and merge status. The run also passes
+   `issue-ref: development/spring-boot-example-application#<iid>` and
+   `issue-action: "Closes"` (also gitops-cd-prod's own default): the MR's
+   description references the issue with a closing verb, so merging it into
+   the gitops repo's default branch **auto-closes the remediation issue** —
+   a CVE is only done once the fix ships to prod. (Dev and qa promotions
+   reference the issue without closing it; `gitops-bump-image` derives the
+   reference from the "Related to #N" line in the MR that landed the
+   commit — the app project is public, so the lookup needs no token.) The
+   node also posts a closing evidence note on the issue (promotion MR link
+   + test PipelineRun names), so the issue carries the whole
+   remediation→test→promotion trail even after it closes.
 
 ### Setup beyond the platform install
 
@@ -211,6 +222,13 @@ starts it with an issue number, and the workflow drives everything from the
   constant: if the engine ever leaves the trigger expression unsubstituted
   in a script body at runtime, the run uses the constant instead of
   failing.
+- **Apply the pipeline change before running this workflow version** — the
+  promote node's PipelineRun supplies `gitops-cd-prod`'s `issue-ref` param
+  (added in `pipelines/pipelines/gitops-cd-prod.yaml` and forwarded to
+  `gitops-bump-image`'s `ISSUE_REF`, which appends it to the MR
+  description). A PipelineRun that supplies a param its pipeline does not
+  declare fails validation, so re-apply those two YAMLs (or let the sync
+  pick them up) before running this workflow version.
 
 ### Assumptions worth knowing
 

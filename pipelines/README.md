@@ -34,11 +34,16 @@ its own:
    `gitops-cd-dev` to promote the fresh image tag into dev.
 7. **`gitops-cd-dev`** — *dev image promotion.* Opens and auto-merges an MR
    bumping `image.tag` in the gitops repo's dev values file. Started
-   automatically by `ci-build-publish`.
+   automatically by `ci-build-publish`. The MR *references* the remediation
+   issue (auto-derived from the MR that landed the commit) without closing
+   it.
 8. **`gitops-cd-prod`** — *prod image promotion (human-gated).* Same promotion
-   into the prod values file; started by a human, the MR stays open for review.
+   into the prod values file; started by a human, the MR stays open for
+   review. The MR's issue reference uses **Closes**, so merging it auto-closes
+   the remediation issue — a CVE is only done once the fix ships to prod.
 9. **`gitops-cd-qa`** — *qa image promotion (human-gated).* Same promotion
    into the qa values file; started by a human, the MR stays open for review.
+   References the issue without closing it, like dev.
 10. **`test-image-functional`** — *image-level functional test evidence.* Deploys
     a published container image into a **per-run ephemeral namespace**, runs the
     project's functional suite (`*FT.java`) against it, comments a test-summary
