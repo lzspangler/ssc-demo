@@ -1,0 +1,160 @@
+{{- $ns := .Values.namespace }}
+{{- $cr := .Values.crName }}
+{{- $pns := .Values.pipelineNamespace }}
+{{- $gl := .Values.gitlab }}
+{{- $rbacWave := .Values.syncWaves.instance }}
+# RBAC, moved here from orchestration/orchestrator-tekton-rbac.yaml.
+
+# --- worker RBAC: the service account <crName>-worker drives PipelineRuns
+# --- from workflow script nodes. The roles live in the pipeline namespace
+# --- where the PipelineRuns are created; the subject lives here.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-pipelinerun-driver
+  namespace: {{ $pns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $rbacWave | quote }}
+rules:
+  - apiGroups:
+      - tekton.dev
+    resources:
+      - pipelineruns
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-gitlab-token-reader
+  namespace: {{ $pns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $rbacWave | quote }}
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      # Created by the app-environments component (gitlab init job). The
+      # worker reads the GitLab API token to comment / close issues; the
+      # setup Job reads the same secret to create the orchestrator
+      # credential below.
+      - scm-auth-secret
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-pipelinerun-driver
+  namespace: {{ $pns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $rbacWave | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-pipelinerun-driver
+subjects:
+  - kind: ServiceAccount
+    name: {{ $cr }}-worker
+    namespace: {{ $ns }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-gitlab-token-reader
+  namespace: {{ $pns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $rbacWave | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-gitlab-token-reader
+subjects:
+  # The worker (via the token Secret mounted by the setup Job's deployment
+  # patch) and the setup Job itself (creating the GitLab credential).
+  - kind: ServiceAccount
+    name: {{ $cr }}-worker
+    namespace: {{ $ns }}
+  - kind: ServiceAccount
+    name: orchestrator-setup
+    namespace: {{ $ns }}
+---
+# --- setup Job RBAC: everything the script in cm-setup-script.yaml does
+# --- over the Kubernetes API (curl, no oc -- see start-gitops-cd-dev for
+# --- the pattern). Least privilege per action:
+#   get automationorchestrators - poll the CR's status conditions
+#   get/patch deployments       - wait for <crName>-worker, patch it
+#   get/list routes             - discover the platform API host
+#   get secret (named)          - read the initial admin credentials
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-setup
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $rbacWave | quote }}
+rules:
+  - apiGroups:
+      - aap.ansible.com
+    resources:
+      - automationorchestrators
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+      - route.openshift.io
+    resources:
+      - routes
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      - {{ $cr }}-initial-admin-password
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-setup
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $rbacWave | quote }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orchestrator-setup
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator-setup
+    namespace: {{ $ns }}

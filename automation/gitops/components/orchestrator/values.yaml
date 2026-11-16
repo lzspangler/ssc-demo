@@ -1,0 +1,122 @@
+# =============================================================================
+# Red Hat Automation Orchestrator -- the platform the remediation workflows
+# run on (orchestration/ at the repo root holds the workflow definitions and
+# the design notes; everything Kubernetes lives in this chart).
+#
+# WHAT THE SETUP JOB DOES BEYOND THE INSTALL (job-setup.yaml): enables script
+# nodes on the worker (a platform setting with no CR field), mounts the
+# worker's long-lived Kubernetes token, then imports + publishes
+# remediate_next_gitlab.json and remediate_and_promote_gitlab.json through
+# the platform's REST API with this cluster's GitLab host and project id
+# rewritten in. Without those rewrites the workflows point at the reference
+# cluster's GitLab and comment on the wrong instance's issues.
+# =============================================================================
+
+# Apps subdomain, no leading dot. Set by bootstrap-infra.
+domain: ""
+
+# The operator's system namespace -- also where the CR, Postgres, the worker
+# and everything else this chart deploys live (the operator bundle's own
+# system namespace, so the Subscription must sit in it too).
+namespace: automation-orchestrator-operator-system
+
+# Name of the AutomationOrchestrator CR. Everything the operator generates
+# derives from it: the worker Deployment is <crName>-worker, the admin
+# Secret is <crName>-initial-admin-password. If you rename it, update the
+# workflow scripts' docs (orchestration/README.md names the worker SA).
+crName: automationorchestrator-demo
+
+subscription:
+  channel: stable
+  name: automation-orchestrator-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  # Automatic, unlike the hand-installed original (orchestration/README.md):
+  # a fresh-cluster install is unattended, and nothing is around to click
+  # "approve" on an InstallPlan -- with Manual the operator never installs
+  # and this Application never goes Healthy. Switch to Manual on a cluster
+  # you intend to keep demoing on: the stable channel ships continuous
+  # builds (the CSV version is a timestamp), so Automatic will upgrade the
+  # operator under a live demo.
+  installPlanApproval: Automatic
+  # Empty takes the catalog's latest stable build -- right for a fresh
+  # cluster, whose catalog may not carry an older pinned build. Pin a CSV
+  # (e.g. automation-orchestrator-operator.v2026.8.1793830765, the one
+  # verified on the reference cluster) only on a long-lived install.
+  startingCSV: ""
+
+postgres:
+  image: registry.redhat.io/rhel9/postgresql-15:latest
+  # Empty = the cluster's default storage class. The reference cluster
+  # pinned ocs-external-storagecluster-ceph-rbd explicitly so the binding
+  # survives a change of default; set that here if your cluster's default
+  # is not what you want a 5Gi RWO database volume on.
+  storageClassName: ""
+  storageSize: 5Gi
+
+# One password for both platform databases (orchestrator + temporal) -- the
+# same value goes into postgres's env, the init SQL (which CREATEs the two
+# users) and both connection secrets, so it must come from a single Helm
+# value. Set by bootstrap-infra from credentials.orchestratorDbPassword;
+# never commit a real one.
+dbPassword: ""
+
+# Namespace the Tekton pipelines (and the secrets the workflow scripts and
+# the setup Job read) live in. The RBAC below lands there, not in the
+# orchestrator namespace.
+pipelineNamespace: tssc-app-ci
+
+# GitLab coordinates for the workflow rewrite. host is derived from
+# gitlabNamespace + domain when empty (gitlab-<ns>.<domain>, the same
+# derivation bootstrap-infra uses for the app-environments Applications).
+gitlab:
+  host: ""
+  # Set by bootstrap-infra from components.gitlab.namespace.
+  namespace: gitlab
+  # Path of the application repository whose issues the workflows drive.
+  appProjectPath: development/spring-boot-example-application
+
+# Where the setup Job fetches the workflow JSONs from: the SAME repo and
+# revision Argo CD pulls this chart from (set by bootstrap-infra), so the
+# imported workflows can never drift from the branch the rest of the demo
+# was installed from. Anonymous clone -- keep the repo public, or prefetch
+# the JSONs another way on a private fork.
+gitops:
+  repoUrl: ""
+  revision: ""
+  orchestrationPath: orchestration
+
+worker:
+  # The platform ships script-node execution disabled (Developer Preview;
+  # the setting is env-only -- no CR field, no UI toggle). Every node of
+  # remediate_and_promote_gitlab after its trigger is a script node, so
+  # without this the first run dies with ScriptNodeDisabled. The setup Job
+  # patches APP_SCRIPT_NODES_ENABLED=true onto the worker Deployment --
+  # extra env entries survive the operator's reconcile (verified on the
+  # reference cluster). Set to false only if you will not run that
+  # workflow.
+  scriptNodesEnabled: true
+  # Long-lived SA-token Secret mounted at /var/run/ao-k8s in the worker
+  # (the operator mounts no token and resets manual
+  # automountServiceAccountToken changes). Created by this chart; the setup
+  # Job adds the mount.
+  k8sAccessSecretName: orchestrator-worker-k8s-access
+
+setupJob:
+  # Needs git + curl + jq (clone the repo, drive two REST APIs, rewrite
+  # JSON). The agent image bundles all three and is already pulled onto the
+  # nodes by the prewarm DaemonSet.
+  image: quay.io/sscdemo/ai-agent-maven-aider:v1.0.1
+  # The platform takes 10-15 minutes to come up after the CR applies; the
+  # job polls rather than failing fast, so keep this generous.
+  activeDeadlineSeconds: 3600
+
+syncWaves:
+  # Within this Application's sync: namespace/operator first, then Postgres
+  # (the CR's migrations fail against a postgres that is not answering),
+  # then the CR, then the setup Job last -- it patches the operator-made
+  # worker Deployment, which must exist first.
+  operator: "-3"
+  postgres: "-2"
+  instance: "-1"
+  setup: "0"

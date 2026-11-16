@@ -596,6 +596,66 @@ spec:
   {{- include "root-app.syncPolicy" . | nindent 2 }}
 {{- end }}
 
+{{- if .Values.components.orchestrator.enabled }}
+{{- $or := .Values.components.orchestrator }}
+{{- if not .Values.components.gitlab.enabled }}
+{{- fail "components.orchestrator's setup Job reads scm-auth-secret and resolves the app project id from the gitlab component's seeded GitLab; enable components.gitlab or disable components.orchestrator" }}
+{{- end }}
+# -----------------------------------------------------------------------------
+# Red Hat Automation Orchestrator. The operator + BYO Postgres + the
+# AutomationOrchestrator CR, plus the setup Job that patches the worker
+# Deployment and imports/publishes the two remediation workflows through the
+# platform's REST API with this cluster's GitLab host and project id
+# rewritten in -- see components/orchestrator/README.md.
+#
+# Wave 10 (parallel with quay/rhtas, after gitlab at 8): the setup Job needs
+# GitLab seeded. The Application's health includes the setup Job, so it stays
+# Progressing for the platform's 10-15 min boot -- that is the install
+# waiting for the workflows to be importable, not a failure.
+# -----------------------------------------------------------------------------
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .Release.Name }}-orchestrator
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "root-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ $or.syncWave | quote }}
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.argocd.project }}
+  source:
+    repoURL: {{ .Values.gitops.repoUrl }}
+    targetRevision: {{ .Values.gitops.revision }}
+    path: {{ .Values.gitops.basePath }}/components/orchestrator
+    helm:
+      valuesObject:
+        domain: {{ $domain | quote }}
+        namespace: {{ $or.namespace | quote }}
+        # Same single-value rule as keycloak's and RHTPA's Postgres: the
+        # password feeds the deployment env, the init SQL and both
+        # connection Secrets.
+        dbPassword: {{ .Values.credentials.orchestratorDbPassword | quote }}
+        pipelineNamespace: {{ .Values.pipelineNamespace | quote }}
+        gitlab:
+          # The setup Job derives the GitLab host from this + $domain, the
+          # same derivation the app-environments Applications use.
+          namespace: {{ .Values.components.gitlab.namespace | quote }}
+        gitops:
+          # The setup Job clones the SAME repo/revision this Application is
+          # sourced from, so the imported workflows cannot drift from the
+          # branch the demo was installed from.
+          repoUrl: {{ .Values.gitops.repoUrl | quote }}
+          revision: {{ .Values.gitops.revision | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $or.namespace }}
+  {{- include "root-app.syncPolicy" . | nindent 2 }}
+{{- end }}
+
 {{- if .Values.components.appEnvironments.enabled }}
 {{- $ae := .Values.components.appEnvironments }}
 {{- if not .Values.components.gitlab.enabled }}

@@ -1,0 +1,34 @@
+{{- $ns := .Values.namespace }}
+{{- $cr := .Values.crName }}
+# Long-lived Kubernetes API credentials for the workflow worker.
+#
+# The operator's worker deployment sets automountServiceAccountToken: false
+# (the worker only talks to Temporal/Postgres/Redis, never the Kubernetes
+# API) and resets any manual attempt to flip that field, so the usual
+# projected token path does not exist in the worker pods. Env injection does
+# not work either: script subprocesses receive only an ALLOWLISTED
+# environment (locale/PATH vars), so custom worker env vars never reach the
+# scripts. Workflow script nodes need the credentials to drive PipelineRuns
+# in {{ .Values.pipelineNamespace }}, so this Secret requests a token for
+# the SAME service account ({{ $cr }}-worker) another way: the cluster's
+# token controller populates the token/ca.crt keys, and the token does not
+# expire. The setup Job patches the worker deployment to mount it at
+# /var/run/ao-k8s (manually added volumes/mounts survive the operator's
+# reconcile the same way extra env entries do; the automount field does
+# not).
+#
+# What the credential can do is still scoped by the RBAC in rbac.yaml:
+# create/read PipelineRuns and get one named secret in
+# {{ .Values.pipelineNamespace }}, nothing else.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.worker.k8sAccessSecretName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/service-account.name: {{ $cr }}-worker
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.instance | quote }}
+type: kubernetes.io/service-account-token

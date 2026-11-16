@@ -21,6 +21,7 @@ re-syncing rather than installing.
 | Artifactory | `https://artifactory-artifactory.<domain>` | `admin` / §1 password |
 | RHTPA | `https://server-trusted-profile-analyzer.<domain>` | OIDC via Keycloak |
 | RHTAS | — (Fulcio/Rekor/TUF Services, no UI) | — |
+| Orchestrator | Route in `automation-orchestrator-operator-system` | `admin` / `automationorchestrator-demo-initial-admin-password` Secret |
 | Tekton | namespace `tssc-app-ci` | — |
 
 Plus: the `development/spring-boot-example-application` repository imported into
@@ -259,7 +260,7 @@ for all of it.
 
 ## 4. Write an uncommitted overrides file
 
-Five credentials have no default and must not reach git.
+Six credentials have no default and must not reach git.
 
 ```sh
 cat > /tmp/ssc-demo-values.yaml <<EOF
@@ -269,6 +270,7 @@ credentials:
   keycloakDbPassword: $(openssl rand -hex 16)
   gitlabRootPassword: $(openssl rand -hex 16)
   tpaDbPassword: $(openssl rand -hex 16)
+  orchestratorDbPassword: $(openssl rand -hex 16)
   tpaCliClientSecret: $(openssl rand -hex 16)
   quayAdminPassword: $(openssl rand -hex 16)
 EOF
@@ -318,7 +320,7 @@ the full values and filter the output (e.g. just the `spring-boot-example-*`
 Applications) before piping to `oc apply` — useful when the override file is
 gone but only Applications that carry no credentials need updating.
 
-Eleven Applications land at once; the sync waves serialise them.
+Twelve Applications land at once; the sync waves serialise them.
 
 ```
  0  pipelines            OpenShift Pipelines operator
@@ -327,11 +329,11 @@ Eleven Applications land at once; the sync waves serialise them.
  4  tekton-pipelines
  5  keycloak, tekton-triggers
  8  gitlab               (imports the app repo from GitHub — slow)
-10  quay, rhtas, rhtpa-prerequisites
+10  quay, rhtas, rhtpa-prerequisites, orchestrator
 15  rhtpa
 ```
 
-Eleven, or twelve with ODF.
+Twelve, or thirteen with ODF.
 
 A wave does not start until the previous one is Healthy, so one Application
 stuck in `Progressing` blocks everything behind it.
@@ -353,6 +355,12 @@ Expected behaviour while you wait:
 * **Quay takes ~15 minutes** and its `quay-noobaa` Job runs first, patching
   ODF's default BackingStore from 256Mi to 1Gi. Below ~400Mi the NooBaa agent
   pod is rejected and no bucket is ever provisioned.
+* **Orchestrator sits in `Progressing` for 10–15 minutes after its operator
+  installs.** The platform takes that long to boot, and the Application's
+  health includes the `orchestrator-setup` Job, which polls until the API
+  answers before importing the two workflows. If it fails, its log names the
+  phase — see `components/orchestrator/README.md` for the two REST endpoints
+  that could not be pre-verified.
 
 If many Applications are stuck at once — each `Running` with a
 `waiting for healthy state of ...` message that never resolves — suspect the
@@ -367,6 +375,7 @@ then the Job logs are where the answer is:
 oc -n gitlab        logs job/initialize-gitlab
 oc -n quay-registry logs job/quay-noobaa
 oc -n quay-registry logs job/quay-config
+oc -n automation-orchestrator-operator-system logs job/orchestrator-setup
 ```
 
 ## 7. Check what the seeding jobs wrote
@@ -501,6 +510,17 @@ oc -n $NS logs job/tekton-cluster-defaults                   # "already correct 
 # Credentials — all six must exist
 oc -n $NS get secret scm-auth-secret scm-auth-gitops-secret gitlab-webhook-secret quay-push \
                      tpa-secret ai-agent-secret maven-settings
+
+# Automation Orchestrator — the setup Job imported both workflows
+oc -n automation-orchestrator-operator-system get pods
+oc -n automation-orchestrator-operator-system get route
+oc -n automation-orchestrator-operator-system logs job/orchestrator-setup | tail
+# ...its last lines should say both workflows are "imported/updated and
+# published". Then log into the UI (Route host, admin / the
+# automationorchestrator-demo-initial-admin-password Secret) and check
+# Workflows lists "Remediate Next Gitlab" and "Remediate Test Promote
+# Gitlab". One manual step remains: pick an LLM model for the agentic node
+# of "Remediate Next Gitlab" (see components/orchestrator/README.md).
 ```
 
 Then log into GitLab at `https://gitlab-gitlab.${DOMAIN}` as `root` and confirm

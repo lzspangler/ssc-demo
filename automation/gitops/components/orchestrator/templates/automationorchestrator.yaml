@@ -1,21 +1,27 @@
+{{- $ns := .Values.namespace }}
 # The AutomationOrchestrator CR -- the piece that makes the operator actually
-# deploy the platform (app pods, Route, admin secret).
+# deploy the platform (app pods, Route, admin secret). Everything downstream
+# derives from metadata.name: the worker Deployment <crName>-worker, its
+# service account <crName>-worker (the subject of the RBAC below), and the
+# <crName>-initial-admin-password Secret the setup Job logs in with.
 #
 # Deliberately NO spec.imagePullSecrets: the operator's images come from
-# registry.redhat.io, which every node on the demo cluster can already pull
-# via the global pull secret, and a reference to a Secret that does not exist
-# would fail pod creation. (An earlier revision referenced
-# `automation-orchestrator-pull-secret`, which was never defined anywhere.)
+# registry.redhat.io, pulled via the cluster's global pull secret -- a
+# reference to a Secret that does not exist would fail pod creation.
 #
 # Deliberately NO spec.secrets section: the operator auto-generates the
 # initial admin password and the secret-encryption key when
 # initialAdminPasswordSecretRef / secretEncryptionKeySecretRef are omitted.
-# Add explicit refs here if you want reproducible values instead.
+---
 apiVersion: aap.ansible.com/v1alpha1
 kind: AutomationOrchestrator
 metadata:
-  name: automationorchestrator-demo
-  namespace: automation-orchestrator-operator-system
+  name: {{ .Values.crName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.instance | quote }}
 spec:
   otel:
     enabled: false
@@ -32,7 +38,7 @@ spec:
     backendDatabase:
       secretRef:
         name: orchestrator-postgres-backend
-      host: postgres-backend.automation-orchestrator-operator-system.svc.cluster.local
+      host: {{ printf "postgres-backend.%s.svc.cluster.local" $ns | quote }}
       sslMode: disable
     sslMode: disable
     poolTimeoutSeconds: 5
@@ -40,8 +46,8 @@ spec:
     temporalDatabase:
       secretRef:
         name: orchestrator-postgres-temporal
-      host: postgres-backend.automation-orchestrator-operator-system.svc.cluster.local
+      host: {{ printf "postgres-backend.%s.svc.cluster.local" $ns | quote }}
       sslMode: disable
-    host: postgres-backend.automation-orchestrator-operator-system.svc.cluster.local
+    host: {{ printf "postgres-backend.%s.svc.cluster.local" $ns | quote }}
   redis:
     replicas: 1
