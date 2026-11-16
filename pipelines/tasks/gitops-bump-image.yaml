@@ -139,6 +139,15 @@ spec:
           value: $(params.APP_REPO_URL)
         - name: APP_COMMIT
           value: $(params.APP_COMMIT)
+        # Mapped into the environment like every other param the script
+        # reads: the script runs under `set -u`, so a param that is declared
+        # and passed but not mapped here dies with "unbound variable" at its
+        # first read (that is exactly how
+        # gitops-cd-prod-orchestrated-926zw failed).
+        - name: ISSUE_REF
+          value: $(params.ISSUE_REF)
+        - name: ISSUE_ACTION
+          value: $(params.ISSUE_ACTION)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
