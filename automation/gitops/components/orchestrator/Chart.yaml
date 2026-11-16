@@ -1,0 +1,10 @@
+apiVersion: v2
+name: orchestrator
+description: >-
+  Red Hat Automation Orchestrator (2026.8): operator, backing Postgres, the
+  AutomationOrchestrator CR, the worker patches the demo's script-node
+  workflows need, and a setup Job that imports and publishes the two
+  workflows from orchestration/ with this cluster's GitLab host and project
+  id rewritten in.
+type: application
+version: 0.1.0

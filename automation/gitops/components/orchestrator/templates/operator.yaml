@@ -1,0 +1,45 @@
+{{- $ns := .Values.namespace }}
+# The operator bundle's system namespace -- the same namespace everything
+# else in this chart deploys into, so the Subscription lives here too.
+# Created explicitly (not left to Argo's CreateNamespace) to carry the
+# part-of label, same as the original hand-install manifest.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+    app.kubernetes.io/part-of: automation-orchestrator
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.operator | quote }}
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: {{ $ns }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.operator | quote }}
+spec: {} # AllNamespaces: the AutomationOrchestrator CR may live in any namespace
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ .Values.subscription.name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.operator | quote }}
+spec:
+  channel: {{ .Values.subscription.channel }}
+  installPlanApproval: {{ .Values.subscription.installPlanApproval }}
+  name: {{ .Values.subscription.name }}
+  source: {{ .Values.subscription.source }}
+  sourceNamespace: {{ .Values.subscription.sourceNamespace }}
+  {{- with .Values.subscription.startingCSV }}
+  startingCSV: {{ . }}
+  {{- end }}

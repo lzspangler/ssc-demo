@@ -1,0 +1,80 @@
+{{- $ns := .Values.namespace }}
+{{- $cr := .Values.crName }}
+# The one-shot platform setup Job. Runs AFTER the CR (sync wave 0 vs -1) and
+# does what Argo alone cannot: patch the operator-owned worker Deployment
+# and drive the platform's REST API (import + publish the two workflow JSONs
+# with this cluster's GitLab host/project id rewritten in).
+#
+# Replace=true,Force=true (same as the gitlab component's seeding Job): the
+# pod template is immutable, so any change to this Job must replace it, and
+# Force covers server-generated fields. Argo re-creates the Job on every
+# sync that sees it changed -- the script is idempotent, so retries (and the
+# backoffLimit below) are safe.
+#
+# The Job's own service account token IS automounted (default): the script
+# talks to the Kubernetes API with it (rbac.yaml scopes it tightly).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orchestrator-setup
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.setup | quote }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orchestrator-setup
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.setup | quote }}
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: {{ .Values.setupJob.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "orchestrator.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: orchestrator-setup
+      restartPolicy: Never
+      containers:
+        - name: setup
+          image: {{ .Values.setupJob.image }}
+          command: ["/bin/bash", "/opt/setup/setup.sh"]
+          env:
+            - name: NAMESPACE
+              value: {{ $ns | quote }}
+            - name: CR_NAME
+              value: {{ $cr | quote }}
+            - name: PIPELINE_NAMESPACE
+              value: {{ .Values.pipelineNamespace | quote }}
+            - name: GITLAB_HOST
+              value: {{ include "orchestrator.gitlabHost" . | quote }}
+            - name: APP_PROJECT_PATH
+              value: {{ .Values.gitlab.appProjectPath | quote }}
+            - name: REPO_URL
+              value: {{ .Values.gitops.repoUrl | required "gitops.repoUrl must be set (bootstrap-infra passes the Argo source repo)" | quote }}
+            - name: REVISION
+              value: {{ .Values.gitops.revision | required "gitops.revision must be set (bootstrap-infra passes the Argo source revision)" | quote }}
+            - name: ORCHESTRATION_PATH
+              value: {{ .Values.gitops.orchestrationPath | quote }}
+            - name: WORKER_K8S_SECRET
+              value: {{ .Values.worker.k8sAccessSecretName | quote }}
+            - name: SCRIPT_NODES_ENABLED
+              value: {{ .Values.worker.scriptNodesEnabled | quote }}
+          volumeMounts:
+            - name: setup-script
+              mountPath: /opt/setup
+              readOnly: true
+      volumes:
+        - name: setup-script
+          configMap:
+            name: orchestrator-setup-script
+            defaultMode: 0755

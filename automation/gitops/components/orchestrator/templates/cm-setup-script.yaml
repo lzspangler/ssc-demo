@@ -1,0 +1,409 @@
+{{- $ns := .Values.namespace }}
+{{- $cr := .Values.crName }}
+# The one-shot setup script the Job below runs. It is bash + curl + jq only
+# (no oc) -- the same in-cluster Kubernetes API pattern as the
+# start-gitops-cd-dev task -- so it runs in any image carrying those tools.
+#
+# Phases (all idempotent, so an Argo-triggered Job retry is safe):
+#   1. wait for the operator to roll out the worker deployment
+#   2. patch the worker deployment (env + k8s-access secret mount)
+#   3. discover the platform API route by probing /api/v1/auth/providers
+#   4. log in with the generated initial admin credentials
+#   5. resolve the GitLab project id for the app repo (anonymous API)
+#   6. clone the gitops repo, rewrite cluster-specific values in the two
+#      workflow JSONs, create a GitLab credential (best-effort) and
+#      import-or-update + publish each workflow
+#
+# The script never logs secret VALUES (admin password, bearer tokens, the
+# GitLab token); on failure it logs key names and HTTP codes only.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-setup-script
+  namespace: {{ $ns }}
+  labels:
+    {{- include "orchestrator.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: {{ .Values.syncWaves.setup | quote }}
+data:
+  setup.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # ---- inputs (env, set by the Job) -------------------------------------
+    : "${NAMESPACE:?}"
+    : "${CR_NAME:?}"
+    : "${PIPELINE_NAMESPACE:?}"
+    : "${GITLAB_HOST:?}"
+    : "${APP_PROJECT_PATH:?}"
+    : "${REPO_URL:?}"
+    : "${REVISION:?}"
+    : "${ORCHESTRATION_PATH:?}"
+    : "${WORKER_K8S_SECRET:?}"
+    SCRIPT_NODES_ENABLED="${SCRIPT_NODES_ENABLED:-true}"
+    WORKFLOWS="${WORKFLOWS:-remediate_and_promote_gitlab.json remediate_next_gitlab.json}"
+
+    # ---- Kubernetes API access (the Job's own service account) ------------
+    K8S="https://kubernetes.default.svc"
+    SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+    K8S_TOKEN="$(cat "${SA_DIR}/token")"
+    CA_CERT="${SA_DIR}/ca.crt"
+    K8S_OUT="/tmp/k8s-out.json"
+
+    log()  { printf '[setup %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+    die()  { log "FATAL: $*"; exit 1; }
+
+    k8s_get() {  # k8s_get <path> -> body on stdout
+      curl -sS --max-time 30 --cacert "${CA_CERT}" \
+        -H "Authorization: Bearer ${K8S_TOKEN}" "${K8S}${1}"
+    }
+    k8s_code() {  # k8s_code <path> -> HTTP code, body left in $K8S_OUT
+      local code
+      code="$(curl -sS --max-time 30 -o "${K8S_OUT}" -w '%{http_code}' \
+        --cacert "${CA_CERT}" \
+        -H "Authorization: Bearer ${K8S_TOKEN}" "${K8S}${1}")" || code="000"
+      printf '%s' "${code}"
+    }
+    k8s_patch() {  # k8s_patch <path> <strategic-merge-json> -> HTTP code, body in $K8S_OUT
+      local code
+      code="$(curl -sS --max-time 30 -o "${K8S_OUT}" -w '%{http_code}' \
+        --cacert "${CA_CERT}" \
+        -H "Authorization: Bearer ${K8S_TOKEN}" \
+        -H 'Content-Type: application/strategic-merge-patch+json' \
+        -X PATCH --data "${2}" "${K8S}${1}")" || code="000"
+      printf '%s' "${code}"
+    }
+    b64() { base64 -d; }
+
+    # ---- phase 1: wait for the worker deployment --------------------------
+    DEP="/apis/apps/v1/namespaces/${NAMESPACE}/deployments/${CR_NAME}-worker"
+    log "Waiting for deployment ${CR_NAME}-worker in ${NAMESPACE} (operator first install can take a while) ..."
+    WORKER_JSON=""
+    for i in $(seq 1 80); do
+      if [ "$(k8s_code "${DEP}")" = "200" ]; then
+        if [ "$(jq -r '.status.availableReplicas // 0' "${K8S_OUT}")" -ge 1 ]; then
+          WORKER_JSON="$(cat "${K8S_OUT}")"
+          break
+        fi
+      fi
+      sleep 15
+    done
+    [ -n "${WORKER_JSON}" ] || die "deployment ${CR_NAME}-worker never became available (check the operator pod and CSV in ${NAMESPACE})"
+
+    # ---- phase 2: patch the worker deployment (idempotent) ----------------
+    # The operator sets automountServiceAccountToken: false and resets manual
+    # changes to that field, but extra env / volumes / volumeMounts added by
+    # name survive its reconcile (strategic merge). Script nodes need:
+    #   APP_SCRIPT_NODES_ENABLED=true              (enable script nodes)
+    #   /var/run/ao-k8s/{token,ca.crt}             (Kubernetes API access --
+    #                                               the orchestrator-worker-
+    #                                               k8s-access Secret, a
+    #                                               long-lived token for the
+    #                                               SAME service account)
+    CONTAINER="$(printf '%s' "${WORKER_JSON}" | jq -r '.spec.template.spec.containers[0].name')"
+    if printf '%s' "${WORKER_JSON}" | jq -e --arg c "${CONTAINER}" \
+        '.spec.template.spec.containers[] | select(.name == $c)
+         | (.env // []) | map(.name) | index("APP_SCRIPT_NODES_ENABLED")' >/dev/null; then
+      log "Worker deployment already patched (APP_SCRIPT_NODES_ENABLED present); skipping"
+    else
+      log "Patching worker deployment (container: ${CONTAINER}, secret: ${WORKER_K8S_SECRET})"
+      if [ "${SCRIPT_NODES_ENABLED}" = "true" ]; then
+        PATCH_BODY="$(jq -n --arg c "${CONTAINER}" --arg s "${WORKER_K8S_SECRET}" '{
+          spec: {template: {spec: {
+            containers: [{
+              name: $c,
+              env: [{name: "APP_SCRIPT_NODES_ENABLED", value: "true"}],
+              volumeMounts: [{name: "ao-k8s-access", mountPath: "/var/run/ao-k8s", readOnly: true}]
+            }],
+            volumes: [{name: "ao-k8s-access", secret: {secretName: $s}}]
+          }}}
+        }')"
+      else
+        # scriptNodesEnabled=false: mount the credentials anyway (script
+        # nodes that DO run still read them), but leave script nodes off.
+        PATCH_BODY="$(jq -n --arg c "${CONTAINER}" --arg s "${WORKER_K8S_SECRET}" '{
+          spec: {template: {spec: {
+            containers: [{
+              name: $c,
+              volumeMounts: [{name: "ao-k8s-access", mountPath: "/var/run/ao-k8s", readOnly: true}]
+            }],
+            volumes: [{name: "ao-k8s-access", secret: {secretName: $s}}]
+          }}}
+        }')"
+      fi
+      PATCH_CODE="$(k8s_patch "${DEP}" "${PATCH_BODY}")"
+      if [ "${PATCH_CODE}" = "200" ]; then
+        log "Worker patch applied; the rollout it triggers needs no waiting -- workflow import does not depend on it"
+      else
+        die "patching ${CR_NAME}-worker returned HTTP ${PATCH_CODE}: $(head -c 300 "${K8S_OUT}")"
+      fi
+    fi
+
+    # ---- phase 3: discover the platform API route -------------------------
+    # The CR's ingress Route name is operator-owned and not documented as
+    # stable, so probe every Route in the namespace for the platform's
+    # unauthenticated health endpoint.
+    log "Discovering the Automation Orchestrator API route ..."
+    API_HOST=""
+    for i in $(seq 1 40); do
+      ROUTES="$(k8s_get "/apis/route.openshift.io/v1/namespaces/${NAMESPACE}/routes" \
+        | jq -r '.items[].spec.host // empty' 2>/dev/null || true)"
+      for h in ${ROUTES}; do
+        if curl -sf --max-time 10 "https://${h}/api/v1/auth/providers" >/dev/null 2>&1; then
+          API_HOST="${h}"
+          break
+        fi
+      done
+      if [ -n "${API_HOST}" ]; then break; fi
+      sleep 15
+    done
+    [ -n "${API_HOST}" ] || die "no Route in ${NAMESPACE} answers /api/v1/auth/providers"
+    API="https://${API_HOST}/api/v1"
+    log "Platform API: ${API}"
+
+    # ---- phase 4: log in with the initial admin credentials ----------------
+    SECRET_PATH="/api/v1/namespaces/${NAMESPACE}/secrets/${CR_NAME}-initial-admin-password"
+    for i in $(seq 1 30); do
+      [ "$(k8s_code "${SECRET_PATH}")" = "200" ] && break
+      sleep 10
+    done
+    [ "$(k8s_code "${SECRET_PATH}")" = "200" ] || die "admin secret ${CR_NAME}-initial-admin-password not found"
+    ADMIN_USER="$(jq -r '.data.username // .data.user // empty' "${K8S_OUT}" | b64)"
+    ADMIN_PASS="$(jq -r '.data.password // empty' "${K8S_OUT}" | b64)"
+    if [ -z "${ADMIN_USER}" ] || [ -z "${ADMIN_PASS}" ]; then
+      die "admin secret is missing username/password (keys present: $(jq -r '.data | keys | join(", ")' "${K8S_OUT}"))"
+    fi
+
+    # The login endpoint is not part of the saved UI bundle (the SPA's auth
+    # client is a separate chunk), so try the two most likely shapes and let
+    # either a bearer token or the session cookie authenticate: every call
+    # below sends the cookie jar AND the Authorization header when a token
+    # was seen. GET /auth/me (a confirmed endpoint) is the success check.
+    JAR="/tmp/ao-cookies.txt"
+    AO_TOKEN=""
+    try_login() {
+      rm -f "${JAR}"
+      local resp=""
+      jq -n --arg u "${ADMIN_USER}" --arg p "${ADMIN_PASS}" '{username: $u, password: $p}' > /tmp/ao-login.json
+      chmod 600 /tmp/ao-login.json
+      resp="$(curl -sS --max-time 20 -c "${JAR}" -H 'Content-Type: application/json' \
+        --data @/tmp/ao-login.json "${API}/auth/login" 2>/dev/null || true)"
+      rm -f /tmp/ao-login.json
+      AO_TOKEN="$(printf '%s' "${resp}" | jq -r '.token // .access_token // .data.token // empty' 2>/dev/null || true)"
+      if [ -z "${AO_TOKEN}" ]; then
+        resp="$(curl -sS --max-time 20 -c "${JAR}" \
+          --data-urlencode 'grant_type=password' \
+          --data-urlencode "username=${ADMIN_USER}" \
+          --data-urlencode "password=${ADMIN_PASS}" \
+          "${API}/auth/token" 2>/dev/null || true)"
+        AO_TOKEN="$(printf '%s' "${resp}" | jq -r '.access_token // .token // empty' 2>/dev/null || true)"
+      fi
+      if [ -n "${AO_TOKEN}" ]; then
+        curl -sf --max-time 20 -b "${JAR}" -H "Authorization: Bearer ${AO_TOKEN}" \
+          "${API}/auth/me" >/dev/null 2>&1
+      else
+        curl -sf --max-time 20 -b "${JAR}" "${API}/auth/me" >/dev/null 2>&1
+      fi
+    }
+    log "Logging in to the platform (retrying while it finishes booting) ..."
+    LOGGED_IN=0
+    for i in $(seq 1 30); do
+      if try_login; then LOGGED_IN=1; break; fi
+      sleep 20
+    done
+    [ "${LOGGED_IN}" = "1" ] || die "could not log in to ${API} (login endpoint and/or response shape needs verification -- see components/orchestrator/README.md)"
+    log "Logged in (${API_HOST})"
+
+    # Platform API helpers. AO_CODE/AO_BODY carry the last response.
+    AO_CODE=""; AO_BODY=""
+    ao_call() {  # ao_call <method> <path> [body-file]
+      local out code
+      local args=( -sS --max-time 60 -w '\n%{http_code}' -b "${JAR}" -X "${1}" )
+      if [ -n "${AO_TOKEN}" ]; then
+        args+=( -H "Authorization: Bearer ${AO_TOKEN}" )
+      fi
+      if [ "${3:-}" != "" ]; then
+        args+=( -H 'Content-Type: application/json' --data @"${3}" )
+      fi
+      out="$(curl "${args[@]}" "${API}${2}" 2>/dev/null)" || true
+      code="${out##*$'\n'}"
+      AO_BODY="${out%$'\n'*}"
+      AO_CODE="${code}"
+    }
+    ao_get() { ao_call GET "$1"; }
+
+    # ---- phase 5: resolve the GitLab project id ---------------------------
+    # The workflow JSONs are generated against the reference cluster where
+    # the app project has id 1; on a fresh GitLab the id can differ, so look
+    # it up through GitLab's anonymous API (both demo projects are public).
+    log "Resolving GitLab project id for ${APP_PROJECT_PATH} ..."
+    PROJ_ENC="$(jq -rn --arg v "${APP_PROJECT_PATH}" '$v|@uri')"
+    PROJECT_ID=""
+    for i in $(seq 1 40); do
+      PROJECT_ID="$(curl -sf --max-time 20 \
+        "https://${GITLAB_HOST}/api/v4/projects/${PROJ_ENC}" \
+        | jq -r '.id // empty' 2>/dev/null || true)"
+      if [ -n "${PROJECT_ID}" ]; then break; fi
+      sleep 15
+    done
+    if [ -z "${PROJECT_ID}" ]; then
+      log "WARNING: could not resolve ${APP_PROJECT_PATH} on ${GITLAB_HOST}; assuming project id 1"
+      PROJECT_ID="1"
+    fi
+    log "GitLab project id: ${PROJECT_ID}"
+
+    # ---- phase 6: workflows ------------------------------------------------
+    log "Cloning ${REPO_URL} (@${REVISION}) for the workflow definitions"
+    rm -rf /tmp/repo
+    git clone --quiet --depth 1 --branch "${REVISION}" "${REPO_URL}" /tmp/repo \
+      || die "git clone failed (the repo must be anonymously readable, like the Argo source)"
+    WF_DIR="/tmp/repo/${ORCHESTRATION_PATH}"
+    [ -d "${WF_DIR}" ] || die "${ORCHESTRATION_PATH}/ not found in the cloned repo"
+
+    # Platform project id for the import call. Best-effort: /projects was
+    # not in the saved UI bundle, and on a fresh install a default project
+    # may or may not exist yet. Prefer the id of an already-imported
+    # workflow (stable across re-runs), then the first /projects entry.
+    PLATFORM_PROJECT=""
+    ao_get "/projects"
+    if [ "${AO_CODE}" = "200" ]; then
+      PLATFORM_PROJECT="$(printf '%s' "${AO_BODY}" | jq -r '((if type == "array" then . else (.resources // []) end) | .[0].id // empty)' 2>/dev/null || true)"
+    fi
+
+    # Best-effort: create a GitLab credential so the http_request nodes in
+    # remediate_next_gitlab can authenticate. The POST /credentials body is
+    # NOT verified against a live instance (the credential-create modal is
+    # an unsaved UI chunk) -- any failure here only warns, and the imported
+    # workflow keeps its old credential_id (fix manually in the UI).
+    NEW_CRED_ID=""
+    if [ "$(k8s_code "/api/v1/namespaces/${PIPELINE_NAMESPACE}/secrets/scm-auth-secret")" = "200" ]; then
+      GL_TOKEN="$(jq -r '.data.token // empty' "${K8S_OUT}" | b64)"
+      if [ -n "${GL_TOKEN}" ]; then
+        CRED_TYPE="gitlab"
+        ao_get "/credential_types"
+        if [ "${AO_CODE}" = "200" ]; then
+          FOUND="$(printf '%s' "${AO_BODY}" | jq -r '(if type == "array" then . else (.resources // []) end)[] | select(.name | test("gitlab"; "i")) | .name' 2>/dev/null | head -1 || true)"
+          if [ -n "${FOUND}" ]; then CRED_TYPE="${FOUND}"; fi
+        fi
+        jq -n --arg t "${CRED_TYPE}" --arg h "https://${GITLAB_HOST}" --arg tok "${GL_TOKEN}" \
+           --arg pid "${PLATFORM_PROJECT}" \
+           '{name: "gitlab-demo",
+             description: "GitLab API token from scm-auth-secret (created by the ssc-demo setup job)",
+             credential_type: $t,
+             inputs: {host: $h, token: $tok}}
+            | (if $pid != "" then . + {project_id: ($pid | tonumber? // $pid)} else . end)' > /tmp/ao-cred.json
+        chmod 600 /tmp/ao-cred.json
+        ao_call POST "/credentials" /tmp/ao-cred.json
+        rm -f /tmp/ao-cred.json
+        if [ "${AO_CODE}" = "201" ] || [ "${AO_CODE}" = "200" ]; then
+          NEW_CRED_ID="$(printf '%s' "${AO_BODY}" | jq -r '.id // empty' 2>/dev/null || true)"
+          log "Created platform credential for GitLab (id: ${NEW_CRED_ID})"
+        else
+          log "WARNING: credential creation returned HTTP ${AO_CODE}; continuing without it (http_request nodes keep their old credential_id -- see components/orchestrator/README.md)"
+        fi
+      else
+        log "WARNING: scm-auth-secret has no 'token' key; skipping platform credential creation"
+      fi
+    else
+      log "WARNING: scm-auth-secret not readable in ${PIPELINE_NAMESPACE} (HTTP ${AO_CODE}); skipping platform credential creation"
+    fi
+
+    for WF in ${WORKFLOWS}; do
+      SRC="${WF_DIR}/${WF}"
+      [ -f "${SRC}" ] || die "${WF} not found in ${WF_DIR}"
+      NAME="$(jq -r '.name' "${SRC}")"
+      DESC="$(jq -r '.description // ""' "${SRC}")"
+      log "Processing ${WF} (workflow \"${NAME}\")"
+
+      # Rewrite cluster-specific values. jq parses the JSON, so the escaped
+      # quotes in the file are normal quotes in the parsed string values:
+      #   gitlab-gitlab.apps.<old-domain>  -> the new cluster's GitLab host
+      #   projects/1/ and PROJECT_ID = "1" -> the resolved project id
+      #   http_request credential_id       -> the new credential (if created)
+      jq --arg host "${GITLAB_HOST}" --arg pid "${PROJECT_ID}" --arg cid "${NEW_CRED_ID}" '
+        def rw: walk(if type == "string" then
+            gsub("gitlab-gitlab\\.apps\\.[a-zA-Z0-9.-]+"; $host)
+          | gsub("projects/1/"; "projects/" + $pid + "/")
+          | gsub("PROJECT_ID = \"1\""; "PROJECT_ID = \"" + $pid + "\"")
+          else . end);
+        (if $cid != "" then
+           .nodes |= map(if .type == "http_request" and (.parameters // {}).credential_id
+                         then .parameters.credential_id = $cid else . end)
+         else . end)
+        | rw' "${SRC}" > /tmp/ao-wf.json
+
+      # Import or update: match by name, PATCH in place, otherwise POST as
+      # an import. Bodies follow the shapes the workflow builder UI sends
+      # (confirmed against its bundle):
+      #   POST  /workflows            {name, workflow_definition, project_id, is_import: true}
+      #   PATCH /workflows/{id}       {name, description, workflow_definition, expected_version}
+      #   POST  /workflows/{id}/versions/{v}/publish   {name, change_description, expected_version}
+      ao_get "/workflows"
+      [ "${AO_CODE}" = "200" ] || die "GET /workflows failed (HTTP ${AO_CODE})"
+      EXISTING="$(printf '%s' "${AO_BODY}" | jq -c --arg n "${NAME}" \
+        'first(((if type == "array" then . else (.resources // []) end))[]
+          | select(.name == $n)) // empty' 2>/dev/null || true)"
+
+      WF_ID=""; EXPECTED_VER=""
+      if [ -n "${EXISTING}" ]; then
+        WF_ID="$(printf '%s' "${EXISTING}" | jq -r '.id')"
+        EXPECTED_VER="$(printf '%s' "${EXISTING}" | jq -r '.current_version // .version.version // empty')"
+        if [ -z "${PLATFORM_PROJECT}" ]; then
+          PLATFORM_PROJECT="$(printf '%s' "${EXISTING}" | jq -r '.project_id // empty')"
+        fi
+        log "Workflow exists (id ${WF_ID}); updating in place"
+        if [ -n "${EXPECTED_VER}" ]; then
+          jq -n --arg n "${NAME}" --arg d "${DESC}" --slurpfile def /tmp/ao-wf.json \
+             --argjson ev "${EXPECTED_VER}" \
+             '{name: $n, description: $d, workflow_definition: $def[0], expected_version: $ev}' > /tmp/ao-body.json
+        else
+          jq -n --arg n "${NAME}" --arg d "${DESC}" --slurpfile def /tmp/ao-wf.json \
+             '{name: $n, description: $d, workflow_definition: $def[0]}' > /tmp/ao-body.json
+        fi
+        ao_call PATCH "/workflows/${WF_ID}" /tmp/ao-body.json
+      else
+        log "Workflow does not exist; importing"
+        jq -n --arg n "${NAME}" --arg d "${DESC}" --slurpfile def /tmp/ao-wf.json \
+           --arg pid "${PLATFORM_PROJECT}" \
+           '{name: $n, description: $d, workflow_definition: $def[0],
+             is_import: true}
+            | (if $pid != "" then . + {project_id: ($pid | tonumber? // $pid)} else . end)' > /tmp/ao-body.json
+        ao_call POST "/workflows" /tmp/ao-body.json
+        if [ "${AO_CODE}" = "200" ] || [ "${AO_CODE}" = "201" ]; then
+          WF_ID="$(printf '%s' "${AO_BODY}" | jq -r '.id // empty' 2>/dev/null || true)"
+        fi
+      fi
+      rm -f /tmp/ao-body.json
+
+      if [ "${AO_CODE}" != "200" ] && [ "${AO_CODE}" != "201" ]; then
+        die "workflow \"${NAME}\" import/update failed (HTTP ${AO_CODE}): $(printf '%s' "${AO_BODY}" | head -c 300)"
+      fi
+      [ -n "${WF_ID}" ] || die "workflow \"${NAME}\" response carried no id: $(printf '%s' "${AO_BODY}" | head -c 300)"
+
+      # Publish the current version so the workflow is runnable. The version
+      # number comes from the platform (current_version, or version.version).
+      ao_get "/workflows"
+      VER="$(printf '%s' "${AO_BODY}" | jq -r --arg i "${WF_ID}" \
+        '((if type == "array" then . else (.resources // []) end))[] | select((.id | tostring) == $i) | (.current_version // .version.version // 1)' 2>/dev/null || true)"
+      [ -n "${VER}" ] || VER="1"
+      jq -n --argjson ev "${VER}" \
+         '{name: null, change_description: "Imported/updated by the ssc-demo setup job", expected_version: $ev}' > /tmp/ao-body.json
+      ao_call POST "/workflows/${WF_ID}/versions/${VER}/publish" /tmp/ao-body.json
+      rm -f /tmp/ao-body.json
+      if [ "${AO_CODE}" != "200" ] && [ "${AO_CODE}" != "201" ]; then
+        # Retry once without expected_version (it is optional in the UI's
+        # publish call and may mismatch after the PATCH bumped the version).
+        jq -n '{name: null, change_description: "Imported/updated by the ssc-demo setup job"}' > /tmp/ao-body.json
+        ao_call POST "/workflows/${WF_ID}/versions/${VER}/publish" /tmp/ao-body.json
+        rm -f /tmp/ao-body.json
+      fi
+      if [ "${AO_CODE}" = "200" ] || [ "${AO_CODE}" = "201" ]; then
+        log "Workflow \"${NAME}\" imported/updated and published (version ${VER})"
+      else
+        die "publishing workflow \"${NAME}\" version ${VER} failed (HTTP ${AO_CODE}): $(printf '%s' "${AO_BODY}" | head -c 300) -- the workflow is imported; publish it in the UI"
+      fi
+    done
+
+    log "Done: worker patched, workflows imported and published"
+    log "Remaining manual step: assign an LLM model to the agentic node of \"Remediate Next Gitlab\" (see components/orchestrator/README.md)"
