@@ -190,20 +190,6 @@ components:
       pipelines: "4"
       triggers: "5"
 
-    # pipelines/pipelines/ holds THREE files that all declare
-    # `metadata.name: maven-build-ci`, and Argo CD refuses to sync a directory
-    # containing two resources with the same identity ("appeared 2 times among
-    # application resources"). Exactly one is installed; the other two are
-    # excluded by filename.
-    #
-    #   maven-build-ci-pipeline-ai.yaml      build + sign + SBOM + AI scan chain
-    #   maven-build-ci-pipeline.yaml         build + sign + SBOM + ACS gates
-    #   maven-build-ci-pipeline-no-acs.yaml  as above, ACS gates removed
-    #
-    # The AI variant is the default because it is what the reference cluster
-    # has applied and what the demo narrative exercises.
-    mavenBuildPipeline: maven-build-ci-pipeline-ai.yaml
-
     # pipelines/config/rhtpa-enable-importers-job.yaml flips RHTPA's
     # `redhat-csaf` importer on through the REST API. The RHTPA Application
     # below already declares that importer with `disabled: false`, so on a

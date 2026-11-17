@@ -30,27 +30,21 @@ directory:
 
 | Application | Source | Wave |
 |---|---|---|
-| `ssc-tekton-tasks` | `pipelines/tasks/` — 23 Tasks | 3 |
+| `ssc-tekton-tasks` | `pipelines/tasks/` — 33 Tasks | 3 |
 | `ssc-tekton-config` | `pipelines/config/ai-agent-config.yaml` | 3 |
-| `ssc-tekton-pipelines` | `pipelines/pipelines/` — the 4 agentic pipelines + one `maven-build-ci` | 4 |
-| `ssc-tekton-triggers` | `pipelines/triggers/` — EventListener, bindings, templates, RBAC, Route | 5 |
+| `ssc-tekton-pipelines` | `pipelines/pipelines/` — 11 Pipelines (see below) | 4 |
+| `ssc-tekton-triggers` | `pipelines/triggers/` — both EventListeners, bindings, templates, RBAC, Routes | 5 |
 
 Together they replace steps 3 and 5 of `pipelines/README.md`'s *One-time
 setup* and step 4 of its trigger setup.
 
-**Pick your `maven-build-ci`.** `pipelines/pipelines/` contains three files
-that all declare `metadata.name: maven-build-ci`, and Argo CD fails an
-Application whose directory yields two resources with the same identity. Set
-`components.tekton.mavenBuildPipeline` to exactly one:
-
-| Value | Pipeline |
-|---|---|
-| `maven-build-ci-pipeline-ai.yaml` (default) | build + sign + SBOM + the AI/RHTPA scan chain |
-| `maven-build-ci-pipeline.yaml` | build + sign + SBOM + ACS gates |
-| `maven-build-ci-pipeline-no-acs.yaml` | as above with the ACS gates removed |
-
-All three reference only Tasks that `ssc-tekton-tasks` installs, so switching
-is a values change and a re-sync.
+`pipelines/pipelines/` holds eleven Pipelines, all installed as-is: the five
+agentic ones (`agentic-cve-analysis`, `agentic-cve-remediation`,
+`agentic-test-generation-{unit,functional,integration}`), the CD chain
+(`gitops-cd-{dev,qa,prod}`), the image-test pair
+(`test-image-{functional,integration}`), and `ci-build-publish` — the CI
+pipeline the push webhook runs on every merge to `main`. They reference only
+Tasks that `ssc-tekton-tasks` installs.
 
 **`pipelineNamespace` is effectively fixed at `tssc-app-ci`.**
 `pipelines/triggers/agentic-issue-triggers.yaml` hardcodes that namespace as
@@ -137,14 +131,6 @@ chmod 600 /tmp/ssc-demo-values.yaml
 Keep this file. `tpaCliClientSecret` in particular is needed again in step 5,
 `gitlabRootPassword` is how you log into GitLab as root, and
 `quayAdminPassword` is how you log into Quay as `quayadmin`.
-
-If you want a `maven-build-ci` other than the AI one, add it here too:
-
-```yaml
-components:
-  tekton:
-    mavenBuildPipeline: maven-build-ci-pipeline.yaml
-```
 
 ### 3. Create the Applications
 
@@ -349,7 +335,7 @@ Artifactory note in `pipelines/README.md`.
   cluster runs on the next reconcile, with no Helm values in between. The flip
   side is that `selfHeal` will revert a `oc edit task ...`, and anything that
   needs to vary per cluster (the hardcoded trigger namespace, the stale RHTAS
-  defaults on `maven-build-ci-pipeline-ai.yaml`) has to be fixed in the file.
+  defaults on the pipelines) has to be fixed in the file.
 * **`components/lightwell-repo`** is the older Nexus-based artifact repository.
   It is not wired into `bootstrap-infra` — Artifactory replaced it — and is
   left in the tree only for reference.
