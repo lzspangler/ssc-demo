@@ -85,7 +85,7 @@ data:
   AI_AGENT: "aider"
   AI_MODEL: "gpt-oss-120b"
   # The model's /v1 endpoint (AI_PROVIDER=openai or gateway).
-  AI_BASE_URL: "https://maas-rhdp.apps.maas.redhatworkshops.io/v1"
+  AI_BASE_URL: "https://maas-rhdp.apps.maas.redhatworkshops.io/v1/chat/completions"
   # Effort / verbosity knob where supported (low|medium|high|xhigh|max). For
   # gpt-oss this maps to reasoning effort; ignored by models that don't take it.
   AI_EFFORT: "high"
