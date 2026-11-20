@@ -159,7 +159,15 @@ spec:
             # OpenAI-compatible coding agent (gpt-oss, Granite, any vLLM/RHOAI/
             # Ollama/watsonx endpoint). litellm reads OPENAI_API_BASE/OPENAI_API_KEY.
             [ -n "${AI_BASE_URL:-}" ] && export OPENAI_API_BASE="${AI_BASE_URL}"
-            export OPENAI_API_KEY="${OPENAI_API_KEY:-placeholder}"
+            # Trim the key: a trailing newline in the Secret (easy to
+            # introduce with `--from-literal=...$(base64 -d)` or a YAML block
+            # scalar) makes the Authorization header invalid HTTP -- httpx
+            # refuses the request and the SDK reports "Connection error"
+            # with ZERO network traffic, which reads exactly like a network
+            # outage. Command substitution strips it everywhere EXCEPT the
+            # envFrom path the pod uses, so every manual curl test passes
+            # while every pipeline run fails.
+            export OPENAI_API_KEY="$(printf '%s' "${OPENAI_API_KEY:-placeholder}" | tr -d '[:space:]')"
             case "${MODEL}" in */*) AIDER_MODEL="${MODEL}";; *) AIDER_MODEL="openai/${MODEL}";; esac
             # The shared MaaS gateway drops connections for minutes at a
             # time (recurring windows observed on cluster-b7zgr). litellm's
