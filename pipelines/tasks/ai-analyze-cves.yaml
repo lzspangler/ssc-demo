@@ -302,6 +302,18 @@ spec:
         def _http_client(sdk_module):
             verify = _tls_verify()
             if verify is True:
+                # The SDK's default httpx client (trust_env=True) honours
+                # SSL_CERT_DIR, which Tekton injects as
+                # /tekton-custom-certs:/etc/ssl/certs:... -- and that env
+                # breaks the client's TLS setup in this image with an
+                # APIConnectionError "Connection error" (verified: popping
+                # the two vars fixes it; an explicit httpx.Client with
+                # verify=False or verify=<ca path> is immune). This task
+                # manages trust itself (AI_CA_BUNDLE / AI_TLS_INSECURE), so
+                # the injected vars are dropped before the default client
+                # can be built.
+                for var in ("SSL_CERT_DIR", "SSL_CERT_FILE"):
+                    os.environ.pop(var, None)
                 return None
             import importlib
             bc = importlib.import_module(sdk_module + "._base_client")
@@ -314,6 +326,18 @@ spec:
                     except ImportError:
                         continue
             return hx.Client(verify=verify)
+
+        # ---- Normalize the provider keys ----
+        # A trailing newline in a Secret value (easy to introduce with
+        # `--from-literal=...$(base64 -d)` or a YAML block scalar) makes the
+        # Authorization header invalid HTTP: httpx refuses the request and
+        # the SDK reports APIConnectionError "Connection error" with ZERO
+        # network traffic -- indistinguishable from an outage. Applies to
+        # every provider: the OpenAI client takes the key explicitly, the
+        # Anthropic clients read ANTHROPIC_API_KEY from the environment.
+        for _key_var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+            if os.environ.get(_key_var):
+                os.environ[_key_var] = os.environ[_key_var].strip()
 
         # ---- Build the provider-appropriate client ----
         family = "openai" if provider == "openai" else "anthropic"
