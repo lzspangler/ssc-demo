@@ -115,10 +115,6 @@ spec:
 {{- if .Values.components.tekton.enabled }}
 {{- $tk := .Values.components.tekton }}
 {{- $ns := .Values.pipelineNamespace }}
-{{- $mavenVariants := list "maven-build-ci-pipeline.yaml" "maven-build-ci-pipeline-ai.yaml" "maven-build-ci-pipeline-no-acs.yaml" }}
-{{- if not (has $tk.mavenBuildPipeline $mavenVariants) }}
-{{- fail (printf "components.tekton.mavenBuildPipeline must be one of %v, got %q" $mavenVariants $tk.mavenBuildPipeline) }}
-{{- end }}
 # -----------------------------------------------------------------------------
 # The Tekton layer. These four Applications replace the `oc apply -f tasks/`,
 # `oc apply -f pipelines/...` and `oc apply -f triggers/...` steps in
@@ -207,10 +203,6 @@ spec:
     path: {{ .Values.gitops.tektonPath }}/pipelines
     directory:
       recurse: false
-      # Drop the maven-build-ci variants that were not selected. All three
-      # declare the same metadata.name, and syncing more than one makes the
-      # whole Application fail to render, not just that resource.
-      exclude: {{ printf "{%s}" (join "," (without $mavenVariants $tk.mavenBuildPipeline)) | quote }}
   destination:
     server: https://kubernetes.default.svc
     namespace: {{ $ns }}

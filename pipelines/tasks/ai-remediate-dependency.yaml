@@ -161,14 +161,32 @@ spec:
             [ -n "${AI_BASE_URL:-}" ] && export OPENAI_API_BASE="${AI_BASE_URL}"
             export OPENAI_API_KEY="${OPENAI_API_KEY:-placeholder}"
             case "${MODEL}" in */*) AIDER_MODEL="${MODEL}";; *) AIDER_MODEL="openai/${MODEL}";; esac
-            aider \
-              --model "${AIDER_MODEL}" \
-              --yes-always --no-auto-commits --no-check-update --no-gitignore \
-              --no-show-model-warnings \
-              --read "${SKILL_DIR}/SKILL.md" \
-              --read "${SKILL_DIR}/pom-patterns.md" \
-              --message "${PROMPT}" \
-              pom.xml 2>&1 | tee /tekton/home/aider-remediate.log
+            # The shared MaaS gateway drops connections for minutes at a
+            # time (recurring windows observed on cluster-b7zgr). litellm's
+            # internal retry ladder spans only ~1 minute, and aider exits 0
+            # even when every model call failed -- so retry HERE, keyed on
+            # whether a pom actually changed, never on exit codes. Five
+            # attempts with 90 s gaps outlasts every window observed.
+            AIDER_ATTEMPTS=5
+            for attempt in $(seq 1 "${AIDER_ATTEMPTS}"); do
+              aider \
+                --model "${AIDER_MODEL}" \
+                --yes-always --no-auto-commits --no-check-update --no-gitignore \
+                --no-show-model-warnings \
+                --read "${SKILL_DIR}/SKILL.md" \
+                --read "${SKILL_DIR}/pom-patterns.md" \
+                --message "${PROMPT}" \
+                pom.xml 2>&1 | tee /tekton/home/aider-remediate.log
+              if git -C "${WORKDIR}" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | grep -q .; then
+                echo "attempt ${attempt}/${AIDER_ATTEMPTS}: pom changed, agent session succeeded"
+                break
+              fi
+              if [ "${attempt}" -lt "${AIDER_ATTEMPTS}" ]; then
+                echo "attempt ${attempt}/${AIDER_ATTEMPTS} produced no pom change" \
+                     "(likely a gateway dropout window); retrying in 90 s" >&2
+                sleep 90
+              fi
+            done
             ;;
           claude-code|*)
             case "${AI_PROVIDER:-anthropic}" in
@@ -231,6 +249,19 @@ spec:
         CHANGED="$(git -C "${WORKDIR}" status --porcelain -- pom.xml '**/pom.xml' 2>/dev/null | wc -l | tr -d ' ')"
         printf '%s' "$([ "${CHANGED:-0}" -gt 0 ] && echo 1 || echo 0)" > "$(results.CHANGED.path)"
         echo "Build file changes: ${CHANGED:-0}"
+
+        # FAIL CLOSED. The agent session's transcript is in the workspace; if
+        # the backend was unreachable the whole session is litellm retries and
+        # the "run" exits 0 having changed nothing -- the pipeline then reports
+        # success while the remediation silently never happened. A remediation
+        # that changed no build file is a failure, not a no-op: the demo's
+        # whole promise is the MR that follows.
+        if [ "${CHANGED:-0}" -eq 0 ]; then
+          echo "ERROR: the remediation agent produced no build file changes." >&2
+          echo "If the log above shows litellm connection errors, the AI backend" >&2
+          echo "was unreachable for the entire session -- re-run the pipeline." >&2
+          exit 1
+        fi
   # The remediation methodology skill (SKILL.md + pom-patterns.md), mounted
   # read-only at ${HOME}/agent-skills/maven-remediation. Lives in
   # pipelines/config/agent-skills-maven-remediation.yaml so it ships with the

@@ -23,10 +23,12 @@ re-syncing rather than installing.
 | RHTAS | — (Fulcio/Rekor/TUF Services, no UI) | — |
 | Orchestrator | Route in `automation-orchestrator-operator-system` | `admin` / `automationorchestrator-demo-initial-admin-password` Secret |
 | Tekton | namespace `tssc-app-ci` | — |
+| App environments | namespaces `spring-boot-example-{dev,qa,prod}` | — |
 
 Plus: the `development/spring-boot-example-application` repository imported into
-GitLab with the CVE issue board, the `/remediate` and `/generate-tests*` webhook,
-23 Tasks, 5 Pipelines, and every credential the pipelines need.
+GitLab with the CVE issue board and two project webhooks — issue comments for
+`/remediate` and `/generate-tests*`, and pushes to `main` for CI — 33 Tasks,
+11 Pipelines, and every credential the pipelines need.
 
 Budget **2–3 hours of wall clock**, most of it unattended. RHTPA's first full
 ingest of the CVE/OSV/CSAF feeds runs for several hours *after* that, in the
@@ -320,7 +322,7 @@ the full values and filter the output (e.g. just the `spring-boot-example-*`
 Applications) before piping to `oc apply` — useful when the override file is
 gone but only Applications that carry no credentials need updating.
 
-Twelve Applications land at once; the sync waves serialise them.
+Fifteen Applications land at once; the sync waves serialise them.
 
 ```
  0  pipelines            OpenShift Pipelines operator
@@ -330,10 +332,11 @@ Twelve Applications land at once; the sync waves serialise them.
  5  keycloak, tekton-triggers
  8  gitlab               (imports the app repo from GitHub — slow)
 10  quay, rhtas, rhtpa-prerequisites, orchestrator
-15  rhtpa
+15  rhtpa-operator
+16  spring-boot-example-{dev,qa,prod}
 ```
 
-Twelve, or thirteen with ODF.
+Fifteen, or sixteen with ODF.
 
 A wave does not start until the previous one is Healthy, so one Application
 stuck in `Progressing` blocks everything behind it.
@@ -361,6 +364,12 @@ Expected behaviour while you wait:
   answers before importing the two workflows. If it fails, its log names the
   phase — see `components/orchestrator/README.md` for the two REST endpoints
   that could not be pre-verified.
+* **The three `spring-boot-example-*` Applications sit `Degraded`
+  (ImagePullBackOff) on a fresh cluster.** Each one's health includes the
+  Deployment pulling its image, and the imported values files' initial tags do
+  not exist in Quay yet — they appear with the first `ci-build-publish` run
+  and its dev promotion. That is the demo working as designed, and wave 16 is
+  last on purpose so it blocks nothing behind it.
 
 If many Applications are stuck at once — each `Running` with a
 `waiting for healthy state of ...` message that never resolves — suspect the
@@ -501,9 +510,9 @@ oc -n keycloak get secret keycloak-initial-admin \
   -o go-template='{{index .data "username"|base64decode}}{{"\n"}}'
 
 # Tekton layer
-oc -n $NS get tasks | wc -l                                  # 23 + header
-oc -n $NS get pipelines                                      # 4 agentic + maven-build-ci
-oc -n $NS get eventlistener agentic-issue-commands           # ADDRESS populated
+oc -n $NS get tasks | wc -l                                  # 33 + header
+oc -n $NS get pipelines                                      # 5 agentic + gitops-cd-{dev,qa,prod} + test-image-{functional,integration} + ci-build-publish
+oc -n $NS get eventlistener agentic-issue-commands ci-build-push   # both ADDRESS populated
 oc get clusterinterceptors                                   # at least cel, gitlab
 oc -n $NS logs job/tekton-cluster-defaults                   # "already correct for <domain>"
 
@@ -524,8 +533,10 @@ oc -n automation-orchestrator-operator-system logs job/orchestrator-setup | tail
 ```
 
 Then log into GitLab at `https://gitlab-gitlab.${DOMAIN}` as `root` and confirm
-`development/spring-boot-example-application` is there with the CVE labels and a
-project webhook pointing at `agentic-issue-commands-tssc-app-ci.${DOMAIN}`.
+`development/spring-boot-example-application` is there with the CVE labels and
+two project webhooks: one pointing at
+`agentic-issue-commands-tssc-app-ci.${DOMAIN}` (issue comments) and one at
+`ci-build-push-tssc-app-ci.${DOMAIN}` (pushes to `main`).
 
 ## 11. Smoke test
 
@@ -566,6 +577,12 @@ a merge request. **`/generate-tests-unit`** does the same through
 `agentic-test-generation-functional`, and **`/generate-tests-integration`**
 through `agentic-test-generation-integration` — one webhook, four slash
 commands; each trigger's cel filter picks its command.
+
+Merging anything to `main` fires the second webhook: `ci-build-push` runs
+`ci-build-publish` (build → image → SBOM → RHTPA), whose finally task starts
+`gitops-cd-dev` to promote the new tag into the gitops repo's dev values file
+— which is what turns the wave-16 `spring-boot-example-dev` Application
+healthy.
 
 ## Known rough edges
 
@@ -609,7 +626,10 @@ helm template ssc automation/gitops/bootstrap-infra \
   -f /tmp/ssc-demo-values.yaml | oc delete -f - --ignore-not-found
 oc delete -f automation/gitops/artifactory/application-artifactory.yaml --ignore-not-found
 oc delete ns gitlab keycloak quay-registry trusted-artifact-signer \
-             trusted-profile-analyzer artifactory tssc-app-ci --ignore-not-found
+             trusted-profile-analyzer artifactory tssc-app-ci \
+             automation-orchestrator-operator-system \
+             spring-boot-example-dev spring-boot-example-qa spring-boot-example-prod \
+             --ignore-not-found
 ```
 
 Deleting the Applications leaves the operator Subscriptions in
