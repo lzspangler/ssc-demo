@@ -193,14 +193,26 @@ spec:
         PR_URL=""
         case "${SCM_PROVIDER}" in
           gitlab)
-            export GITLAB_HOST="${GIT_HOST}"
-            export GITLAB_TOKEN="${TOKEN}"
-            PR_URL="$(glab mr create \
-              --source-branch "${BRANCH}" \
-              --target-branch "${BASE_BRANCH}" \
-              --title "${TITLE}" \
-              --description "${BODY}" \
-              --yes 2>&1 | grep -Eo 'https?://[^ ]+/-/merge_requests/[0-9]+' | head -1 || true)"
+            # Use the GitLab API directly. This avoids glab's local git/recovery
+            # state and supports the demo cluster's self-signed route cert.
+            PROJECT_PATH="$(python3 - "${GIT_URL}" <<'PY'
+              import sys, urllib.parse
+              url = sys.argv[1].split('://', 1)[-1]
+              path = url.split('/', 1)[1].removesuffix('.git')
+              print(urllib.parse.quote(path, safe=''))
+            PY
+            )"
+            MR_RESPONSE="$(curl -ksS --fail-with-body \
+              -H "PRIVATE-TOKEN: ${TOKEN}" \
+              --data-urlencode "source_branch=${BRANCH}" \
+              --data-urlencode "target_branch=${BASE_BRANCH}" \
+              --data-urlencode "title=${TITLE}" \
+              --data-urlencode "description=${BODY}" \
+              -X POST "https://${GIT_HOST}/api/v4/projects/${PROJECT_PATH}/merge_requests")" || {
+                echo "GitLab merge request creation failed: ${MR_RESPONSE}" >&2
+                exit 1
+              }
+            PR_URL="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["web_url"])' <<<"${MR_RESPONSE}")"
             ;;
           github)
             export GH_HOST="${GIT_HOST}"

@@ -38,7 +38,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: artifactory
-  namespace: openshift-gitops
+  namespace: platform-gitops
   labels:
     app.kubernetes.io/part-of: maven-build-ci
 spec:

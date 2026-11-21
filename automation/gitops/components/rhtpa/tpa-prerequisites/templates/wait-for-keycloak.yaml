@@ -28,8 +28,23 @@ spec:
             - -c
             - |
               echo "Waiting for OIDC endpoint: {{ include "tpa-prerequisites.issuerUrl" . }}"
-              until curl -sf -o /dev/null "{{ include "tpa-prerequisites.issuerUrl" . }}/.well-known/openid-configuration"; do
+              until curl {{- if .Values.oidc.caConfigMap }} --cacert /etc/ssc-ca/ca-bundle.crt{{- end }} -sf -o /dev/null "{{ include "tpa-prerequisites.issuerUrl" . }}/.well-known/openid-configuration"; do
                 echo "OIDC endpoint not ready, retrying in 10s..."
                 sleep 10
               done
               echo "OIDC endpoint is ready"
+          {{- if .Values.oidc.caConfigMap }}
+          volumeMounts:
+            - name: ssc-ingress-ca
+              mountPath: /etc/ssc-ca
+              readOnly: true
+          {{- end }}
+      {{- if .Values.oidc.caConfigMap }}
+      volumes:
+        - name: ssc-ingress-ca
+          configMap:
+            name: {{ .Values.oidc.caConfigMap }}
+            items:
+              - key: ca-bundle.crt
+                path: ca-bundle.crt
+      {{- end }}
